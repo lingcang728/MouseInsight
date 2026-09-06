@@ -119,60 +119,60 @@ $hashEntries | Out-File -FilePath $hashFile -Encoding utf8
 Write-Host "`n打包完成！发布文件清单如下:" -ForegroundColor Cyan
 Get-ChildItem $releaseDir | Format-Table Name, @{Label="大小(KB)"; Expression={[math]::Round($_.Length / 1KB, 2)}}, LastWriteTime
 
-# 7. 本地安装与快捷方式指向更新
-if ($InstallLocally -and $installerPath) {
+# 7. 便携版快捷方式与开机自启动配置
+$portableExe = Join-Path $releaseDir 'Mouse Insight.exe'
+if (Test-Path $portableExe) {
     Write-Host "========================================" -ForegroundColor Magenta
-    Write-Host "  更新本地安装到最新版本..." -ForegroundColor Magenta
+    Write-Host "  配置便携版快捷方式与开机自启..." -ForegroundColor Magenta
     Write-Host "========================================" -ForegroundColor Magenta
+
+    # 创建 .portable 标记，确保用户配置存放在 release\config.json
+    $portableMarker = Join-Path $releaseDir '.portable'
+    if (-not (Test-Path $portableMarker)) {
+        New-Item -ItemType File -Path $portableMarker -Force | Out-Null
+    }
+
+    # 更新开机自启注册表指向便携版
+    $runRegPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $autostartCmd = "`"$portableExe`" --autostart"
+    Set-ItemProperty -Path $runRegPath -Name 'Mouse Insight' -Value $autostartCmd
+    Write-Host "已配置开机自启注册表指向便携版: $autostartCmd" -ForegroundColor Green
+
+    $wsh = New-Object -ComObject WScript.Shell
     
-    Write-Host "正在安装最新版本: $installerPath ..." -ForegroundColor Yellow
-    $installProc = Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait -PassThru
-    Start-Sleep -Seconds 3
+    # 1) 桌面快捷方式
+    $desktopLnkPath = [System.IO.Path]::Combine([Environment]::GetFolderPath('Desktop'), 'Mouse Insight.lnk')
+    $desktopLnk = $wsh.CreateShortcut($desktopLnkPath)
+    $desktopLnk.TargetPath = $portableExe
+    $desktopLnk.WorkingDirectory = $releaseDir
+    $desktopLnk.Description = "Mouse Insight (Portable)"
+    $desktopLnk.IconLocation = "$portableExe,0"
+    $desktopLnk.Save()
+    Write-Host "已更新桌面快捷方式: $desktopLnkPath -> $portableExe" -ForegroundColor Green
 
-    $installedExe = "$env:LOCALAPPDATA\Programs\Mouse Insight\Mouse Insight.exe"
-    if (-not (Test-Path $installedExe)) {
-        $installedExe = "$env:LOCALAPPDATA\Mouse Insight\Mouse Insight.exe"
+    # 2) 开始菜单快捷方式 (Programs\Mouse Insight\Mouse Insight.lnk)
+    $startMenuDir = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Mouse Insight')
+    if (-not (Test-Path $startMenuDir)) {
+        New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
     }
+    $startMenuLnkPath = [System.IO.Path]::Combine($startMenuDir, 'Mouse Insight.lnk')
+    $startMenuLnk = $wsh.CreateShortcut($startMenuLnkPath)
+    $startMenuLnk.TargetPath = $portableExe
+    $startMenuLnk.WorkingDirectory = $releaseDir
+    $startMenuLnk.Description = "Mouse Insight (Portable)"
+    $startMenuLnk.IconLocation = "$portableExe,0"
+    $startMenuLnk.Save()
+    Write-Host "已更新开始菜单快捷方式: $startMenuLnkPath -> $portableExe" -ForegroundColor Green
 
-    if (Test-Path $installedExe) {
-        Write-Host "本地已成功安装至: $installedExe" -ForegroundColor Green
-
-        $wsh = New-Object -ComObject WScript.Shell
-        
-        # 1) 桌面快捷方式
-        $desktopLnkPath = [System.IO.Path]::Combine([Environment]::GetFolderPath('Desktop'), 'Mouse Insight.lnk')
-        $desktopLnk = $wsh.CreateShortcut($desktopLnkPath)
-        $desktopLnk.TargetPath = $installedExe
-        $desktopLnk.WorkingDirectory = [System.IO.Path]::GetDirectoryName($installedExe)
-        $desktopLnk.Description = "Mouse Insight"
-        $desktopLnk.IconLocation = "$installedExe,0"
-        $desktopLnk.Save()
-        Write-Host "已更新桌面快捷方式: $desktopLnkPath -> $installedExe" -ForegroundColor Green
-
-        # 2) 开始菜单快捷方式 (Windows 搜索栏索引路径)
-        $startMenuDir = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Mouse Insight')
-        if (-not (Test-Path $startMenuDir)) {
-            New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
-        }
-        $startMenuLnkPath = [System.IO.Path]::Combine($startMenuDir, 'Mouse Insight.lnk')
-        $startMenuLnk = $wsh.CreateShortcut($startMenuLnkPath)
-        $startMenuLnk.TargetPath = $installedExe
-        $startMenuLnk.WorkingDirectory = [System.IO.Path]::GetDirectoryName($installedExe)
-        $startMenuLnk.Description = "Mouse Insight"
-        $startMenuLnk.IconLocation = "$installedExe,0"
-        $startMenuLnk.Save()
-        Write-Host "已更新开始菜单快捷方式 (Windows 搜索栏可直接检索): $startMenuLnkPath -> $installedExe" -ForegroundColor Green
-
-        # 根目录开始菜单也同步一份，确保 Windows Search 瞬时检索
-        $rootProgramsLnk = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Mouse Insight.lnk')
-        $rootLnk = $wsh.CreateShortcut($rootProgramsLnk)
-        $rootLnk.TargetPath = $installedExe
-        $rootLnk.WorkingDirectory = [System.IO.Path]::GetDirectoryName($installedExe)
-        $rootLnk.Description = "Mouse Insight"
-        $rootLnk.IconLocation = "$installedExe,0"
-        $rootLnk.Save()
-        Write-Host "已更新主程序组快捷方式: $rootProgramsLnk -> $installedExe" -ForegroundColor Green
-    } else {
-        Write-Warning "未找到安装目录，跳过快捷方式重定向。"
-    }
+    # 3) 根目录开始菜单快捷方式 (Windows 搜索栏直接索引)
+    $rootProgramsLnk = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Mouse Insight.lnk')
+    $rootLnk = $wsh.CreateShortcut($rootProgramsLnk)
+    $rootLnk.TargetPath = $portableExe
+    $rootLnk.WorkingDirectory = $releaseDir
+    $rootLnk.Description = "Mouse Insight (Portable)"
+    $rootLnk.IconLocation = "$portableExe,0"
+    $rootLnk.Save()
+    Write-Host "已更新 Windows 搜索栏索引快捷方式: $rootProgramsLnk -> $portableExe" -ForegroundColor Green
+} else {
+    Write-Warning "未找到便携版 $portableExe ，跳过快捷方式映射。"
 }
