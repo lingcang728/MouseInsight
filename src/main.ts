@@ -872,7 +872,7 @@ boot()
         void checkForUpdate(ver);
       });
     } catch {
-      $("app-version").textContent = "v0.2.0-beta.1";
+      $("app-version").textContent = "v0.2.0-beta.2";
     }
   })
   .catch((err) => {

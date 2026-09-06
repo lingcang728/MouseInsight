@@ -152,18 +152,27 @@ jobs:
           # GITHUB_ENV above, so they are now regular runner environment
           # variables. Do not rebind them through the workflow env context.
           unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_PRIVATE_KEY_BASE64
-          npm run tauri -- build --target universal-apple-darwin --bundles dmg
+          npm run tauri -- build --target universal-apple-darwin --bundles app,dmg
 
       - name: Locate bundle and confirm universal binary
         id: bundle
         shell: bash
         run: |
           set -euo pipefail
-          app=$(find src-tauri/target/universal-apple-darwin/release/bundle -name '*.app' -type d | head -n 1)
-          dmg=$(find src-tauri/target/universal-apple-darwin/release/bundle -name '*.dmg' | head -n 1)
+          shopt -s nullglob
+          bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
+          echo "bundle tree:"
+          find "$bundle_root" -maxdepth 3 -print || true
+
+          macos_apps=("$bundle_root/macos"/*.app)
+          dmg_files=("$bundle_root/dmg"/*.dmg)
+          app="${macos_apps[0]:-}"
+          dmg="${dmg_files[0]:-}"
+
           if [[ -z $app || -z $dmg ]]; then
             echo "signed universal .app/.dmg was not produced" >&2
-            find src-tauri/target -name '*.app' -o -name '*.dmg' >&2 || true
+            echo "app=${app:-<missing>}" >&2
+            echo "dmg=${dmg:-<missing>}" >&2
             exit 1
           fi
           bin="$app/Contents/MacOS/Mouse Insight"
