@@ -24,7 +24,7 @@ Windows 鼠标按键映射工具。先看见系统刚收到的是哪颗键，再
 
 ## 安装
 
-到 [Releases](https://github.com/lingcang728/MouseInsight/releases) 下载 `Mouse Insight_*_x64-setup.exe`，双击安装。装到当前用户目录，不需要管理员权限。
+到 [Releases](https://github.com/lingcang728/MouseInsight/releases) 下载最新安装包，双击安装。装到当前用户目录，不需要管理员权限。
 
 安装包暂未代码签名。Windows SmartScreen 可能提示「未知发布者」，点「更多信息」→「仍要运行」即可。
 
