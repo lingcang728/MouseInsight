@@ -18,9 +18,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "nsis"
-    ],
+    "targets": "all",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -28,6 +26,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "10.15"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

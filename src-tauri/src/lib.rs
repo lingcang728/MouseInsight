@@ -1,4 +1,6 @@
 mod engine;
+#[cfg(target_os = "macos")]
+mod macos;
 
 use engine::{Mapping, Pulse, RuntimeBindingState, SendReport, Snapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,10 +82,19 @@ fn open_url(url: String) -> Result<(), String> {
             .map_err(|e| format!("open url failed: {e}"))?;
         Ok(())
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("open url failed: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = url;
-        Err("open_url is only implemented on Windows".into())
+        Err("open_url is only implemented on Windows and macOS".into())
     }
 }
 
@@ -109,6 +120,11 @@ fn open_config_dir() -> Result<(), String> {
     {
         use std::process::Command;
         let _ = Command::new("explorer").arg(dir).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let _ = Command::new("open").arg(dir).spawn();
     }
     Ok(())
 }
