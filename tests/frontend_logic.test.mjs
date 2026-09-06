@@ -10,6 +10,7 @@ import {
   sanitizeMappings,
   DraftSession,
   codeToToken,
+  normalizeMapping,
 } from "../src/logic.ts";
 
 // 轻量、高可读性的纯逻辑测试执行器
@@ -246,13 +247,14 @@ await suite("3. 按钮能力矩阵规则 isButtonAllowedForMode", async () => {
     }
   });
 
-  await test("middle, xbutton1, xbutton2 允许完整的 hold, click, toggle 三种模式", () => {
+  await test("middle, xbutton1, xbutton2 允许 dual 与 toggle", () => {
     for (const btn of ["middle", "xbutton1", "xbutton2"]) {
+      assert.equal(isButtonAllowedForMode(btn, "dual"), true);
+      assert.equal(isButtonAllowedForMode(btn, "toggle"), true);
       assert.equal(isButtonAllowedForMode(btn, "hold"), true);
       assert.equal(isButtonAllowedForMode(btn, "click"), true);
-      assert.equal(isButtonAllowedForMode(btn, "toggle"), true);
       assert.equal(isButtonAllowedForMode(btn, "invalid"), false);
-      assert.deepEqual(getAllowedModesForButton(btn), ["hold", "click", "toggle"]);
+      assert.deepEqual(getAllowedModesForButton(btn), ["dual", "toggle"]);
     }
   });
 
@@ -450,7 +452,47 @@ await suite("5. 数据清洗与安全性校验 sanitizeMappings", async () => {
   });
 });
 
-await suite("6. codeToToken 键盘事件兜底映射", async () => {
+await suite("6. normalizeMapping 短按/长按字段", async () => {
+  await test("旧 hold 配置迁移到 hold_keys", () => {
+    const n = normalizeMapping({
+      id: "1",
+      button: "xbutton1",
+      mode: "hold",
+      keys: ["LControl", "LAlt"],
+    });
+    assert.equal(n.mode, "dual");
+    assert.deepEqual(n.hold_keys, ["LControl", "LAlt"]);
+    assert.deepEqual(n.tap_keys, []);
+  });
+
+  await test("旧 click 配置迁移到 tap_keys", () => {
+    const n = normalizeMapping({
+      id: "2",
+      button: "xbutton2",
+      mode: "click",
+      keys: ["Enter"],
+    });
+    assert.equal(n.mode, "dual");
+    assert.deepEqual(n.tap_keys, ["Enter"]);
+    assert.deepEqual(n.hold_keys, []);
+  });
+
+  await test("同时有 tap_keys 与 hold_keys 时保持 dual", () => {
+    const n = normalizeMapping({
+      id: "3",
+      button: "middle",
+      mode: "dual",
+      keys: [],
+      tap_keys: ["LControl", "V"],
+      hold_keys: ["LControl", "C"],
+    });
+    assert.equal(n.mode, "dual");
+    assert.deepEqual(n.tap_keys, ["LControl", "V"]);
+    assert.deepEqual(n.hold_keys, ["LControl", "C"]);
+  });
+});
+
+await suite("7. codeToToken 键盘事件兜底映射", async () => {
   await test("左右修饰键映射到 L/R token", () => {
     assert.equal(codeToToken("ControlLeft"), "LControl");
     assert.equal(codeToToken("ControlRight"), "RControl");

@@ -44,6 +44,7 @@ const EXTRA_INFO: usize = 0x4D49_484B;
 const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFC);
 const TAP_QUEUE_CAP: usize = 8;
 const EDGE_CHANNEL_CAP: usize = 256;
+const HOLD_THRESHOLD: Duration = Duration::from_millis(400);
 const HOTKEY_PAUSE: i32 = 1;
 const HOTKEY_SCROLL: i32 = 2;
 
@@ -105,6 +106,7 @@ pub enum TriggerMode {
     Hold,
     Click,
     Toggle,
+    Dual,
 }
 
 impl TriggerMode {
@@ -112,6 +114,7 @@ impl TriggerMode {
         match s {
             "click" => TriggerMode::Click,
             "toggle" => TriggerMode::Toggle,
+            "dual" => TriggerMode::Dual,
             _ => TriggerMode::Hold,
         }
     }
@@ -135,6 +138,8 @@ pub struct CompiledAction {
     pub mapping_id: String,
     pub mode: TriggerMode,
     pub specs: Vec<KeySpec>,
+    pub tap_specs: Vec<KeySpec>,
+    pub hold_specs: Vec<KeySpec>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -155,32 +160,79 @@ pub fn compile_mappings(mappings: &[Mapping]) -> CompiledMappings {
     compile_mappings_with_gen(mappings, 0)
 }
 
+fn specs_from_names(names: &[String]) -> Vec<KeySpec> {
+    names.iter().filter_map(|k| key_spec(k)).collect()
+}
+
 pub fn compile_mappings_with_gen(mappings: &[Mapping], generation: u64) -> CompiledMappings {
     let mut slots: [Option<Arc<CompiledAction>>; MouseButton::COUNT] = Default::default();
     for m in mappings {
-        if m.keys.is_empty() {
-            continue;
-        }
         if let Some(btn) = MouseButton::from_str_fast(&m.button) {
-            // Capability 规则 1: Left / Right 绝不允许建立映射（后端防线）
             if btn.is_primary() {
                 continue;
             }
+            let idx = btn as usize;
+            if slots[idx].is_some() {
+                continue;
+            }
+
+            let tap_names = if m.tap_keys.is_empty() {
+                Vec::new()
+            } else {
+                m.tap_keys.clone()
+            };
+            let hold_names = if m.hold_keys.is_empty() {
+                Vec::new()
+            } else {
+                m.hold_keys.clone()
+            };
+
             let mut mode = TriggerMode::from_str_fast(&m.mode);
             if btn.is_wheel() {
                 mode = TriggerMode::Click;
             }
-            let idx = btn as usize;
-            if slots[idx].is_none() {
-                let specs: Vec<KeySpec> = m.keys.iter().filter_map(|k| key_spec(k)).collect();
-                if !specs.is_empty() {
-                    slots[idx] = Some(Arc::new(CompiledAction {
-                        mapping_id: m.id.clone(),
-                        mode,
-                        specs,
-                    }));
+
+            let (mode, tap_specs, hold_specs, specs) = if btn.is_wheel() {
+                let names = if !tap_names.is_empty() {
+                    tap_names
+                } else {
+                    m.keys.clone()
+                };
+                let specs = specs_from_names(&names);
+                (TriggerMode::Click, specs.clone(), Vec::new(), specs)
+            } else if mode == TriggerMode::Toggle {
+                let specs = specs_from_names(&m.keys);
+                (TriggerMode::Toggle, Vec::new(), Vec::new(), specs)
+            } else {
+                let mut tap = specs_from_names(&tap_names);
+                let mut hold = specs_from_names(&hold_names);
+                if tap.is_empty() && hold.is_empty() {
+                    let legacy = specs_from_names(&m.keys);
+                    if mode == TriggerMode::Hold {
+                        hold = legacy;
+                    } else {
+                        tap = legacy;
+                    }
                 }
+                if !tap.is_empty() && !hold.is_empty() {
+                    (TriggerMode::Dual, tap.clone(), hold.clone(), tap)
+                } else if !hold.is_empty() {
+                    (TriggerMode::Hold, Vec::new(), hold.clone(), hold)
+                } else {
+                    (TriggerMode::Click, tap.clone(), Vec::new(), tap)
+                }
+            };
+
+            if specs.is_empty() && tap_specs.is_empty() && hold_specs.is_empty() {
+                continue;
             }
+            slots[idx] = Some(Arc::new(CompiledAction {
+                mapping_id: m.id.clone(),
+                mode,
+                specs,
+                tap_specs,
+                hold_specs,
+            }));
         }
     }
     CompiledMappings { slots, generation }
@@ -192,6 +244,10 @@ pub struct Mapping {
     pub button: String,
     pub mode: String,
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub tap_keys: Vec<String>,
+    #[serde(default)]
+    pub hold_keys: Vec<String>,
     #[serde(default)]
     pub label: String,
 }
@@ -410,6 +466,14 @@ struct QueuedTap {
     specs: Vec<KeySpec>,
 }
 
+#[derive(Clone, Debug)]
+struct DualPending {
+    mapping_id: String,
+    tap_specs: Vec<KeySpec>,
+    hold_specs: Vec<KeySpec>,
+    due: Instant,
+}
+
 pub struct InputStateMachine<I: InputInjector> {
     pub injector: I,
     pub key_refs: HashMap<KeySpec, u32>,
@@ -417,9 +481,11 @@ pub struct InputStateMachine<I: InputInjector> {
     active_toggles: HashMap<MouseButton, (String, Vec<KeySpec>)>,
     tap_in_flight: HashMap<MouseButton, ActiveTap>,
     tap_queue: HashMap<MouseButton, VecDeque<QueuedTap>>,
+    pending_dual: HashMap<MouseButton, DualPending>,
     current_generation: u64,
     paused: bool,
     tap_dwell: Duration,
+    hold_threshold: Duration,
     on_state_change: Option<Box<dyn Fn(RuntimeBindingState) + Send + 'static>>,
     on_send_error: Option<Box<dyn Fn(SendReport) + Send + 'static>>,
 }
@@ -433,9 +499,11 @@ impl<I: InputInjector> InputStateMachine<I> {
             active_toggles: HashMap::new(),
             tap_in_flight: HashMap::new(),
             tap_queue: HashMap::new(),
+            pending_dual: HashMap::new(),
             current_generation: 0,
             paused: false,
             tap_dwell: Duration::from_millis(30),
+            hold_threshold: HOLD_THRESHOLD,
             on_state_change: None,
             on_send_error: None,
         }
@@ -444,6 +512,12 @@ impl<I: InputInjector> InputStateMachine<I> {
     #[allow(dead_code)]
     pub fn with_dwell(mut self, dwell: Duration) -> Self {
         self.tap_dwell = dwell;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_hold_threshold(mut self, threshold: Duration) -> Self {
+        self.hold_threshold = threshold;
         self
     }
 
@@ -484,7 +558,11 @@ impl<I: InputInjector> InputStateMachine<I> {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.tap_in_flight.values().map(|t| t.due).min()
+        self.tap_in_flight
+            .values()
+            .map(|t| t.due)
+            .chain(self.pending_dual.values().map(|t| t.due))
+            .min()
     }
 
     fn emit_state_change(
@@ -554,7 +632,53 @@ impl<I: InputInjector> InputStateMachine<I> {
         }
     }
 
+    fn fire_click(
+        &mut self,
+        mapping_id: String,
+        button: MouseButton,
+        specs: Vec<KeySpec>,
+        now: Instant,
+    ) {
+        if self.tap_in_flight.contains_key(&button) {
+            let q = self.tap_queue.entry(button).or_default();
+            if q.len() < TAP_QUEUE_CAP {
+                q.push_back(QueuedTap {
+                    mapping_id,
+                    specs,
+                });
+            }
+            return;
+        }
+        self.acquire_specs(&specs);
+        self.tap_in_flight.insert(
+            button,
+            ActiveTap {
+                mapping_id: mapping_id.clone(),
+                specs,
+                due: now + self.tap_dwell,
+            },
+        );
+        self.emit_state_change(mapping_id, button, TriggerMode::Click, true);
+    }
+
     pub fn tick(&mut self, now: Instant) {
+        let mut due_dual = Vec::new();
+        for (btn, pending) in &self.pending_dual {
+            if pending.due <= now {
+                due_dual.push(*btn);
+            }
+        }
+        for btn in due_dual {
+            if let Some(pending) = self.pending_dual.remove(&btn) {
+                self.acquire_specs(&pending.hold_specs);
+                self.active_holds.insert(
+                    btn,
+                    (pending.mapping_id.clone(), pending.hold_specs),
+                );
+                self.emit_state_change(pending.mapping_id, btn, TriggerMode::Hold, true);
+            }
+        }
+
         let mut expired_buttons = Vec::new();
         for (btn, tap) in &self.tap_in_flight {
             if tap.due <= now {
@@ -597,6 +721,7 @@ impl<I: InputInjector> InputStateMachine<I> {
 
         if self.paused {
             if !down {
+                self.pending_dual.remove(&button);
                 if let Some((mapping_id, specs)) = self.active_holds.remove(&button) {
                     self.release_specs(&specs);
                     self.emit_state_change(mapping_id, button, TriggerMode::Hold, false);
@@ -628,31 +753,28 @@ impl<I: InputInjector> InputStateMachine<I> {
                     );
                 }
                 TriggerMode::Click => {
-                    if self.tap_in_flight.contains_key(&button) {
-                        let q = self.tap_queue.entry(button).or_default();
-                        if q.len() < TAP_QUEUE_CAP {
-                            q.push_back(QueuedTap {
-                                mapping_id: action.mapping_id.clone(),
-                                specs: action.specs.clone(),
-                            });
-                        }
-                    } else {
-                        self.acquire_specs(&action.specs);
-                        self.tap_in_flight.insert(
-                            button,
-                            ActiveTap {
-                                mapping_id: action.mapping_id.clone(),
-                                specs: action.specs.clone(),
-                                due: now + self.tap_dwell,
-                            },
-                        );
-                        self.emit_state_change(
-                            action.mapping_id.clone(),
-                            button,
-                            TriggerMode::Click,
-                            true,
-                        );
+                    self.fire_click(
+                        action.mapping_id.clone(),
+                        button,
+                        action.specs.clone(),
+                        now,
+                    );
+                }
+                TriggerMode::Dual => {
+                    if self.pending_dual.contains_key(&button)
+                        || self.active_holds.contains_key(&button)
+                    {
+                        return;
                     }
+                    self.pending_dual.insert(
+                        button,
+                        DualPending {
+                            mapping_id: action.mapping_id.clone(),
+                            tap_specs: action.tap_specs.clone(),
+                            hold_specs: action.hold_specs.clone(),
+                            due: now + self.hold_threshold,
+                        },
+                    );
                 }
                 TriggerMode::Toggle => {
                     if let Some((mapping_id, specs)) = self.active_toggles.remove(&button) {
@@ -672,7 +794,10 @@ impl<I: InputInjector> InputStateMachine<I> {
                 }
             }
         } else {
-            // MouseUp 优先释放 active_holds 中记录的 snapshot，绝不依赖新配置
+            if let Some(pending) = self.pending_dual.remove(&button) {
+                self.fire_click(pending.mapping_id, button, pending.tap_specs, now);
+                return;
+            }
             if let Some((mapping_id, specs)) = self.active_holds.remove(&button) {
                 self.release_specs(&specs);
                 self.emit_state_change(mapping_id, button, TriggerMode::Hold, false);
@@ -701,6 +826,7 @@ impl<I: InputInjector> InputStateMachine<I> {
         }
 
         self.tap_queue.clear();
+        self.pending_dual.clear();
 
         let mut had_alt_or_win = false;
         let leftover_keys: Vec<(KeySpec, u32)> = self.key_refs.drain().collect();
@@ -789,6 +915,24 @@ impl RecorderState {
             self.last_emitted = self.max_chord.clone();
             self.max_chord.clone()
         }
+    }
+
+    fn remove_token(&mut self, token: &str) {
+        self.chip_modifiers.remove(token);
+        self.physical_held
+            .retain(|vk| vk_to_token(*vk).as_deref() != Some(token));
+        let mut current: Vec<String> = self
+            .physical_held
+            .iter()
+            .filter_map(|&code| vk_to_token(code))
+            .collect();
+        for c in &self.chip_modifiers {
+            if !current.contains(c) {
+                current.push(c.clone());
+            }
+        }
+        self.max_chord = normalize_key_chord(&current);
+        self.last_emitted = self.max_chord.clone();
     }
 }
 
@@ -1121,6 +1265,15 @@ pub fn add_record_key(key: String) {
     if !chord.is_empty() {
         let _ = e.cmd_tx.send(InputCmd::Record(chord));
     }
+}
+
+pub fn remove_record_key(key: String) {
+    let e = engine();
+    let mut rec = e.recorder.write();
+    rec.remove_token(&key);
+    let chord = rec.max_chord.clone();
+    drop(rec);
+    let _ = e.cmd_tx.send(InputCmd::Record(chord));
 }
 
 pub fn take_record_keys() -> Vec<String> {
@@ -1773,6 +1926,8 @@ mod tests {
             mapping_id: id.into(),
             mode,
             specs,
+            tap_specs: Vec::new(),
+            hold_specs: Vec::new(),
         })
     }
 
@@ -1813,6 +1968,8 @@ mod tests {
             mode: "hold".into(),
             keys: vec!["LControl".into(), "LAlt".into()],
             label: "".into(),
+            tap_keys: vec![],
+            hold_keys: vec![],
         }];
         let compiled = compile_mappings(&mappings);
         let action = compiled.get(MouseButton::XButton1).expect("compiled slot");
@@ -2383,6 +2540,8 @@ mod tests {
                 mode: "hold".into(),
                 keys: vec!["LControl".into()],
                 label: "".into(),
+                tap_keys: vec![],
+                hold_keys: vec![],
             },
             Mapping {
                 id: "2".into(),
@@ -2390,6 +2549,8 @@ mod tests {
                 mode: "click".into(),
                 keys: vec!["Enter".into()],
                 label: "".into(),
+                tap_keys: vec![],
+                hold_keys: vec![],
             },
             Mapping {
                 id: "3".into(),
@@ -2397,6 +2558,8 @@ mod tests {
                 mode: "hold".into(),
                 keys: vec!["Space".into()],
                 label: "".into(),
+                tap_keys: vec![],
+                hold_keys: vec![],
             },
         ];
 
@@ -2415,6 +2578,8 @@ mod tests {
                 mode: "hold".into(),
                 keys: vec!["ArrowUp".into()],
                 label: "".into(),
+                tap_keys: vec![],
+                hold_keys: vec![],
             },
             Mapping {
                 id: "2".into(),
@@ -2422,6 +2587,8 @@ mod tests {
                 mode: "toggle".into(),
                 keys: vec!["ArrowDown".into()],
                 label: "".into(),
+                tap_keys: vec![],
+                hold_keys: vec![],
             },
             Mapping {
                 id: "3".into(),
@@ -2429,6 +2596,8 @@ mod tests {
                 mode: "click".into(),
                 keys: vec!["PageUp".into()],
                 label: "".into(),
+                tap_keys: vec![],
+                hold_keys: vec![],
             },
         ];
 
@@ -2786,5 +2955,88 @@ mod tests {
         replace_file_atomic(&from, &to).expect("replace");
         assert_eq!(fs::read_to_string(&to).unwrap(), "new");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn dummy_dual(id: &str, tap: &[&str], hold: &[&str]) -> Arc<CompiledAction> {
+        let tap_specs: Vec<KeySpec> = tap.iter().map(|k| key_spec(k).unwrap()).collect();
+        let hold_specs: Vec<KeySpec> = hold.iter().map(|k| key_spec(k).unwrap()).collect();
+        Arc::new(CompiledAction {
+            mapping_id: id.into(),
+            mode: TriggerMode::Dual,
+            specs: tap_specs.clone(),
+            tap_specs,
+            hold_specs,
+        })
+    }
+
+    #[test]
+    fn dual_short_press_fires_tap_only() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone())
+            .with_dwell(Duration::from_millis(10))
+            .with_hold_threshold(Duration::from_millis(40));
+        let act = dummy_dual("mid", &["LControl", "V"], &["LControl", "C"]);
+        let t0 = Instant::now();
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, t0);
+        assert!(injector.events().is_empty(), "must not inject until up or threshold");
+        sm.handle_mouse_edge(
+            MouseButton::Middle,
+            false,
+            None,
+            1,
+            t0 + Duration::from_millis(10),
+        );
+        sm.tick(t0 + Duration::from_millis(30));
+        let evs = injector.events();
+        let vks: Vec<_> = evs.iter().map(|e| e.spec.vk).collect();
+        assert!(vks.contains(&VK_LCONTROL));
+        assert!(vks.contains(&VK_RETURN) || evs.iter().any(|e| e.spec.vk.0 == b'V' as u16));
+        assert!(!evs.iter().any(|e| e.spec.vk.0 == b'C' as u16));
+    }
+
+    #[test]
+    fn dual_long_press_fires_hold_not_tap() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone())
+            .with_dwell(Duration::from_millis(10))
+            .with_hold_threshold(Duration::from_millis(20));
+        let act = dummy_dual("mid", &["LControl", "V"], &["LControl", "C"]);
+        let t0 = Instant::now();
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, t0);
+        sm.tick(t0 + Duration::from_millis(25));
+        let after_hold = injector.events();
+        assert!(after_hold.iter().any(|e| e.spec.vk.0 == b'C' as u16 && e.action == KeyAction::Down));
+        assert!(!after_hold.iter().any(|e| e.spec.vk.0 == b'V' as u16));
+        sm.handle_mouse_edge(
+            MouseButton::Middle,
+            false,
+            None,
+            1,
+            t0 + Duration::from_millis(40),
+        );
+        let ups = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.action == KeyAction::Up && e.spec.vk.0 == b'C' as u16)
+            .count();
+        assert_eq!(ups, 1);
+    }
+
+    #[test]
+    fn compile_dual_from_tap_and_hold_keys() {
+        let mappings = vec![Mapping {
+            id: "1".into(),
+            button: "middle".into(),
+            mode: "dual".into(),
+            keys: vec![],
+            label: "".into(),
+            tap_keys: vec!["LControl".into(), "V".into()],
+            hold_keys: vec!["LControl".into(), "C".into()],
+        }];
+        let compiled = compile_mappings(&mappings);
+        let action = compiled.get(MouseButton::Middle).unwrap();
+        assert_eq!(action.mode, TriggerMode::Dual);
+        assert_eq!(action.tap_specs.len(), 2);
+        assert_eq!(action.hold_specs.len(), 2);
     }
 }

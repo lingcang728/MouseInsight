@@ -3,13 +3,15 @@
  * 包含：修饰键判断、快捷键规范化、默认触发模式推断、按钮能力矩阵以及事务化录制状态机。
  */
 
-export type TriggerMode = "hold" | "click" | "toggle";
+export type TriggerMode = "hold" | "click" | "toggle" | "dual";
 
 export type Mapping = {
   id: string;
   button: string;
   mode: TriggerMode | string;
   keys: string[];
+  tap_keys?: string[];
+  hold_keys?: string[];
   label?: string;
 };
 
@@ -19,6 +21,7 @@ export type DraftMapping = {
   existingId?: string;
   initialKeys: string[];
   suggestedMode?: "hold" | "click";
+  slot?: "tap" | "hold" | "toggle";
 };
 
 export const MAPPABLE_BUTTONS = [
@@ -42,12 +45,14 @@ export const BUTTON_LABEL: Record<string, string> = {
 export const MODE_LABEL: Record<string, string> = {
   hold: "跟随按住",
   click: "单次触发",
+  dual: "点按 / 长按",
   toggle: "切换保持",
 };
 
 export const MODE_DESC: Record<string, string> = {
-  hold: "按下立刻注入，松开立刻释放。点一下也会发短暂脉冲，不是长按阈值。",
+  hold: "按下立刻注入，松开立刻释放。",
   click: "每按一下，完整触发一次快捷键",
+  dual: "短按与长按可以绑两套键。只填长按则按下立刻跟随；两套都填时短按点触、长按超过阈值才跟随。",
   toggle: "按一次保持，再按一次释放",
 };
 
@@ -256,7 +261,7 @@ export function isButtonAllowedForMode(button: string, mode: string): boolean {
     return mode === "click";
   }
   if (button === "middle" || button === "xbutton1" || button === "xbutton2") {
-    return mode === "hold" || mode === "click" || mode === "toggle";
+    return mode === "hold" || mode === "click" || mode === "toggle" || mode === "dual";
   }
   return false;
 }
@@ -264,7 +269,7 @@ export function isButtonAllowedForMode(button: string, mode: string): boolean {
 /**
  * 获取指定按钮所支持的模式列表
  */
-export function getAllowedModesForButton(button: string): ("hold" | "click" | "toggle")[] {
+export function getAllowedModesForButton(button: string): ("dual" | "toggle" | "click")[] {
   if (button === "left" || button === "right") {
     return [];
   }
@@ -272,9 +277,30 @@ export function getAllowedModesForButton(button: string): ("hold" | "click" | "t
     return ["click"];
   }
   if (button === "middle" || button === "xbutton1" || button === "xbutton2") {
-    return ["hold", "click", "toggle"];
+    return ["dual", "toggle"];
   }
   return [];
+}
+
+export function normalizeMapping(raw: Mapping): Mapping {
+  const keys = Array.isArray(raw.keys) ? [...raw.keys] : [];
+  const tap = Array.isArray(raw.tap_keys) ? [...raw.tap_keys] : [];
+  const hold = Array.isArray(raw.hold_keys) ? [...raw.hold_keys] : [];
+  if (raw.button === "wheelup" || raw.button === "wheeldown") {
+    const t = tap.length ? tap : keys;
+    return { ...raw, mode: "click", keys: t, tap_keys: t, hold_keys: [] };
+  }
+  if (raw.mode === "toggle") {
+    return { ...raw, mode: "toggle", keys, tap_keys: [], hold_keys: [] };
+  }
+  if (!tap.length && !hold.length && keys.length) {
+    if (raw.mode === "hold") {
+      return { ...raw, mode: "dual", keys, tap_keys: [], hold_keys: keys };
+    }
+    return { ...raw, mode: "dual", keys, tap_keys: keys, hold_keys: [] };
+  }
+  const nextKeys = keys.length ? keys : tap.length ? tap : hold;
+  return { ...raw, mode: "dual", keys: nextKeys, tap_keys: tap, hold_keys: hold };
 }
 
 /**
@@ -290,13 +316,7 @@ export function sanitizeMappings(rawMappings: Mapping[]): Mapping[] {
       seenButtons.add(m.button);
       return true;
     })
-    .map((m) => {
-      // 滚轮一律强制单次触发
-      if ((m.button === "wheelup" || m.button === "wheeldown") && m.mode !== "click") {
-        return { ...m, mode: "click" };
-      }
-      return m;
-    });
+    .map((m) => normalizeMapping(m));
 }
 
 /**

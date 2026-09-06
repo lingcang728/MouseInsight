@@ -60,6 +60,34 @@ fn add_record_key(key: String) {
 }
 
 #[tauri::command]
+fn remove_record_key(key: String) {
+    engine::remove_record_key(key);
+}
+
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+            .map_err(|e| format!("open url failed: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = url;
+        Err("open_url is only implemented on Windows".into())
+    }
+}
+
+#[tauri::command]
 fn take_record_keys() -> Vec<String> {
     engine::take_record_keys()
 }
@@ -348,7 +376,10 @@ pub fn run() {
             arm_record,
             disarm_record,
             add_record_key,
+            remove_record_key,
             take_record_keys,
+            app_version,
+            open_url,
             xmbc_running,
             config_dir,
             open_config_dir,

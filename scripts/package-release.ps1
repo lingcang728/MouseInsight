@@ -111,6 +111,17 @@ function Get-Sha256Hex($filePath) {
     }
 }
 
+$latestObj = [ordered]@{
+    version  = $appVersion
+    name     = "Mouse Insight $appVersion"
+    url      = "https://github.com/lingcang728/MouseInsight/releases/tag/v$appVersion"
+    portable = "https://github.com/lingcang728/MouseInsight/releases/download/v$appVersion/Mouse.Insight.exe"
+    setup    = "https://github.com/lingcang728/MouseInsight/releases/download/v$appVersion/Mouse.Insight_${appVersion}_x64-setup.exe"
+}
+$latestPath = Join-Path $releaseDir 'latest.json'
+$latestObj | ConvertTo-Json | Set-Content -Path $latestPath -Encoding utf8
+Write-Host "  已写入 latest.json" -ForegroundColor DarkCyan
+
 $hashFile = Join-Path $releaseDir 'SHA256SUMS.txt'
 $hashEntries = @()
 

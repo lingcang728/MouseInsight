@@ -12,6 +12,7 @@ import {
   getAllowedModesForButton,
   sanitizeMappings,
   codeToToken,
+  normalizeMapping,
 } from "./logic";
 
 type Pulse = {
@@ -72,14 +73,38 @@ function prettyKeys(keys: string[]): string[] {
   });
 }
 
-function renderKeys(el: HTMLElement, keys: string[], dimEmpty = true) {
-  const labels = prettyKeys(keys);
+function renderKeys(
+  el: HTMLElement,
+  keys: string[],
+  opts: { dimEmpty?: boolean; removable?: boolean } = {}
+) {
+  const dimEmpty = opts.dimEmpty !== false;
+  const removable = !!opts.removable;
   el.replaceChildren();
-  labels.forEach((k) => {
+  if (!keys.length) {
     const span = document.createElement("span");
-    span.className = `key${keys.length || !dimEmpty ? "" : " dim"}`;
-    span.textContent = k;
+    span.className = `key${dimEmpty ? " dim" : ""}`;
+    span.textContent = "空";
     el.appendChild(span);
+    return;
+  }
+  prettyKeys(keys).forEach((label, i) => {
+    const chip = document.createElement("span");
+    chip.className = "key-chip";
+    const text = document.createElement("span");
+    text.className = "k";
+    text.textContent = label;
+    chip.appendChild(text);
+    if (removable) {
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "key-x";
+      x.dataset.removeKey = keys[i];
+      x.setAttribute("aria-label", `删除 ${label}`);
+      x.textContent = "×";
+      chip.appendChild(x);
+    }
+    el.appendChild(chip);
   });
 }
 
@@ -112,7 +137,7 @@ function getStatusPill(m: Mapping): { text: string; className: string } | null {
     return isActive
       ? { text: "保持中", className: "pill pill-on status-pill active" }
       : { text: "已关闭", className: "pill pill-off status-pill inactive" };
-  } else if (m.mode === "hold") {
+  } else if (m.mode === "hold" || ((m.mode === "dual" || !m.mode) && (m.hold_keys?.length ?? 0))) {
     return isActive
       ? { text: "按住中", className: "pill pill-hold status-pill active" }
       : null;
@@ -184,12 +209,41 @@ function renderDock() {
     }
     return;
   }
-  $("dock-lead").textContent = `${BUTTON_LABEL[selected.button] ?? selected.button} · ${MODE_LABEL[selected.mode] ?? selected.mode}`;
-  renderKeys($("dock-keys"), selected.keys);
+  const mode = selected.mode === "toggle" ? "toggle" : "dual";
+  $("dock-lead").textContent = `${BUTTON_LABEL[selected.button] ?? selected.button} · ${MODE_LABEL[mode] ?? mode}`;
+  const shown =
+    selected.mode === "toggle"
+      ? selected.keys
+      : (selected.tap_keys?.length ? selected.tap_keys : selected.hold_keys) ?? selected.keys;
+  renderKeys($("dock-keys"), shown ?? []);
   const hintEl = $("dock-hint");
   if (hintEl) {
-    hintEl.textContent = `${MODE_LABEL[selected.mode] ?? selected.mode}：${MODE_DESC[selected.mode] ?? ""}`;
+    hintEl.textContent = MODE_DESC[mode] ?? MODE_DESC[selected.mode] ?? "";
   }
+}
+
+function makeComboRow(
+  slot: "tap" | "hold" | "toggle",
+  label: string,
+  keys: string[]
+): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "gesture";
+  const lab = document.createElement("span");
+  lab.className = "gesture-label";
+  lab.textContent = label;
+  const combo = document.createElement("div");
+  combo.className = "combo";
+  combo.dataset.slot = slot;
+  renderKeys(combo, keys, { removable: true });
+  const rec = document.createElement("button");
+  rec.type = "button";
+  rec.className = "ghost map-btn-record";
+  rec.dataset.act = "record";
+  rec.dataset.slot = slot;
+  rec.textContent = keys.length ? "重录" : "录制";
+  row.append(lab, combo, rec);
+  return row;
 }
 
 function renderMaps(liveButton?: string) {
@@ -221,7 +275,6 @@ function renderMaps(liveButton?: string) {
     const row = document.createElement("div");
     row.className = "map-primary-row";
 
-    // 鼠标按钮下拉框：严格限定为 MAPPABLE_BUTTONS，排除 left 和 right
     const selButton = document.createElement("select");
     selButton.dataset.k = "button";
     selButton.className = "map-sel-btn";
@@ -236,34 +289,24 @@ function renderMaps(liveButton?: string) {
       selButton.appendChild(opt);
     });
 
-    // 模式选择器：滚轮（wheelup/wheeldown）仅允许 click（单次触发）
     const selMode = document.createElement("select");
     selMode.dataset.k = "mode";
     selMode.className = "map-sel-mode";
     const availableModes = getAllowedModesForButton(m.button);
+    const uiMode = m.mode === "toggle" ? "toggle" : availableModes[0];
     availableModes.forEach((modeKey) => {
       const opt = document.createElement("option");
       opt.value = modeKey;
       opt.textContent = MODE_LABEL[modeKey] ?? modeKey;
-      opt.selected = m.mode === modeKey;
+      opt.selected = uiMode === modeKey;
       selMode.appendChild(opt);
     });
 
-    // 状态指示 pill
     const pill = document.createElement("span");
     const pillData = getStatusPill(m);
     pill.className = pillData ? pillData.className : "pill status-pill hidden";
     pill.textContent = pillData ? pillData.text : "";
 
-    // 录键按钮
-    const btnRecord = document.createElement("button");
-    btnRecord.type = "button";
-    btnRecord.className = "ghost map-btn-record";
-    btnRecord.dataset.act = "record";
-    const keyLabels = prettyKeys(m.keys).join(" + ");
-    btnRecord.textContent = m.keys.length ? keyLabels : "录快捷键";
-
-    // 删除按钮
     const btnDel = document.createElement("button");
     btnDel.type = "button";
     btnDel.className = "danger";
@@ -271,14 +314,23 @@ function renderMaps(liveButton?: string) {
     btnDel.setAttribute("aria-label", "删除");
     btnDel.textContent = "删除";
 
-    row.append(selButton, selMode, pill, btnRecord, btnDel);
+    row.append(selButton, selMode, pill, btnDel);
+    article.append(row);
 
-    // 模式说明文案
+    const isWheel = m.button === "wheelup" || m.button === "wheeldown";
+    if (m.mode === "toggle") {
+      article.append(makeComboRow("toggle", "组合", m.keys ?? []));
+    } else if (isWheel) {
+      article.append(makeComboRow("tap", "短按", m.tap_keys ?? m.keys ?? []));
+    } else {
+      article.append(makeComboRow("tap", "短按", m.tap_keys ?? []));
+      article.append(makeComboRow("hold", "长按", m.hold_keys ?? []));
+    }
+
     const desc = document.createElement("div");
     desc.className = "map-desc mode-hint";
-    desc.textContent = `${MODE_LABEL[m.mode] ?? m.mode}：${MODE_DESC[m.mode] ?? ""}`;
-
-    article.append(row, desc);
+    desc.textContent = MODE_DESC[uiMode] ?? MODE_DESC[m.mode] ?? "";
+    article.append(desc);
     host.appendChild(article);
   });
 
@@ -302,30 +354,49 @@ function showAlert(msg: string) {
   }
 }
 
-async function openRecordForExisting(id: string) {
+function keysForSlot(m: Mapping, slot: "tap" | "hold" | "toggle"): string[] {
+  if (slot === "hold") return [...(m.hold_keys ?? [])];
+  if (slot === "tap") return [...(m.tap_keys ?? (m.mode === "click" ? m.keys : []))];
+  return [...(m.keys ?? [])];
+}
+
+async function openRecordForExisting(id: string, slot: "tap" | "hold" | "toggle" = "tap") {
   const m = mappings.find((x) => x.id === id);
   if (!m) return;
+  const initialKeys = keysForSlot(m, slot);
   currentDraft = {
     button: m.button,
     isNew: false,
     existingId: m.id,
-    initialKeys: [...m.keys],
+    initialKeys,
+    slot,
   };
-  recordBuf = [...m.keys];
+  recordBuf = [...initialKeys];
   $("record-mask").classList.remove("hidden");
-  renderKeys($("record-keys"), recordBuf, false);
+  const title = $("record-mask").querySelector("h2");
+  if (title) {
+    title.textContent =
+      slot === "hold" ? "录长按组合键" : slot === "tap" ? "录短按组合键" : "录切换组合键";
+  }
+  renderKeys($("record-keys"), recordBuf, { dimEmpty: false, removable: true });
   await invoke("arm_record");
 }
 
-async function openRecordForNew(button: string) {
+async function openRecordForNew(button: string, slot: "tap" | "hold" | "toggle" = "tap") {
   currentDraft = {
     button,
     isNew: true,
     initialKeys: [],
+    slot,
   };
   recordBuf = [];
   $("record-mask").classList.remove("hidden");
-  renderKeys($("record-keys"), []);
+  const title = $("record-mask").querySelector("h2");
+  if (title) {
+    title.textContent =
+      slot === "hold" ? "录长按组合键" : slot === "tap" ? "录短按组合键" : "录切换组合键";
+  }
+  renderKeys($("record-keys"), [], { removable: true });
   await invoke("arm_record");
 }
 
@@ -359,26 +430,35 @@ async function confirmRecord() {
     return;
   }
 
+  const slot = currentDraft.slot ?? (inferTriggerMode(currentDraft.button, finalKeys) === "hold" ? "hold" : "tap");
   if (currentDraft.isNew) {
-    const inferredMode = inferTriggerMode(currentDraft.button, finalKeys);
-    const newMapping: Mapping = {
+    const newMapping: Mapping = normalizeMapping({
       id: crypto.randomUUID(),
       button: currentDraft.button,
-      mode: inferredMode,
-      keys: [...finalKeys],
-    };
+      mode: slot === "toggle" ? "toggle" : "dual",
+      keys: slot === "toggle" ? [...finalKeys] : [],
+      tap_keys: slot === "tap" ? [...finalKeys] : [],
+      hold_keys: slot === "hold" ? [...finalKeys] : [],
+    });
     mappings.push(newMapping);
     selectedMappingId = newMapping.id;
   } else {
     const existing = mappings.find((x) => x.id === currentDraft?.existingId);
     if (existing) {
-      existing.keys = [...finalKeys];
-      if (
-        (existing.button === "wheelup" || existing.button === "wheeldown") &&
-        existing.mode !== "click"
-      ) {
-        existing.mode = "click";
+      if (slot === "toggle") {
+        existing.mode = "toggle";
+        existing.keys = [...finalKeys];
+        existing.tap_keys = [];
+        existing.hold_keys = [];
+      } else if (slot === "hold") {
+        existing.hold_keys = [...finalKeys];
+        existing.mode = existing.mode === "toggle" ? "dual" : existing.mode || "dual";
+        if (existing.mode !== "toggle") existing.mode = "dual";
+      } else {
+        existing.tap_keys = [...finalKeys];
+        if (existing.mode !== "toggle") existing.mode = "dual";
       }
+      mappings = mappings.map((x) => (x.id === existing.id ? normalizeMapping(existing) : x));
     }
   }
 
@@ -513,19 +593,22 @@ async function boot() {
     document.querySelector(".listen-sheet")?.classList.remove("armed");
 
     const existing = mappings.find((x) => x.button === capturedButton);
+    const inferredSlot =
+      capturedButton === "wheelup" || capturedButton === "wheeldown" ? "tap" : "hold";
     if (existing) {
       selectedMappingId = existing.id;
       renderMaps(capturedButton);
-      await openRecordForExisting(existing.id);
+      const slot =
+        existing.mode === "toggle" ? "toggle" : inferredSlot === "hold" && !(existing.hold_keys?.length) && (existing.tap_keys?.length) ? "tap" : inferredSlot;
+      await openRecordForExisting(existing.id, slot);
     } else {
-      // 事务式草稿：不添加进 mappings，不保存
-      await openRecordForNew(capturedButton);
+      await openRecordForNew(capturedButton, inferredSlot);
     }
   });
 
   await listen<string[]>("record-keys", (ev) => {
     recordBuf = ev.payload ?? [];
-    renderKeys($("record-keys"), recordBuf);
+    renderKeys($("record-keys"), recordBuf, { removable: true });
   });
 
   await listen("record-cancel", () => {
@@ -574,10 +657,29 @@ $("maps").addEventListener("change", async (e) => {
     m.button = nextBtn;
     if (nextBtn === "wheelup" || nextBtn === "wheeldown") {
       m.mode = "click";
+      m.tap_keys = m.tap_keys?.length ? m.tap_keys : m.keys;
+      m.hold_keys = [];
     }
   }
   if (sel.dataset.k === "mode") {
-    m.mode = sel.value;
+    if (sel.value === "toggle") {
+      m.mode = "toggle";
+      if (!m.keys.length) {
+        m.keys = m.tap_keys?.length ? m.tap_keys : m.hold_keys ?? [];
+      }
+      m.tap_keys = [];
+      m.hold_keys = [];
+    } else if (sel.value === "click") {
+      m.mode = "click";
+      m.tap_keys = m.tap_keys?.length ? m.tap_keys : m.keys;
+      m.hold_keys = [];
+    } else {
+      m.mode = "dual";
+      if (!m.tap_keys?.length && !m.hold_keys?.length && m.keys.length) {
+        m.hold_keys = inferTriggerMode(m.button, m.keys) === "hold" ? m.keys : [];
+        m.tap_keys = m.hold_keys.length ? [] : m.keys;
+      }
+    }
   }
 
   // 清除该按键的旧 runtime 活跃状态
@@ -606,10 +708,33 @@ $("maps").addEventListener("click", async (e) => {
     return;
   }
 
+  const removeKey = t.dataset.removeKey ?? t.closest("button")?.getAttribute("data-remove-key");
+  if (removeKey) {
+    const slot = (t.closest(".combo") as HTMLElement | null)?.dataset.slot as
+      | "tap"
+      | "hold"
+      | "toggle"
+      | undefined;
+    const target = mappings.find((m) => m.id === id);
+    if (target && slot) {
+      if (slot === "hold") {
+        target.hold_keys = (target.hold_keys ?? []).filter((k) => k !== removeKey);
+      } else if (slot === "tap") {
+        target.tap_keys = (target.tap_keys ?? []).filter((k) => k !== removeKey);
+      } else {
+        target.keys = target.keys.filter((k) => k !== removeKey);
+      }
+      await persist();
+      renderMaps();
+    }
+    return;
+  }
+
   if (t.dataset.act === "record") {
+    const slot = (t.dataset.slot as "tap" | "hold" | "toggle") || "tap";
     selectedMappingId = id;
     renderMaps();
-    openRecordForExisting(id);
+    openRecordForExisting(id, slot);
     return;
   }
 
@@ -631,6 +756,17 @@ $("record-mask").addEventListener("click", (e) => {
   if (e.target === $("record-mask")) {
     closeRecord();
   }
+});
+
+$("record-keys").addEventListener("click", async (e) => {
+  const t = e.target as HTMLElement;
+  const key = t.dataset.removeKey;
+  if (!key || !currentDraft) return;
+  e.preventDefault();
+  e.stopPropagation();
+  recordBuf = recordBuf.filter((k) => k !== key);
+  renderKeys($("record-keys"), recordBuf, { removable: true });
+  await invoke("remove_record_key", { key });
 });
 
 $("record-chips").addEventListener("click", async (e) => {
@@ -672,6 +808,73 @@ $("chk-autostart").addEventListener("change", async (e) => {
   }
 });
 
-boot().catch((err) => {
-  console.error("MouseInsight 初始化异常:", err);
-});
+function parseVer(v: string): number[] {
+  return v
+    .replace(/^v/i, "")
+    .split(".")
+    .map((n) => parseInt(n, 10) || 0);
+}
+
+function isNewer(remote: string, current: string): boolean {
+  const a = parseVer(remote);
+  const b = parseVer(current);
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return false;
+}
+
+async function checkForUpdate(current: string) {
+  const status = $("update-status");
+  status.textContent = "正在检查…";
+  try {
+    let remoteVer = "";
+    let remoteUrl = "https://github.com/lingcang728/MouseInsight/releases/latest";
+    try {
+      const r = await fetch(
+        "https://github.com/lingcang728/MouseInsight/releases/latest/download/latest.json"
+      );
+      if (r.ok) {
+        const j = await r.json();
+        remoteVer = String(j.version ?? "").replace(/^v/i, "");
+        if (j.url) remoteUrl = String(j.url);
+      }
+    } catch {
+      /* fallback below */
+    }
+    if (!remoteVer) {
+      const r = await fetch("https://api.github.com/repos/lingcang728/MouseInsight/releases/latest");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      remoteVer = String(j.tag_name ?? "").replace(/^v/i, "");
+      if (j.html_url) remoteUrl = String(j.html_url);
+    }
+    if (!remoteVer) throw new Error("empty version");
+    if (isNewer(remoteVer, current)) {
+      status.textContent = `有新版本 v${remoteVer}`;
+      await invoke("open_url", { url: remoteUrl });
+    } else {
+      status.textContent = "已是最新版";
+    }
+  } catch (err) {
+    status.textContent = `检查失败：${String(err)}`;
+  }
+}
+
+boot()
+  .then(async () => {
+    try {
+      const ver = await invoke<string>("app_version");
+      $("app-version").textContent = `v${ver}`;
+      $("btn-check-update").addEventListener("click", () => {
+        void checkForUpdate(ver);
+      });
+    } catch {
+      $("app-version").textContent = "v0.1.3";
+    }
+  })
+  .catch((err) => {
+    console.error("MouseInsight 初始化异常:", err);
+  });
