@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="darkreader-lock" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Mouse Insight</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="rail">
+        <div class="brand">
+          <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+            <rect class="mark-bg" width="32" height="32" rx="9" />
+            <rect class="mark-body" x="10" y="6" width="12" height="20" rx="6" />
+            <rect class="mark-bg" x="15.2" y="8" width="1.6" height="7" rx="0.8" />
+            <rect class="mark-body" x="7" y="15" width="3" height="5" rx="1.2" />
+          </svg>
+          <div>
+            <strong>Mouse Insight</strong>
+          </div>
+        </div>
+        <p class="rail-note">左键右键永远放行，不会被这程序吞掉。紧急时按 Pause 解除拦截。</p>
+        <div class="rail-spacer"></div>
+        <button type="button" class="ghost" id="btn-pause">暂停映射</button>
+        <button type="button" class="ghost" id="btn-theme">换成浅色</button>
+        <button type="button" class="ghost danger-exit" id="btn-quit">退出</button>
+      </aside>
+
+      <main class="stage">
+        <header class="hero">
+          <h1>先看见，再动手</h1>
+          <p>先听鼠标上的键，再录键盘上任意键。任何 Windows 认得到的鼠标都能用。</p>
+        </header>
+
+        <div id="xmbc-banner" class="banner hidden">
+          检测到 X-Mouse Button Control 还在跑。两套钩子会抢事件，先退出它。
+        </div>
+
+        <section class="insight">
+          <div class="sheet pulse-sheet">
+            <div class="sheet-top">
+              <span>刚才这颗</span>
+              <span id="pulse-ago" class="meta">还没按过</span>
+            </div>
+            <div class="pulse-body">
+              <div class="mouse" aria-hidden="true">
+                <div class="mouse-thumbs">
+                  <i id="zone-xbutton1" class="zone side s1"></i>
+                  <i id="zone-xbutton2" class="zone side s2"></i>
+                </div>
+                <div class="mouse-shell">
+                  <div class="mouse-lids">
+                    <i id="zone-left" class="zone lid left"></i>
+                    <i id="zone-middle" class="zone wheel"></i>
+                    <i id="zone-right" class="zone lid right"></i>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div id="pulse-name" class="pulse-name">等你按一下</div>
+                <div id="pulse-state" class="meta">洞察只看 Windows 认得到的键</div>
+                <div class="dots" id="dots"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="sheet listen-sheet">
+            <div class="sheet-top"><span>听下一颗键</span></div>
+            <p class="listen-copy" id="listen-copy">点开始听，再按鼠标上任意一颗键。然后录键盘上你想发的键，不限 Typeless。</p>
+            <button type="button" class="solid" id="btn-listen">开始听</button>
+          </div>
+        </section>
+
+        <section class="maps-wrap">
+          <div class="sheet-top">
+            <span>映射</span>
+            <span class="meta">只改你列出的键</span>
+          </div>
+          <div id="maps" class="maps"></div>
+        </section>
+      </main>
+
+      <aside class="dock">
+        <div class="sheet dock-card">
+          <div class="sheet-top"><span>当前组合</span></div>
+          <p class="dock-lead" id="dock-lead">还没有绑定</p>
+          <div class="keys" id="dock-keys">
+            <span class="key dim">空</span>
+          </div>
+          <p class="meta" id="dock-hint">键盘任意键都能录。Typeless 听写可录 Left Ctrl + Left Alt。</p>
+        </div>
+        <div class="sheet dock-card">
+          <div class="sheet-top"><span>设置</span></div>
+          <label class="check">
+            <input type="checkbox" id="chk-autostart" />
+            开机自启
+          </label>
+          <p class="meta">配置跟安装包放在一起</p>
+          <p class="meta path" id="cfg-path"></p>
+        </div>
+      </aside>
+    </div>
+
+    <div id="record-mask" class="mask hidden">
+      <div class="sheet record-card">
+        <h2>同时按下组合键</h2>
+        <div class="keys" id="record-keys"><span class="key dim">在听</span></div>
+        <div class="chips" id="record-chips">
+          <button type="button" data-key="LControl">Left Ctrl</button>
+          <button type="button" data-key="LAlt">Left Alt</button>
+          <button type="button" data-key="RAlt">Right Alt</button>
+          <button type="button" data-key="LShift">Shift</button>
+          <button type="button" data-key="LWin">Win</button>
+        </div>
+        <p class="meta">一起按住 Ctrl、Alt 或其它键。点「就这个」确认，Esc 取消。录制时不会触发 Typeless。</p>
+        <div class="row">
+          <button type="button" class="ghost" id="record-cancel">取消</button>
+          <button type="button" class="solid" id="record-ok">就这个</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

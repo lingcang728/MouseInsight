@@ -1,0 +1,24 @@
+{
+  "name": "mouse-insight",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mouse Insight",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "package:release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-autostart": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "~5.6",
+    "vite": "^6"
+  }
+}
