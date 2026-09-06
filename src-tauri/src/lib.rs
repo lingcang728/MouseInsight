@@ -1,10 +1,17 @@
 mod engine;
 
-use engine::{Mapping, Pulse, Snapshot};
-use tauri::menu::{Menu, MenuItem};
+use engine::{Mapping, Pulse, SendReport, Snapshot};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
+
+static WINDOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct TrayState {
+    pause_item: MenuItem<tauri::Wry>,
+}
 
 #[tauri::command]
 fn get_snapshot() -> Snapshot {
@@ -12,23 +19,24 @@ fn get_snapshot() -> Snapshot {
 }
 
 #[tauri::command]
-fn save_mappings(mappings: Vec<Mapping>) {
-    engine::set_mappings(mappings);
+fn save_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
+    engine::set_mappings(mappings)
 }
 
 #[tauri::command]
-fn save_theme(theme: String) {
-    engine::set_theme(theme);
+fn save_theme(theme: String) -> Result<(), String> {
+    engine::set_theme(theme)
 }
 
 #[tauri::command]
-fn save_paused(paused: bool) {
-    engine::set_paused(paused);
+fn save_paused(app: tauri::AppHandle, paused: bool) -> Result<(), String> {
+    sync_engine_paused_state(&app, paused);
+    Ok(())
 }
 
 #[tauri::command]
-fn save_autostart(on: bool) {
-    engine::set_autostart_flag(on);
+fn save_autostart(on: bool) -> Result<(), String> {
+    engine::set_autostart_flag(on)
 }
 
 #[tauri::command]
@@ -67,111 +75,201 @@ fn config_dir() -> String {
 }
 
 #[tauri::command]
+fn open_config_dir() -> Result<(), String> {
+    let dir = engine::config_dir();
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let _ = Command::new("explorer").arg(dir).spawn();
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     engine::shutdown();
     app.exit(0);
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-        #[cfg(target_os = "windows")]
-        if let Ok(hwnd) = w.hwnd() {
-            unsafe {
-                use windows::Win32::Foundation::HWND;
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
-                    SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
-                };
-                use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+pub fn sync_engine_paused_state(app: &tauri::AppHandle, paused: bool) {
+    let _ = engine::set_paused(paused);
 
-                let win_hwnd = HWND(hwnd.0 as _);
-                let fore_hwnd = GetForegroundWindow();
-                let fore_tid = GetWindowThreadProcessId(fore_hwnd, None);
-                let cur_tid = GetCurrentThreadId();
+    if let Some(tray) = app.tray_by_id("main") {
+        let tip = if paused {
+            "Mouse Insight · 已暂停"
+        } else {
+            "Mouse Insight · 已启用"
+        };
+        let _ = tray.set_tooltip(Some(tip));
+    }
 
-                if fore_tid != cur_tid && fore_tid != 0 {
-                    let _ = AttachThreadInput(cur_tid, fore_tid, true);
-                    let _ = ShowWindow(win_hwnd, SW_RESTORE);
-                    let _ = ShowWindow(win_hwnd, SW_SHOW);
-                    let _ = BringWindowToTop(win_hwnd);
-                    let _ = SetForegroundWindow(win_hwnd);
-                    let _ = AttachThreadInput(cur_tid, fore_tid, false);
-                } else {
-                    let _ = ShowWindow(win_hwnd, SW_RESTORE);
-                    let _ = ShowWindow(win_hwnd, SW_SHOW);
-                    let _ = BringWindowToTop(win_hwnd);
-                    let _ = SetForegroundWindow(win_hwnd);
-                }
+    if let Some(state) = app.try_state::<TrayState>() {
+        let text = if paused { "恢复映射" } else { "暂停映射" };
+        let _ = state.pause_item.set_text(text);
+    }
+
+    let _ = app.emit("engine-state-changed", serde_json::json!({ "paused": paused }));
+}
+
+fn bring_hwnd_to_front(w: &tauri::WebviewWindow) {
+    let _ = w.show();
+    let _ = w.unminimize();
+    let _ = w.set_focus();
+
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = w.hwnd() {
+        unsafe {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+            use windows::Win32::UI::WindowsAndMessaging::{
+                BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
+                SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+            };
+
+            let win_hwnd = HWND(hwnd.0 as _);
+            let fore_hwnd = GetForegroundWindow();
+            let fore_tid = GetWindowThreadProcessId(fore_hwnd, None);
+            let cur_tid = GetCurrentThreadId();
+
+            if fore_tid != cur_tid && fore_tid != 0 {
+                let _ = AttachThreadInput(cur_tid, fore_tid, true);
+                let _ = ShowWindow(win_hwnd, SW_RESTORE);
+                let _ = ShowWindow(win_hwnd, SW_SHOW);
+                let _ = BringWindowToTop(win_hwnd);
+                let _ = SetForegroundWindow(win_hwnd);
+                let _ = AttachThreadInput(cur_tid, fore_tid, false);
+            } else {
+                let _ = ShowWindow(win_hwnd, SW_RESTORE);
+                let _ = ShowWindow(win_hwnd, SW_SHOW);
+                let _ = BringWindowToTop(win_hwnd);
+                let _ = SetForegroundWindow(win_hwnd);
             }
         }
-    } else {
-        // Fallback: Recreate window if somehow closed
-        let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-            .title("Mouse Insight")
-            .inner_size(1180.0, 760.0)
-            .min_inner_size(920.0, 620.0)
-            .center()
-            .decorations(true)
-            .build();
+    }
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        bring_hwnd_to_front(&w);
+        engine::set_window_visible(true);
+        WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+    } else if let Ok(w) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("Mouse Insight")
+        .inner_size(1180.0, 760.0)
+        .min_inner_size(920.0, 620.0)
+        .center()
+        .decorations(true)
+        .build()
+    {
+        WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+        engine::set_window_visible(true);
+        bring_hwnd_to_front(&w);
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let is_autostart = std::env::args().any(|arg| arg == "--autostart");
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            None,
+            Some(vec!["--autostart"]),
         ))
-        .on_window_event(|window, event| match event {
-            WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
+        .on_window_event(|_window, event| match event {
+            WindowEvent::CloseRequested { .. } => {
                 engine::disarm_record();
-                let _ = window.hide();
+                engine::set_window_visible(false);
+                WINDOW_ACTIVE.store(false, Ordering::Relaxed);
+            }
+            WindowEvent::Destroyed => {
+                engine::set_window_visible(false);
+                WINDOW_ACTIVE.store(false, Ordering::Relaxed);
             }
             WindowEvent::Focused(false) => {
                 engine::disarm_record();
             }
             _ => {}
         })
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
             let handle2 = app.handle().clone();
             let handle3 = app.handle().clone();
             let handle4 = app.handle().clone();
+            let handle_pause = app.handle().clone();
+            let handle_err = app.handle().clone();
+
             engine::start(
                 move |pulse: Pulse| {
-                    let _ = handle.emit("mouse-pulse", pulse);
+                    if WINDOW_ACTIVE.load(Ordering::Relaxed) {
+                        let _ = handle.emit("mouse-pulse", pulse);
+                    }
                 },
                 move |button: String| {
-                    let _ = handle2.emit("listen-captured", button);
+                    if WINDOW_ACTIVE.load(Ordering::Relaxed) {
+                        let _ = handle2.emit("listen-captured", button);
+                    }
                 },
                 move |keys: Vec<String>| {
-                    let _ = handle3.emit("record-keys", keys);
+                    if WINDOW_ACTIVE.load(Ordering::Relaxed) {
+                        let _ = handle3.emit("record-keys", keys);
+                    }
                 },
                 move || {
-                    let _ = handle4.emit("record-cancel", ());
+                    if WINDOW_ACTIVE.load(Ordering::Relaxed) {
+                        let _ = handle4.emit("record-cancel", ());
+                    }
+                },
+                move |paused: bool| {
+                    sync_engine_paused_state(&handle_pause, paused);
+                },
+                move |report: SendReport| {
+                    if WINDOW_ACTIVE.load(Ordering::Relaxed) {
+                        let _ = handle_err.emit("injection-error", report);
+                    }
                 },
             );
 
-            let show = MenuItem::with_id(app, "show", "打开", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let initial_snap = engine::snapshot();
+            let is_paused = initial_snap.config.paused;
+
+            let show_item = MenuItem::with_id(app, "show", "打开控制面板", true, None::<&str>)?;
+            let pause_item = MenuItem::with_id(
+                app,
+                "toggle_pause",
+                if is_paused { "恢复映射" } else { "暂停映射" },
+                true,
+                None::<&str>,
+            )?;
+            let sep = PredefinedMenuItem::separator(app)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+
+            let menu = Menu::with_items(app, &[&show_item, &pause_item, &sep, &quit_item])?;
+            app.manage(TrayState {
+                pause_item: pause_item.clone(),
+            });
+
+            let tooltip = if is_paused {
+                "Mouse Insight · 已暂停"
+            } else {
+                "Mouse Insight · 已启用"
+            };
 
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().cloned().unwrap())
-                .tooltip("Mouse Insight")
+                .tooltip(tooltip)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         show_main_window(app);
+                    }
+                    "toggle_pause" => {
+                        let current_paused = engine::snapshot().config.paused;
+                        sync_engine_paused_state(app, !current_paused);
                     }
                     "quit" => {
                         engine::shutdown();
@@ -197,6 +295,10 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            if !is_autostart {
+                show_main_window(&app.handle());
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -212,6 +314,7 @@ pub fn run() {
             take_record_keys,
             xmbc_running,
             config_dir,
+            open_config_dir,
             quit_app
         ]);
 
@@ -227,4 +330,3 @@ pub fn run() {
         }
     });
 }
-

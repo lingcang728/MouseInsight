@@ -6,7 +6,7 @@ type Mapping = {
   button: string;
   mode: string;
   keys: string[];
-  label: string;
+  label?: string;
 };
 
 type Pulse = {
@@ -16,8 +16,17 @@ type Pulse = {
   swallowed: boolean;
 };
 
+type SendReport = {
+  timestamp: number;
+  expected: number;
+  inserted: number;
+  win32_error: number;
+  is_uipi_blocked: boolean;
+};
+
 type Snapshot = {
   config: {
+    schema_version: number;
     theme: string;
     autostart: boolean;
     paused: boolean;
@@ -26,6 +35,8 @@ type Snapshot = {
   xmbc_running: boolean;
   last: Pulse | null;
   listening: boolean;
+  is_portable: boolean;
+  config_dir: string;
 };
 
 const BUTTON_LABEL: Record<string, string> = {
@@ -45,17 +56,14 @@ const MODE_LABEL: Record<string, string> = {
 };
 
 let mappings: Mapping[] = [];
+let selectedMappingId: string | null = null;
 let recordingFor: string | null = null;
 let recordBuf: string[] = [];
-let listening = false;
+let isPaused = false;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-function prettyKeys(keys: string[]) {
+function prettyKeys(keys: string[]): string[] {
   if (!keys.length) return ["空"];
   return keys.map((k) => {
     if (k === "LControl") return "Left Ctrl";
@@ -71,9 +79,13 @@ function prettyKeys(keys: string[]) {
 
 function renderKeys(el: HTMLElement, keys: string[], dimEmpty = true) {
   const labels = prettyKeys(keys);
-  el.innerHTML = labels
-    .map((k) => `<span class="key${keys.length || !dimEmpty ? "" : " dim"}">${k}</span>`)
-    .join("");
+  el.replaceChildren();
+  labels.forEach((k) => {
+    const span = document.createElement("span");
+    span.className = `key${keys.length || !dimEmpty ? "" : " dim"}`;
+    span.textContent = k;
+    el.appendChild(span);
+  });
 }
 
 function applyTheme(theme: string) {
@@ -82,13 +94,20 @@ function applyTheme(theme: string) {
 }
 
 function setPausedUi(paused: boolean) {
+  isPaused = paused;
   $("btn-pause").textContent = paused ? "继续映射" : "暂停映射";
 }
 
 function paintDots(button: string) {
   const host = $("dots");
   if (!host.childElementCount) {
-    host.innerHTML = Array.from({ length: 16 * 4 }, () => `<i class="dot"></i>`).join("");
+    const fragment = document.createDocumentFragment();
+    for (let i = 0; i < 16 * 4; i++) {
+      const dot = document.createElement("i");
+      dot.className = "dot";
+      fragment.appendChild(dot);
+    }
+    host.appendChild(fragment);
   }
   const dots = [...host.children] as HTMLElement[];
   const col = { xbutton1: 1, xbutton2: 3, middle: 7, wheelup: 9, wheeldown: 10, left: 12, right: 14 }[
@@ -109,83 +128,104 @@ function highlightMouse(button: string) {
   document.getElementById(id)?.classList.add("on");
 }
 
-function renderMaps(liveButton?: string) {
-  const host = $("maps");
-  if (!mappings.length) {
-    host.innerHTML = `<p class="meta">还没有映射。先听一颗键。</p>`;
+function renderDock() {
+  const selected = mappings.find((m) => m.id === selectedMappingId) ?? mappings[0];
+  if (!selected) {
     $("dock-lead").textContent = "还没有绑定";
     renderKeys($("dock-keys"), []);
     return;
   }
-  host.innerHTML = mappings
-    .map((m) => {
-      const live = m.button === liveButton ? " live" : "";
-      return `<article class="map${live}" data-id="${m.id}" data-button="${m.button}">
-        <select data-k="button">${Object.entries(BUTTON_LABEL)
-          .map(([v, l]) => `<option value="${v}" ${m.button === v ? "selected" : ""}>${l}</option>`)
-          .join("")}</select>
-        <select data-k="mode">${Object.entries(MODE_LABEL)
-          .map(([v, l]) => `<option value="${v}" ${m.mode === v ? "selected" : ""}>${l}</option>`)
-          .join("")}</select>
-        <button type="button" class="ghost" data-act="record">${prettyKeys(m.keys)
-          .map((k) => k)
-          .join(" + ") || "录快捷键"}</button>
-        <button type="button" class="danger" data-act="del" aria-label="删除">删除</button>
-      </article>`;
-    })
-    .join("");
+  $("dock-lead").textContent = `${BUTTON_LABEL[selected.button] ?? selected.button} · ${MODE_LABEL[selected.mode] ?? selected.mode}`;
+  renderKeys($("dock-keys"), selected.keys);
+}
 
-  const first = mappings[0];
-  $("dock-lead").textContent = `${BUTTON_LABEL[first.button] ?? first.button} · ${MODE_LABEL[first.mode]}`;
-  renderKeys($("dock-keys"), first.keys);
+function renderMaps(liveButton?: string) {
+  const host = $("maps");
+  if (!mappings.length) {
+    host.replaceChildren();
+    const p = document.createElement("p");
+    p.className = "meta";
+    p.textContent = "还没有映射。先听一颗键。";
+    host.appendChild(p);
+    selectedMappingId = null;
+    renderDock();
+    return;
+  }
+
+  if (!mappings.some((m) => m.id === selectedMappingId)) {
+    selectedMappingId = mappings[0].id;
+  }
+
+  host.replaceChildren();
+  mappings.forEach((m) => {
+    const article = document.createElement("article");
+    const isLive = m.button === liveButton;
+    const isSelected = m.id === selectedMappingId;
+    article.className = `map${isLive ? " live" : ""}${isSelected ? " selected" : ""}`;
+    article.dataset.id = m.id;
+    article.dataset.button = m.button;
+
+    // Button selector with duplicate prevention
+    const selButton = document.createElement("select");
+    selButton.dataset.k = "button";
+    Object.entries(BUTTON_LABEL).forEach(([v, l]) => {
+      const opt = document.createElement("option");
+      opt.value = v;
+      const isOccupied = mappings.some((other) => other.id !== m.id && other.button === v);
+      opt.textContent = isOccupied ? `${l} (已绑定)` : l;
+      opt.selected = m.button === v;
+      opt.disabled = isOccupied;
+      selButton.appendChild(opt);
+    });
+
+    // Mode selector
+    const selMode = document.createElement("select");
+    selMode.dataset.k = "mode";
+    Object.entries(MODE_LABEL).forEach(([v, l]) => {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = l;
+      opt.selected = m.mode === v;
+      selMode.appendChild(opt);
+    });
+
+    // Key record button
+    const btnRecord = document.createElement("button");
+    btnRecord.type = "button";
+    btnRecord.className = "ghost";
+    btnRecord.dataset.act = "record";
+    const keyLabels = prettyKeys(m.keys).join(" + ");
+    btnRecord.textContent = m.keys.length ? keyLabels : "录快捷键";
+
+    // Delete button
+    const btnDel = document.createElement("button");
+    btnDel.type = "button";
+    btnDel.className = "danger";
+    btnDel.dataset.act = "del";
+    btnDel.setAttribute("aria-label", "删除");
+    btnDel.textContent = "删除";
+
+    article.append(selButton, selMode, btnRecord, btnDel);
+    host.appendChild(article);
+  });
+
+  renderDock();
 }
 
 async function persist() {
-  await invoke("save_mappings", { mappings });
+  try {
+    await invoke("save_mappings", { mappings });
+  } catch (err) {
+    showAlert(`保存配置失败: ${String(err)}`);
+  }
 }
 
-function codeToToken(e: KeyboardEvent): string | null {
-  const map: Record<string, string> = {
-    ControlLeft: "LControl",
-    ControlRight: "RControl",
-    AltLeft: "LAlt",
-    AltRight: "RAlt",
-    ShiftLeft: "LShift",
-    ShiftRight: "RShift",
-    MetaLeft: "LWin",
-    MetaRight: "RWin",
-    Space: "Space",
-    Enter: "Enter",
-    Tab: "Tab",
-    Escape: "Escape",
-    Backspace: "Backspace",
-    Delete: "Delete",
-    Insert: "Insert",
-    Home: "Home",
-    End: "End",
-    PageUp: "PageUp",
-    PageDown: "PageDown",
-    ArrowLeft: "ArrowLeft",
-    ArrowRight: "ArrowRight",
-    ArrowUp: "ArrowUp",
-    ArrowDown: "ArrowDown",
-    Minus: "Minus",
-    Equal: "Equal",
-    Comma: "Comma",
-    Period: "Period",
-    Slash: "Slash",
-    Backquote: "Backquote",
-    BracketLeft: "BracketLeft",
-    Backslash: "Backslash",
-    BracketRight: "BracketRight",
-    Quote: "Quote",
-    Semicolon: "Semicolon",
-  };
-  if (map[e.code]) return map[e.code];
-  if (/^Key[A-Z]$/.test(e.code)) return e.code.slice(3);
-  if (/^Digit[0-9]$/.test(e.code)) return e.code.slice(5);
-  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(e.code)) return e.code;
-  return null;
+function showAlert(msg: string) {
+  const banner = $("alert-banner");
+  if (banner) {
+    banner.textContent = msg;
+    banner.classList.remove("hidden");
+  }
 }
 
 async function openRecord(id: string) {
@@ -204,13 +244,29 @@ async function closeRecord() {
 
 async function boot() {
   const snap = await invoke<Snapshot>("get_snapshot");
-  mappings = snap.config.mappings ?? [];
+  const seenButtons = new Set<string>();
+  mappings = (snap.config.mappings ?? []).filter((m) => {
+    if (seenButtons.has(m.button)) return false;
+    seenButtons.add(m.button);
+    return true;
+  });
+  if (mappings.length) {
+    selectedMappingId = mappings[0].id;
+  }
+
   applyTheme(snap.config.theme || "dark");
   setPausedUi(!!snap.config.paused);
-  $("chk-autostart").toggleAttribute("checked", !!snap.config.autostart);
   ($("chk-autostart") as HTMLInputElement).checked = !!snap.config.autostart;
   $("xmbc-banner").classList.toggle("hidden", !snap.xmbc_running);
-  $("cfg-path").textContent = await invoke<string>("config_dir");
+  
+  const modeTag = snap.is_portable ? "[便携模式] " : "[标准安装] ";
+  const pathEl = $("cfg-path");
+  pathEl.textContent = `${modeTag}${snap.config_dir}`;
+  pathEl.title = "点击在文件资源管理器中定位配置目录";
+  pathEl.addEventListener("click", async () => {
+    await invoke("open_config_dir");
+  });
+
   paintDots("xbutton1");
   renderMaps();
 
@@ -231,28 +287,52 @@ async function boot() {
     $("pulse-ago").textContent = p.down ? "按下" : "松开";
     highlightMouse(p.button);
     paintDots(p.button);
+
     document.querySelectorAll(".map").forEach((el) => {
       el.classList.toggle("live", (el as HTMLElement).dataset.button === p.button && p.down);
     });
+
+    if (p.down) {
+      const active = mappings.find((m) => m.button === p.button);
+      if (active && selectedMappingId !== active.id) {
+        selectedMappingId = active.id;
+        document.querySelectorAll(".map").forEach((el) => {
+          el.classList.toggle("selected", (el as HTMLElement).dataset.id === active.id);
+        });
+        renderDock();
+      }
+    }
+  });
+
+  await listen<{ paused: boolean }>("engine-state-changed", (ev) => {
+    setPausedUi(ev.payload.paused);
+  });
+
+  await listen<SendReport>("injection-error", (ev) => {
+    const r = ev.payload;
+    if (r.is_uipi_blocked) {
+      showAlert("⚠️ 快捷键注入受阻：目标窗口可能以管理员权限运行（受 Windows UIPI 特权保护）。如有需要，请以管理员身份启动 Mouse Insight。");
+    } else {
+      showAlert(`⚠️ 按键注入失败 (成功 ${r.inserted}/${r.expected}, 错误码 ${r.win32_error})`);
+    }
   });
 
   await listen<string>("listen-captured", async (ev) => {
-    listening = false;
     $("listen-copy").textContent = `听到了：${BUTTON_LABEL[ev.payload] ?? ev.payload}。请录键盘。`;
     $("btn-listen").textContent = "再听一颗";
     document.querySelector(".listen-sheet")?.classList.remove("armed");
     let m = mappings.find((x) => x.button === ev.payload);
     if (!m) {
       m = {
-        id: uid(),
+        id: crypto.randomUUID(),
         button: ev.payload,
         mode: "hold",
         keys: [],
-        label: BUTTON_LABEL[ev.payload] ?? ev.payload,
       };
       mappings.push(m);
-      persist();
+      await persist();
     }
+    selectedMappingId = m.id;
     renderMaps(ev.payload);
     await openRecord(m.id);
   });
@@ -274,19 +354,19 @@ $("btn-theme").addEventListener("click", async () => {
 });
 
 $("btn-pause").addEventListener("click", async () => {
-  const willPause = $("btn-pause").textContent === "暂停映射";
-  setPausedUi(willPause);
-  await invoke("save_paused", { paused: willPause });
+  const next = !isPaused;
+  setPausedUi(next);
+  await invoke("save_paused", { paused: next });
 });
 
 $("btn-listen").addEventListener("click", async () => {
-  listening = true;
   $("listen-copy").textContent = "在听。按鼠标上你要绑定的那颗键，左右键也可以。";
   $("btn-listen").textContent = "在听…";
   document.querySelector(".listen-sheet")?.classList.add("armed");
   await invoke("arm_listen");
 });
 
+// Quit button: bound only ONCE
 $("btn-quit").addEventListener("click", async () => {
   await invoke("quit_app");
 });
@@ -298,8 +378,19 @@ $("maps").addEventListener("change", async (e) => {
   const m = mappings.find((x) => x.id === row.dataset.id);
   if (!m) return;
   const sel = t as HTMLSelectElement;
-  if (sel.dataset.k === "button") m.button = sel.value;
-  if (sel.dataset.k === "mode") m.mode = sel.value;
+
+  if (sel.dataset.k === "button") {
+    const nextBtn = sel.value;
+    const isConflict = mappings.some((other) => other.id !== m.id && other.button === nextBtn);
+    if (isConflict) {
+      sel.value = m.button;
+      return;
+    }
+    m.button = nextBtn;
+  }
+  if (sel.dataset.k === "mode") {
+    m.mode = sel.value;
+  }
   await persist();
   renderMaps();
 });
@@ -309,17 +400,34 @@ $("maps").addEventListener("click", async (e) => {
   const row = t.closest(".map") as HTMLElement | null;
   if (!row) return;
   const id = row.dataset.id!;
+
   if (t.dataset.act === "del") {
     mappings = mappings.filter((m) => m.id !== id);
+    if (selectedMappingId === id) {
+      selectedMappingId = mappings[0]?.id ?? null;
+    }
     await persist();
     renderMaps();
+    return;
   }
-  if (t.dataset.act === "record") openRecord(id);
+
+  if (t.dataset.act === "record") {
+    selectedMappingId = id;
+    renderMaps();
+    openRecord(id);
+    return;
+  }
+
+  if (selectedMappingId !== id) {
+    selectedMappingId = id;
+    renderMaps();
+  }
 });
 
 $("record-cancel").addEventListener("click", () => {
   closeRecord();
 });
+
 $("record-ok").addEventListener("click", async () => {
   const keys = await invoke<string[]>("take_record_keys");
   const use = keys.length ? keys : recordBuf;
@@ -373,9 +481,6 @@ $("chk-autostart").addEventListener("change", async (e) => {
   }
 });
 
-$("btn-quit")?.addEventListener("click", async () => {
-  await invoke("quit_app");
+boot().catch((err) => {
+  console.error("MouseInsight 初始化异常:", err);
 });
-
-boot();
-

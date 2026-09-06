@@ -35,6 +35,7 @@
           <p>先听鼠标上的键，再录键盘上任意键。任何 Windows 认得到的鼠标都能用。</p>
         </header>
 
+        <div id="alert-banner" class="banner hidden" style="background: var(--surface-2); border-color: #eab308; color: var(--fg); margin-bottom: 12px;"></div>
         <div id="xmbc-banner" class="banner hidden">
           检测到 X-Mouse Button Control 还在跑。两套钩子会抢事件，先退出它。
         </div>
@@ -98,7 +99,7 @@
             <input type="checkbox" id="chk-autostart" />
             开机自启
           </label>
-          <p class="meta">配置跟安装包放在一起</p>
+          <p class="meta" id="cfg-mode-desc">配置文件位置 (点击在资源管理器中打开)</p>
           <p class="meta path" id="cfg-path"></p>
         </div>
       </aside>

@@ -10,4 +10,5 @@ src-tauri/gen/
 # Local build / user data next to the exe
 release/*.exe
 release/*.msi
+release/*.txt
 release/config.json

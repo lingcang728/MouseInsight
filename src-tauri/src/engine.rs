@@ -1,13 +1,16 @@
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use arc_swap::ArcSwap;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
     TH32CS_SNAPPROCESS,
@@ -15,24 +18,150 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_BACK,
     VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT,
     VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4,
     VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS,
     VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN,
-    VK_SCROLL, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VK_SCROLL, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, PostThreadMessageW,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, MSLLHOOKSTRUCT, MSG,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 const LLMHF_INJECTED: u32 = 0x0000_0001;
 const LLMHF_LOWER_IL_INJECTED: u32 = 0x0000_0002;
+const LLKHF_UP: u32 = 0x80;
+const LLKHF_INJECTED_KBD: u32 = 0x10;
 const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFF);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum MouseButton {
+    Left = 0,
+    Right = 1,
+    Middle = 2,
+    XButton1 = 3,
+    XButton2 = 4,
+    WheelUp = 5,
+    WheelDown = 6,
+}
+
+impl MouseButton {
+    pub const COUNT: usize = 7;
+
+    #[inline(always)]
+    pub fn is_primary(self) -> bool {
+        matches!(self, MouseButton::Left | MouseButton::Right)
+    }
+
+    #[inline(always)]
+    pub fn is_wheel(self) -> bool {
+        matches!(self, MouseButton::WheelUp | MouseButton::WheelDown)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MouseButton::Left => "left",
+            MouseButton::Right => "right",
+            MouseButton::Middle => "middle",
+            MouseButton::XButton1 => "xbutton1",
+            MouseButton::XButton2 => "xbutton2",
+            MouseButton::WheelUp => "wheelup",
+            MouseButton::WheelDown => "wheeldown",
+        }
+    }
+
+    pub fn from_str_fast(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(MouseButton::Left),
+            "right" => Some(MouseButton::Right),
+            "middle" => Some(MouseButton::Middle),
+            "xbutton1" => Some(MouseButton::XButton1),
+            "xbutton2" => Some(MouseButton::XButton2),
+            "wheelup" => Some(MouseButton::WheelUp),
+            "wheeldown" => Some(MouseButton::WheelDown),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerMode {
+    Hold,
+    Click,
+    Toggle,
+}
+
+impl TriggerMode {
+    pub fn from_str_fast(s: &str) -> Self {
+        match s {
+            "click" => TriggerMode::Click,
+            "toggle" => TriggerMode::Toggle,
+            _ => TriggerMode::Hold,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeySpec {
+    pub vk: VIRTUAL_KEY,
+    pub extended: bool,
+}
+
+impl std::hash::Hash for KeySpec {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.vk.0.hash(state);
+        self.extended.hash(state);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledAction {
+    pub mode: TriggerMode,
+    pub specs: Vec<KeySpec>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct CompiledMappings {
+    pub slots: [Option<CompiledAction>; MouseButton::COUNT],
+}
+
+impl CompiledMappings {
+    #[inline(always)]
+    pub fn get(&self, btn: MouseButton) -> Option<&CompiledAction> {
+        self.slots[btn as usize].as_ref()
+    }
+}
+
+pub fn compile_mappings(mappings: &[Mapping]) -> CompiledMappings {
+    let mut slots = [None, None, None, None, None, None, None];
+    for m in mappings {
+        if m.keys.is_empty() {
+            continue;
+        }
+        if let Some(btn) = MouseButton::from_str_fast(&m.button) {
+            let idx = btn as usize;
+            if slots[idx].is_none() {
+                let specs: Vec<KeySpec> = m.keys.iter().filter_map(|k| key_spec(k)).collect();
+                if !specs.is_empty() {
+                    let mode = TriggerMode::from_str_fast(&m.mode);
+                    slots[idx] = Some(CompiledAction {
+                        mode,
+                        specs,
+                    });
+                }
+            }
+        }
+    }
+    CompiledMappings { slots }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mapping {
@@ -40,20 +169,28 @@ pub struct Mapping {
     pub button: String,
     pub mode: String,
     pub keys: Vec<String>,
+    #[serde(default)]
     pub label: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub theme: String,
     pub autostart: bool,
     pub paused: bool,
     pub mappings: Vec<Mapping>,
 }
 
+fn default_schema_version() -> u32 {
+    1
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            schema_version: 1,
             theme: "dark".into(),
             autostart: false,
             paused: false,
@@ -76,63 +213,285 @@ pub struct Snapshot {
     pub xmbc_running: bool,
     pub last: Option<Pulse>,
     pub listening: bool,
+    pub is_portable: bool,
+    pub config_dir: String,
 }
 
-enum Cmd {
-    Pulse(Pulse),
-    Fire { button: String, down: bool },
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SendReport {
+    pub timestamp: u64,
+    pub expected: u32,
+    pub inserted: u32,
+    pub win32_error: u32,
+    pub is_uipi_blocked: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveBinding {
+    pub specs: Vec<KeySpec>,
+    pub mode: TriggerMode,
+}
+
+#[derive(Default)]
+pub struct InputState {
+    pub active_bindings: HashMap<MouseButton, ActiveBinding>,
+    pub key_refs: HashMap<KeySpec, u32>,
+    pub toggle_on: HashMap<MouseButton, bool>,
+}
+
+impl InputState {
+    pub fn reset_all(&mut self) {
+        let mut had_alt_or_win = false;
+        for (spec, count) in &self.key_refs {
+            if *count > 0 {
+                send_key(spec, false);
+                if is_alt_or_win(spec.vk) {
+                    had_alt_or_win = true;
+                }
+            }
+        }
+        if had_alt_or_win {
+            send_mask_key();
+        }
+        self.active_bindings.clear();
+        self.key_refs.clear();
+        self.toggle_on.clear();
+    }
+}
+
+#[derive(Default)]
+struct RecorderState {
+    physical_held: HashSet<u32>,
+    max_chord: Vec<String>,
+    chip_modifiers: HashSet<String>,
+}
+
+impl RecorderState {
+    fn reset(&mut self) {
+        self.physical_held.clear();
+        self.max_chord.clear();
+        self.chip_modifiers.clear();
+    }
+
+    fn on_key(&mut self, vk: u32, down: bool) -> Vec<String> {
+        if down {
+            self.physical_held.insert(vk);
+            let mut current: Vec<String> = self
+                .physical_held
+                .iter()
+                .filter_map(|&code| vk_to_token(code))
+                .collect();
+            for chip in &self.chip_modifiers {
+                if !current.contains(chip) {
+                    current.push(chip.clone());
+                }
+            }
+            let normalized = normalize_key_chord(&current);
+            if normalized.len() >= self.max_chord.len() {
+                self.max_chord = normalized.clone();
+            }
+            self.max_chord.clone()
+        } else {
+            self.physical_held.remove(&vk);
+            self.max_chord.clone()
+        }
+    }
+
+    fn add_chip(&mut self, chip: String) -> Vec<String> {
+        self.chip_modifiers.insert(chip);
+        let mut current: Vec<String> = self
+            .physical_held
+            .iter()
+            .filter_map(|&code| vk_to_token(code))
+            .collect();
+        for c in &self.chip_modifiers {
+            if !current.contains(c) {
+                current.push(c.clone());
+            }
+        }
+        let normalized = normalize_key_chord(&current);
+        if normalized.len() >= self.max_chord.len() {
+            self.max_chord = normalized.clone();
+        }
+        self.max_chord.clone()
+    }
+}
+
+fn modifier_weight(key: &str) -> u32 {
+    match key {
+        "LControl" | "RControl" | "Ctrl" | "Control" => 10,
+        "LShift" | "RShift" | "Shift" => 20,
+        "LAlt" | "RAlt" | "Alt" => 30,
+        "LWin" | "RWin" | "Win" | "Meta" => 40,
+        _ => 100,
+    }
+}
+
+pub fn normalize_key_chord(keys: &[String]) -> Vec<String> {
+    let mut deduped: Vec<String> = Vec::new();
+    for k in keys {
+        if !deduped.contains(k) {
+            deduped.push(k.clone());
+        }
+    }
+    deduped.sort_by(|a, b| {
+        let wa = modifier_weight(a);
+        let wb = modifier_weight(b);
+        if wa != wb {
+            wa.cmp(&wb)
+        } else {
+            a.cmp(b)
+        }
+    });
+    deduped
+}
+
+enum InputCmd {
+    Fire { button: MouseButton, down: bool },
+    ResetState,
+    EmergencyPause,
+    ListenCaptured(String),
     Record(Vec<String>),
     RecordCancel,
 }
 
 struct Engine {
     cfg: RwLock<AppConfig>,
+    compiled: ArcSwap<CompiledMappings>,
     paused: AtomicBool,
     listening: AtomicBool,
     recording: AtomicBool,
+    window_visible: AtomicBool,
     last: RwLock<Option<Pulse>>,
-    tx: Sender<Cmd>,
-    held: RwLock<HashSet<String>>,
-    injected: RwLock<Vec<String>>,
-    record_buf: RwLock<Vec<String>>,
+    last_send_error: RwLock<Option<SendReport>>,
+    cmd_tx: Sender<InputCmd>,
+    telem_tx: Sender<Pulse>,
+    recorder: RwLock<RecorderState>,
 }
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 static HOOK_TID: AtomicU32 = AtomicU32::new(0);
 
-fn is_primary(button: &str) -> bool {
-    button == "left" || button == "right"
-}
-
 fn engine() -> &'static Engine {
     ENGINE.get().expect("engine not started")
 }
 
-pub fn config_dir() -> PathBuf {
-    std::env::current_exe()
+pub fn set_window_visible(visible: bool) {
+    if let Some(e) = ENGINE.get() {
+        e.window_visible.store(visible, Ordering::Relaxed);
+    }
+}
+
+pub fn is_portable_mode() -> bool {
+    let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    exe_dir.join(".portable").is_file()
+        || exe_dir.join("portable").is_file()
+        || exe_dir.join("config.json").is_file()
+}
+
+pub fn config_dir() -> PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    if is_portable_mode() {
+        exe_dir
+    } else {
+        std::env::var_os("APPDATA")
+            .map(|appdata| PathBuf::from(appdata).join("MouseInsight"))
+            .unwrap_or(exe_dir)
+    }
 }
 
 fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+fn config_bak_path() -> PathBuf {
+    config_dir().join("config.json.bak")
+}
+
 fn load_config() -> AppConfig {
     let path = config_path();
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => AppConfig::default(),
+    if !path.exists() {
+        return AppConfig::default();
+    }
+    match fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<AppConfig>(&s) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("[MouseInsight] config.json parse error: {err}. Attempting backup recovery...");
+                let bak = config_bak_path();
+                if bak.exists() {
+                    if let Ok(bak_s) = fs::read_to_string(&bak) {
+                        if let Ok(bak_cfg) = serde_json::from_str::<AppConfig>(&bak_s) {
+                            eprintln!("[MouseInsight] Restored config from config.json.bak successfully.");
+                            return bak_cfg;
+                        }
+                    }
+                }
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let corrupt_path = config_dir().join(format!("config.json.corrupted.{ts}"));
+                let _ = fs::copy(&path, &corrupt_path);
+                eprintln!("[MouseInsight] Preserved corrupted config at {:?}", corrupt_path);
+                AppConfig::default()
+            }
+        },
+        Err(e) => {
+            eprintln!("[MouseInsight] Failed to read config file: {e}");
+            AppConfig::default()
+        }
     }
 }
 
-fn save_config(cfg: &AppConfig) {
+fn save_config(cfg: &AppConfig) -> Result<(), String> {
     let dir = config_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(s) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(config_path(), s);
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {e}"))?;
+
+    let json = serde_json::to_string_pretty(cfg)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+
+    let pid = std::process::id();
+    let tmp_path = dir.join(format!("config.json.{pid}.tmp"));
+    let file_path = config_path();
+    let bak_path = config_bak_path();
+
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to create tmp config: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("Failed to write tmp config: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync tmp config to disk: {e}"))?;
     }
+
+    if file_path.exists() {
+        let _ = fs::copy(&file_path, &bak_path);
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, &file_path) {
+        if file_path.exists() {
+            let _ = fs::remove_file(&file_path);
+        }
+        if let Err(replace_err) = fs::rename(&tmp_path, &file_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("Atomic config swap failed: {e} / {replace_err}"));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn xmbc_running() -> bool {
@@ -177,40 +536,94 @@ pub fn snapshot() -> Snapshot {
         xmbc_running: xmbc_running(),
         last: e.last.read().clone(),
         listening: e.listening.load(Ordering::Relaxed),
+        is_portable: is_portable_mode(),
+        config_dir: config_dir().display().to_string(),
     }
 }
 
-pub fn set_mappings(mappings: Vec<Mapping>) {
+pub fn set_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
     let e = engine();
-    let mut cfg = e.cfg.write();
-    cfg.mappings = mappings;
-    save_config(&cfg);
+    let compiled = compile_mappings(&mappings);
+    e.compiled.store(Arc::new(compiled));
+    let cfg = {
+        let mut w = e.cfg.write();
+        w.mappings = mappings;
+        w.clone()
+    };
+    let _ = e.cmd_tx.try_send(InputCmd::ResetState);
+    save_config(&cfg)
 }
 
-pub fn set_theme(theme: String) {
+pub fn set_theme(theme: String) -> Result<(), String> {
     let e = engine();
-    let mut cfg = e.cfg.write();
-    cfg.theme = theme;
-    save_config(&cfg);
+    let cfg = {
+        let mut w = e.cfg.write();
+        w.theme = theme;
+        w.clone()
+    };
+    save_config(&cfg)
 }
 
-pub fn set_paused(paused: bool) {
+pub fn set_paused(paused: bool) -> Result<(), String> {
     let e = engine();
-    e.paused.store(paused, Ordering::Relaxed);
+    e.paused.store(paused, Ordering::SeqCst);
     if paused {
-        release_all();
+        let _ = e.cmd_tx.try_send(InputCmd::ResetState);
     }
-    let mut cfg = e.cfg.write();
-    cfg.paused = paused;
-    save_config(&cfg);
+    let cfg = {
+        let mut w = e.cfg.write();
+        w.paused = paused;
+        w.clone()
+    };
+    save_config(&cfg)
+}
+
+pub fn set_autostart_flag(on: bool) -> Result<(), String> {
+    let e = engine();
+    let cfg = {
+        let mut w = e.cfg.write();
+        w.autostart = on;
+        w.clone()
+    };
+    save_config(&cfg)
+}
+
+pub fn arm_listen() {
+    engine().listening.store(true, Ordering::Relaxed);
+}
+
+pub fn arm_record() {
+    let e = engine();
+    e.recorder.write().reset();
+    e.recording.store(true, Ordering::Relaxed);
+}
+
+pub fn disarm_record() {
+    let e = engine();
+    e.recording.store(false, Ordering::Relaxed);
+    e.recorder.write().reset();
+}
+
+pub fn add_record_key(key: String) {
+    let e = engine();
+    let chord = e.recorder.write().add_chip(key);
+    let _ = e.cmd_tx.try_send(InputCmd::Record(chord));
+}
+
+pub fn take_record_keys() -> Vec<String> {
+    let e = engine();
+    e.recording.store(false, Ordering::Relaxed);
+    let keys = e.recorder.read().max_chord.clone();
+    e.recorder.write().reset();
+    keys
 }
 
 pub fn shutdown() {
     if let Some(e) = ENGINE.get() {
-        e.paused.store(true, Ordering::Relaxed);
+        e.paused.store(true, Ordering::SeqCst);
         e.recording.store(false, Ordering::Relaxed);
         e.listening.store(false, Ordering::Relaxed);
-        release_all();
+        let _ = e.cmd_tx.try_send(InputCmd::ResetState);
     }
     let tid = HOOK_TID.load(Ordering::Relaxed);
     if tid != 0 {
@@ -220,147 +633,252 @@ pub fn shutdown() {
     }
 }
 
-pub fn set_autostart_flag(on: bool) {
-    let e = engine();
-    let mut cfg = e.cfg.write();
-    cfg.autostart = on;
-    save_config(&cfg);
-}
-
-pub fn arm_listen() {
-    engine().listening.store(true, Ordering::Relaxed);
-}
-
-pub fn arm_record() {
-    let e = engine();
-    e.record_buf.write().clear();
-    e.recording.store(true, Ordering::Relaxed);
-}
-
-pub fn disarm_record() {
-    let e = engine();
-    e.recording.store(false, Ordering::Relaxed);
-}
-
-pub fn add_record_key(key: String) {
-    let e = engine();
-    {
-        let mut buf = e.record_buf.write();
-        if !buf.iter().any(|k| k == &key) {
-            buf.push(key);
-        }
-    }
-    let _ = e.tx.try_send(Cmd::Record(e.record_buf.read().clone()));
-}
-
-pub fn take_record_keys() -> Vec<String> {
-    let e = engine();
-    e.recording.store(false, Ordering::Relaxed);
-    e.record_buf.read().clone()
-}
-
 pub fn start(
     on_pulse: impl Fn(Pulse) + Send + 'static,
     on_listen: impl Fn(String) + Send + 'static,
     on_record: impl Fn(Vec<String>) + Send + 'static,
     on_record_cancel: impl Fn() + Send + 'static,
+    on_emergency_pause: impl Fn(bool) + Send + 'static,
+    on_send_error: impl Fn(SendReport) + Send + 'static,
 ) {
-    let (tx, rx) = unbounded::<Cmd>();
+    let (cmd_tx, cmd_rx) = bounded::<InputCmd>(64);
+    let (telem_tx, telem_rx) = bounded::<Pulse>(16);
+
     let cfg = load_config();
     let paused = cfg.paused;
+    let compiled = compile_mappings(&cfg.mappings);
+
     let _ = ENGINE.set(Engine {
+        cfg: RwLock::new(cfg),
+        compiled: ArcSwap::from_pointee(compiled),
         paused: AtomicBool::new(paused),
         listening: AtomicBool::new(false),
         recording: AtomicBool::new(false),
+        window_visible: AtomicBool::new(false),
         last: RwLock::new(None),
-        cfg: RwLock::new(cfg),
-        tx,
-        held: RwLock::new(HashSet::new()),
-        injected: RwLock::new(Vec::new()),
-        record_buf: RwLock::new(Vec::new()),
+        last_send_error: RwLock::new(None),
+        cmd_tx,
+        telem_tx,
+        recorder: RwLock::new(RecorderState::default()),
     });
 
     thread::Builder::new()
+        .name("mi-telemetry".into())
+        .spawn(move || {
+            while let Ok(pulse) = telem_rx.recv() {
+                on_pulse(pulse);
+            }
+        })
+        .expect("telemetry thread");
+
+    thread::Builder::new()
         .name("mi-worker".into())
-        .spawn(move || worker_loop(rx, on_pulse, on_listen, on_record, on_record_cancel))
-        .expect("worker");
+        .spawn(move || {
+            worker_loop(
+                cmd_rx,
+                on_listen,
+                on_record,
+                on_record_cancel,
+                on_emergency_pause,
+                on_send_error,
+            )
+        })
+        .expect("worker thread");
 
     thread::Builder::new()
         .name("mi-hook".into())
         .spawn(hook_loop)
-        .expect("hook");
+        .expect("hook thread");
 }
 
 fn worker_loop(
-    rx: Receiver<Cmd>,
-    on_pulse: impl Fn(Pulse),
+    rx: Receiver<InputCmd>,
     on_listen: impl Fn(String),
     on_record: impl Fn(Vec<String>),
     on_record_cancel: impl Fn(),
+    on_emergency_pause: impl Fn(bool),
+    on_send_error: impl Fn(SendReport),
 ) {
-    let mut toggle_on: HashMap<String, bool> = HashMap::new();
+    let mut state = InputState::default();
+
     while let Ok(cmd) = rx.recv() {
+        let e = engine();
         match cmd {
-            Cmd::Pulse(p) => {
-                let e = engine();
-                let mut captured = false;
-                if e.listening.load(Ordering::Relaxed) && p.down {
-                    e.listening.store(false, Ordering::Relaxed);
-                    captured = true;
-                    on_listen(p.button.clone());
+            InputCmd::Fire { button, down } => {
+                if e.paused.load(Ordering::Relaxed) {
+                    continue;
                 }
-                *e.last.write() = Some(p.clone());
-                if captured || !is_primary(&p.button) {
-                    on_pulse(p);
+                apply_input_state(&mut state, button, down, &on_send_error);
+            }
+            InputCmd::ResetState => {
+                state.reset_all();
+            }
+            InputCmd::EmergencyPause => {
+                let current = e.paused.load(Ordering::SeqCst);
+                let next = !current;
+                e.paused.store(next, Ordering::SeqCst);
+                if next {
+                    state.reset_all();
                 }
+                {
+                    let mut w = e.cfg.write();
+                    w.paused = next;
+                    let cfg_clone = w.clone();
+                    drop(w);
+                    let _ = save_config(&cfg_clone);
+                }
+                on_emergency_pause(next);
             }
-            Cmd::Fire { button, down } => {
-                apply_mapping(&button, down, &mut toggle_on);
+            InputCmd::ListenCaptured(btn) => {
+                on_listen(btn);
             }
-            Cmd::Record(keys) => on_record(keys),
-            Cmd::RecordCancel => on_record_cancel(),
+            InputCmd::Record(keys) => on_record(keys),
+            InputCmd::RecordCancel => on_record_cancel(),
         }
     }
 }
 
-fn apply_mapping(button: &str, down: bool, toggle_on: &mut HashMap<String, bool>) {
+fn apply_input_state(
+    state: &mut InputState,
+    button: MouseButton,
+    down: bool,
+    on_send_error: &impl Fn(SendReport),
+) {
     let e = engine();
-    let cfg = e.cfg.read();
-    let Some(m) = cfg.mappings.iter().find(|m| m.button == button) else {
-        return;
-    };
-    if m.keys.is_empty() {
-        return;
-    }
-    match m.mode.as_str() {
-        "hold" => {
-            if down {
-                press_keys(&m.keys);
-                e.held.write().insert(button.to_string());
-            } else {
-                release_keys(&m.keys);
-                e.held.write().remove(button);
+    let compiled_guard = e.compiled.load();
+    let Some(action) = compiled_guard.get(button) else {
+        if !down {
+            if let Some(binding) = state.active_bindings.remove(&button) {
+                if binding.mode == TriggerMode::Hold {
+                    release_active_specs(state, &binding.specs, on_send_error);
+                }
             }
         }
-        "toggle" => {
+        return;
+    };
+
+    match action.mode {
+        TriggerMode::Hold => {
+            if down {
+                if state.active_bindings.contains_key(&button) {
+                    return;
+                }
+                let binding = ActiveBinding {
+                    specs: action.specs.clone(),
+                    mode: TriggerMode::Hold,
+                };
+                press_active_specs(state, &action.specs, on_send_error);
+                state.active_bindings.insert(button, binding);
+            } else if let Some(binding) = state.active_bindings.remove(&button) {
+                release_active_specs(state, &binding.specs, on_send_error);
+            }
+        }
+        TriggerMode::Toggle => {
             if !down {
                 return;
             }
-            let on = toggle_on.entry(button.to_string()).or_insert(false);
-            if *on {
-                release_keys(&m.keys);
-                *on = false;
+            let is_on = state.toggle_on.entry(button).or_insert(false);
+            if *is_on {
+                *is_on = false;
+                if let Some(binding) = state.active_bindings.remove(&button) {
+                    release_active_specs(state, &binding.specs, on_send_error);
+                }
             } else {
-                press_keys(&m.keys);
-                *on = true;
+                *is_on = true;
+                let binding = ActiveBinding {
+                    specs: action.specs.clone(),
+                    mode: TriggerMode::Toggle,
+                };
+                press_active_specs(state, &action.specs, on_send_error);
+                state.active_bindings.insert(button, binding);
             }
         }
-        _ => {
+        TriggerMode::Click => {
             if down {
-                press_keys(&m.keys);
-                release_keys(&m.keys);
+                press_specs_once(&action.specs, on_send_error);
             }
         }
+    }
+}
+
+fn press_active_specs(
+    state: &mut InputState,
+    specs: &[KeySpec],
+    on_send_error: &impl Fn(SendReport),
+) {
+    let mut to_press: Vec<KeySpec> = Vec::new();
+    for s in specs {
+        let count = state.key_refs.entry(*s).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            to_press.push(*s);
+        }
+    }
+    if !to_press.is_empty() {
+        let inputs: Vec<INPUT> = to_press.iter().map(|s| make_input(s, true)).collect();
+        if let Err(report) = execute_send_inputs(&inputs) {
+            *engine().last_send_error.write() = Some(report.clone());
+            on_send_error(report);
+        }
+    }
+}
+
+fn release_active_specs(
+    state: &mut InputState,
+    specs: &[KeySpec],
+    on_send_error: &impl Fn(SendReport),
+) {
+    let mut to_release: Vec<KeySpec> = Vec::new();
+    let mut had_alt_or_win = false;
+
+    for s in specs.iter().rev() {
+        if let Some(count) = state.key_refs.get_mut(s) {
+            if *count > 0 {
+                *count -= 1;
+                if *count == 0 {
+                    to_release.push(*s);
+                    if is_alt_or_win(s.vk) {
+                        had_alt_or_win = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !to_release.is_empty() {
+        let mut inputs: Vec<INPUT> = to_release.iter().map(|s| make_input(s, false)).collect();
+        if had_alt_or_win {
+            inputs.push(make_raw_input(VK_MASK_KEY, false, true));
+            inputs.push(make_raw_input(VK_MASK_KEY, false, false));
+        }
+        if let Err(report) = execute_send_inputs(&inputs) {
+            *engine().last_send_error.write() = Some(report.clone());
+            on_send_error(report);
+        }
+    }
+}
+
+fn press_specs_once(specs: &[KeySpec], on_send_error: &impl Fn(SendReport)) {
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(specs.len() * 2 + 2);
+    let mut had_alt_or_win = false;
+
+    for s in specs {
+        inputs.push(make_input(s, true));
+    }
+    for s in specs.iter().rev() {
+        inputs.push(make_input(s, false));
+        if is_alt_or_win(s.vk) {
+            had_alt_or_win = true;
+        }
+    }
+    if had_alt_or_win {
+        inputs.push(make_raw_input(VK_MASK_KEY, false, true));
+        inputs.push(make_raw_input(VK_MASK_KEY, false, false));
+    }
+
+    if let Err(report) = execute_send_inputs(&inputs) {
+        *engine().last_send_error.write() = Some(report.clone());
+        on_send_error(report);
     }
 }
 
@@ -378,12 +896,11 @@ fn hook_loop() {
         }
         let _ = UnhookWindowsHookEx(mouse);
         let _ = UnhookWindowsHookEx(kbd);
-        release_all();
+        if let Some(eng) = ENGINE.get() {
+            let _ = eng.cmd_tx.try_send(InputCmd::ResetState);
+        }
     }
 }
-
-const LLKHF_UP: u32 = 0x80;
-const LLKHF_INJECTED_KBD: u32 = 0x10;
 
 unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
@@ -393,15 +910,13 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     if kb.flags.0 & LLKHF_INJECTED_KBD != 0 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
-    let down = kb.flags.0 & LLKHF_UP == 0
-        && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN);
+    let msg = wparam.0 as u32;
+    let down = kb.flags.0 & LLKHF_UP == 0 && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
 
     if down && (kb.vkCode == VK_PAUSE.0 as u32 || kb.vkCode == VK_SCROLL.0 as u32) {
         if let Some(e) = ENGINE.get() {
-            e.paused.store(true, Ordering::Relaxed);
-            e.recording.store(false, Ordering::Relaxed);
+            let _ = e.cmd_tx.try_send(InputCmd::EmergencyPause);
         }
-        release_all();
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
@@ -412,21 +927,18 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    if down {
-        if kb.vkCode == VK_ESCAPE.0 as u32 {
-            eng.recording.store(false, Ordering::Relaxed);
-            let _ = eng.tx.try_send(Cmd::RecordCancel);
-        } else if let Some(tok) = vk_to_token(kb.vkCode) {
-            let mut buf = eng.record_buf.write();
-            if !buf.iter().any(|k| k == &tok) {
-                buf.push(tok);
-            }
-            let snap = buf.clone();
-            drop(buf);
-            let _ = eng.tx.try_send(Cmd::Record(snap));
-        }
+    if down && kb.vkCode == VK_ESCAPE.0 as u32 {
+        eng.recording.store(false, Ordering::Relaxed);
+        let _ = eng.cmd_tx.try_send(InputCmd::RecordCancel);
+        return LRESULT(1);
     }
-    // Swallow while recording so Typeless / other global hotkeys cannot steal the chord.
+
+    let is_key_event = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP;
+    if is_key_event {
+        let chord = eng.recorder.write().on_key(kb.vkCode, down);
+        let _ = eng.cmd_tx.try_send(InputCmd::Record(chord));
+    }
+
     LRESULT(1)
 }
 
@@ -488,80 +1000,80 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    let Some((button, down, is_wheel)) = classify(wparam.0 as u32, ms.mouseData) else {
+    let Some((button, down)) = classify(wparam.0 as u32, ms.mouseData) else {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     };
 
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    if down && eng.listening.swap(false, Ordering::Relaxed) {
+        let _ = eng.cmd_tx.try_send(InputCmd::ListenCaptured(button.as_str().to_string()));
+    }
 
     let paused = eng.paused.load(Ordering::Relaxed);
-    let mapped = if paused {
-        false
-    } else {
-        let cfg = eng.cfg.read();
-        cfg.mappings
-            .iter()
-            .any(|m| m.button == button && !m.keys.is_empty())
-    };
+    let compiled_guard = eng.compiled.load();
+    let action_opt = compiled_guard.get(button);
+    let is_mapped = action_opt.is_some() && !paused;
+    let swallow = is_mapped && !button.is_primary();
 
-    // Never swallow left/right. Intercepting them locks every other window.
-    let swallow = mapped && !paused && !is_primary(&button);
-    let _ = eng.tx.try_send(Cmd::Pulse(Pulse {
-        button: button.clone(),
-        down,
-        t,
-        swallowed: swallow,
-    }));
-    if mapped && !paused {
-        let _ = eng.tx.try_send(Cmd::Fire {
-            button: button.clone(),
-            down,
-        });
-        if is_wheel {
-            let _ = eng.tx.try_send(Cmd::Fire {
+    if is_mapped {
+        let _ = eng.cmd_tx.try_send(InputCmd::Fire { button, down });
+        if button.is_wheel() {
+            let _ = eng.cmd_tx.try_send(InputCmd::Fire {
                 button,
                 down: false,
             });
         }
     }
+
+    let need_telemetry = eng.window_visible.load(Ordering::Relaxed)
+        || eng.listening.load(Ordering::Relaxed);
+
+    if need_telemetry {
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let pulse = Pulse {
+            button: button.as_str().to_string(),
+            down,
+            t,
+            swallowed: swallow,
+        };
+        *eng.last.write() = Some(pulse.clone());
+        let _ = eng.telem_tx.try_send(pulse);
+    }
+
     if swallow {
         return LRESULT(1);
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-fn classify(msg: u32, mouse_data: u32) -> Option<(String, bool, bool)> {
+#[inline(always)]
+fn classify(msg: u32, mouse_data: u32) -> Option<(MouseButton, bool)> {
     let xhi = ((mouse_data >> 16) & 0xffff) as u16;
     match msg {
-        WM_LBUTTONDOWN => Some(("left".into(), true, false)),
-        WM_LBUTTONUP => Some(("left".into(), false, false)),
-        WM_RBUTTONDOWN => Some(("right".into(), true, false)),
-        WM_RBUTTONUP => Some(("right".into(), false, false)),
-        WM_MBUTTONDOWN => Some(("middle".into(), true, false)),
-        WM_MBUTTONUP => Some(("middle".into(), false, false)),
-        WM_XBUTTONDOWN if xhi == 1 => Some(("xbutton1".into(), true, false)),
-        WM_XBUTTONUP if xhi == 1 => Some(("xbutton1".into(), false, false)),
-        WM_XBUTTONDOWN if xhi == 2 => Some(("xbutton2".into(), true, false)),
-        WM_XBUTTONUP if xhi == 2 => Some(("xbutton2".into(), false, false)),
+        WM_LBUTTONDOWN => Some((MouseButton::Left, true)),
+        WM_LBUTTONUP => Some((MouseButton::Left, false)),
+        WM_RBUTTONDOWN => Some((MouseButton::Right, true)),
+        WM_RBUTTONUP => Some((MouseButton::Right, false)),
+        WM_MBUTTONDOWN => Some((MouseButton::Middle, true)),
+        WM_MBUTTONUP => Some((MouseButton::Middle, false)),
+        WM_XBUTTONDOWN if xhi == 1 => Some((MouseButton::XButton1, true)),
+        WM_XBUTTONUP if xhi == 1 => Some((MouseButton::XButton1, false)),
+        WM_XBUTTONDOWN if xhi == 2 => Some((MouseButton::XButton2, true)),
+        WM_XBUTTONUP if xhi == 2 => Some((MouseButton::XButton2, false)),
         WM_MOUSEWHEEL => {
             let delta = xhi as i16;
             if delta > 0 {
-                Some(("wheelup".into(), true, true))
+                Some((MouseButton::WheelUp, true))
             } else {
-                Some(("wheeldown".into(), true, true))
+                Some((MouseButton::WheelDown, true))
             }
         }
         WM_MOUSEHWHEEL => None,
         _ => None,
     }
-}
-
-struct KeySpec {
-    vk: VIRTUAL_KEY,
-    extended: bool,
 }
 
 fn key_spec(name: &str) -> Option<KeySpec> {
@@ -610,9 +1122,9 @@ fn key_spec(name: &str) -> Option<KeySpec> {
             }
         }
         other if other.starts_with('F') => {
-            if let Ok(n) = other[1..].parse::<u16>() {
-                if (1..=24).contains(&n) {
-                    (VIRTUAL_KEY(VK_F1.0 + n - 1), false)
+            if let Ok(num) = other[1..].parse::<u16>() {
+                if (1..=24).contains(&num) {
+                    (VIRTUAL_KEY(VK_F1.0 + num - 1), false)
                 } else {
                     return None;
                 }
@@ -623,6 +1135,11 @@ fn key_spec(name: &str) -> Option<KeySpec> {
         _ => return None,
     };
     Some(KeySpec { vk, extended })
+}
+
+#[inline(always)]
+fn is_alt_or_win(vk: VIRTUAL_KEY) -> bool {
+    matches!(vk, VK_LMENU | VK_RMENU | VK_MENU | VK_LWIN | VK_RWIN)
 }
 
 fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
@@ -654,121 +1171,81 @@ fn make_input(spec: &KeySpec, down: bool) -> INPUT {
 
 fn send_key(spec: &KeySpec, down: bool) {
     let input = make_input(spec, down);
-    unsafe {
-        let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    let _ = execute_send_inputs(&[input]);
 }
 
-fn send_chord(keys: &[String], down: bool) {
-    let specs: Vec<KeySpec> = if down {
-        keys.iter().filter_map(|k| key_spec(k)).collect()
-    } else {
-        keys.iter().rev().filter_map(|k| key_spec(k)).collect()
-    };
-    if specs.is_empty() {
-        return;
-    }
-
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(specs.len() * 2 + 2);
-
-    if down {
-        for s in &specs {
-            inputs.push(make_input(s, true));
-        }
-    } else {
-        let mut had_alt = false;
-        let mut had_win = false;
-
-        for s in &specs {
-            inputs.push(make_input(s, false));
-            match s.vk {
-                VK_LMENU | VK_RMENU => {
-                    had_alt = true;
-                    inputs.push(make_raw_input(VK_MENU, false, false));
-                }
-                VK_LCONTROL | VK_RCONTROL => {
-                    inputs.push(make_raw_input(VK_CONTROL, false, false));
-                }
-                VK_LSHIFT | VK_RSHIFT => {
-                    inputs.push(make_raw_input(VK_SHIFT, false, false));
-                }
-                VK_LWIN | VK_RWIN => {
-                    had_win = true;
-                }
-                _ => {}
-            }
-        }
-
-        // Send unassigned mask key (0xFF) down + up to prevent Windows
-        // from activating the active window's menu bar (SC_KEYMENU) or Start Menu.
-        if had_alt || had_win {
-            inputs.push(make_raw_input(VK_MASK_KEY, false, true));
-            inputs.push(make_raw_input(VK_MASK_KEY, false, false));
-        }
-    }
-
-    unsafe {
-        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-fn press_keys(keys: &[String]) {
-    if let Some(e) = ENGINE.get() {
-        e.injected.write().extend(keys.iter().cloned());
-    }
-    send_chord(keys, true);
-}
-
-fn release_keys(keys: &[String]) {
-    send_chord(keys, false);
-    if let Some(e) = ENGINE.get() {
-        let mut inj = e.injected.write();
-        for k in keys {
-            if let Some(i) = inj.iter().rposition(|x| x == k) {
-                inj.remove(i);
-            }
-        }
-    }
-}
-
-fn force_release_all_modifiers() {
+fn send_mask_key() {
     let inputs = [
-        make_raw_input(VK_LMENU, false, false),
-        make_raw_input(VK_RMENU, true, false),
-        make_raw_input(VK_MENU, false, false),
-        make_raw_input(VK_LCONTROL, false, false),
-        make_raw_input(VK_RCONTROL, true, false),
-        make_raw_input(VK_CONTROL, false, false),
-        make_raw_input(VK_LSHIFT, false, false),
-        make_raw_input(VK_RSHIFT, false, false),
-        make_raw_input(VK_SHIFT, false, false),
-        make_raw_input(VK_LWIN, true, false),
-        make_raw_input(VK_RWIN, true, false),
         make_raw_input(VK_MASK_KEY, false, true),
         make_raw_input(VK_MASK_KEY, false, false),
     ];
-    unsafe {
-        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    let _ = execute_send_inputs(&inputs);
+}
+
+fn execute_send_inputs(inputs: &[INPUT]) -> Result<u32, SendReport> {
+    if inputs.is_empty() {
+        return Ok(0);
+    }
+    let expected = inputs.len() as u32;
+    let inserted = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+
+    if inserted == expected {
+        Ok(inserted)
+    } else {
+        let err = unsafe { GetLastError() };
+        let is_uipi = inserted == 0 && (err.0 == 5 || err.0 == 0);
+        Err(SendReport {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            expected,
+            inserted,
+            win32_error: err.0,
+            is_uipi_blocked: is_uipi,
+        })
     }
 }
 
-fn release_all() {
-    let Some(e) = ENGINE.get() else {
-        return;
-    };
-    let keys = {
-        let mut inj = e.injected.write();
-        let k = inj.clone();
-        inj.clear();
-        e.held.write().clear();
-        k
-    };
-    for k in keys.iter().rev() {
-        if let Some(spec) = key_spec(k) {
-            send_key(&spec, false);
-        }
-    }
-    force_release_all_modifiers();
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn test_normalize_key_chord() {
+        let keys = vec![
+            "K".into(),
+            "LAlt".into(),
+            "LControl".into(),
+            "LShift".into(),
+        ];
+        let normalized = normalize_key_chord(&keys);
+        assert_eq!(normalized, vec!["LControl", "LShift", "LAlt", "K"]);
+    }
+
+    #[test]
+    fn test_mouse_button_conversion() {
+        assert_eq!(MouseButton::from_str_fast("xbutton1"), Some(MouseButton::XButton1));
+        assert_eq!(MouseButton::from_str_fast("xbutton2"), Some(MouseButton::XButton2));
+        assert_eq!(MouseButton::from_str_fast("middle"), Some(MouseButton::Middle));
+        assert_eq!(MouseButton::XButton1.as_str(), "xbutton1");
+    }
+
+    #[test]
+    fn test_compile_mappings_precompilation() {
+        let mappings = vec![
+            Mapping {
+                id: "1".into(),
+                button: "xbutton1".into(),
+                mode: "hold".into(),
+                keys: vec!["LControl".into(), "LAlt".into()],
+                label: "".into(),
+            },
+        ];
+        let compiled = compile_mappings(&mappings);
+        let action = compiled.get(MouseButton::XButton1).expect("compiled slot");
+        assert_eq!(action.mode, TriggerMode::Hold);
+        assert_eq!(action.specs.len(), 2);
+    }
+}
 
