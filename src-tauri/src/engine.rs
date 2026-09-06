@@ -10,14 +10,19 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+#[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::GetCurrentThreadId;
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
     INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -27,6 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT,
     VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SPACE, VK_TAB, VK_UP,
 };
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
     TranslateMessage, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
@@ -35,17 +41,102 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
+#[cfg(not(target_os = "windows"))]
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VIRTUAL_KEY(pub u16);
+
+#[cfg(not(target_os = "windows"))]
+pub const VK_BACK: VIRTUAL_KEY = VIRTUAL_KEY(0x08);
+#[cfg(not(target_os = "windows"))]
+pub const VK_TAB: VIRTUAL_KEY = VIRTUAL_KEY(0x09);
+#[cfg(not(target_os = "windows"))]
+pub const VK_RETURN: VIRTUAL_KEY = VIRTUAL_KEY(0x0D);
+#[cfg(not(target_os = "windows"))]
+pub const VK_ESCAPE: VIRTUAL_KEY = VIRTUAL_KEY(0x1B);
+#[cfg(not(target_os = "windows"))]
+pub const VK_SPACE: VIRTUAL_KEY = VIRTUAL_KEY(0x20);
+#[cfg(not(target_os = "windows"))]
+pub const VK_PRIOR: VIRTUAL_KEY = VIRTUAL_KEY(0x21);
+#[cfg(not(target_os = "windows"))]
+pub const VK_NEXT: VIRTUAL_KEY = VIRTUAL_KEY(0x22);
+#[cfg(not(target_os = "windows"))]
+pub const VK_END: VIRTUAL_KEY = VIRTUAL_KEY(0x23);
+#[cfg(not(target_os = "windows"))]
+pub const VK_HOME: VIRTUAL_KEY = VIRTUAL_KEY(0x24);
+#[cfg(not(target_os = "windows"))]
+pub const VK_LEFT: VIRTUAL_KEY = VIRTUAL_KEY(0x25);
+#[cfg(not(target_os = "windows"))]
+pub const VK_UP: VIRTUAL_KEY = VIRTUAL_KEY(0x26);
+#[cfg(not(target_os = "windows"))]
+pub const VK_RIGHT: VIRTUAL_KEY = VIRTUAL_KEY(0x27);
+#[cfg(not(target_os = "windows"))]
+pub const VK_DOWN: VIRTUAL_KEY = VIRTUAL_KEY(0x28);
+#[cfg(not(target_os = "windows"))]
+pub const VK_INSERT: VIRTUAL_KEY = VIRTUAL_KEY(0x2D);
+#[cfg(not(target_os = "windows"))]
+pub const VK_DELETE: VIRTUAL_KEY = VIRTUAL_KEY(0x2E);
+#[cfg(not(target_os = "windows"))]
+pub const VK_LWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5B);
+#[cfg(not(target_os = "windows"))]
+pub const VK_RWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5C);
+#[cfg(not(target_os = "windows"))]
+pub const VK_LSHIFT: VIRTUAL_KEY = VIRTUAL_KEY(0xA0);
+#[cfg(not(target_os = "windows"))]
+pub const VK_RSHIFT: VIRTUAL_KEY = VIRTUAL_KEY(0xA1);
+#[cfg(not(target_os = "windows"))]
+pub const VK_LCONTROL: VIRTUAL_KEY = VIRTUAL_KEY(0xA2);
+#[cfg(not(target_os = "windows"))]
+pub const VK_RCONTROL: VIRTUAL_KEY = VIRTUAL_KEY(0xA3);
+#[cfg(not(target_os = "windows"))]
+pub const VK_LMENU: VIRTUAL_KEY = VIRTUAL_KEY(0xA4);
+#[cfg(not(target_os = "windows"))]
+pub const VK_RMENU: VIRTUAL_KEY = VIRTUAL_KEY(0xA5);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_1: VIRTUAL_KEY = VIRTUAL_KEY(0xBA);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_PLUS: VIRTUAL_KEY = VIRTUAL_KEY(0xBB);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_COMMA: VIRTUAL_KEY = VIRTUAL_KEY(0xBC);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_MINUS: VIRTUAL_KEY = VIRTUAL_KEY(0xBD);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_PERIOD: VIRTUAL_KEY = VIRTUAL_KEY(0xBE);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_2: VIRTUAL_KEY = VIRTUAL_KEY(0xBF);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_3: VIRTUAL_KEY = VIRTUAL_KEY(0xC0);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_4: VIRTUAL_KEY = VIRTUAL_KEY(0xDB);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_5: VIRTUAL_KEY = VIRTUAL_KEY(0xDC);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_6: VIRTUAL_KEY = VIRTUAL_KEY(0xDD);
+#[cfg(not(target_os = "windows"))]
+pub const VK_OEM_7: VIRTUAL_KEY = VIRTUAL_KEY(0xDE);
+#[cfg(not(target_os = "windows"))]
+pub const VK_F1: VIRTUAL_KEY = VIRTUAL_KEY(0x70);
+
+#[cfg(target_os = "windows")]
 const LLMHF_INJECTED: u32 = 0x0000_0001;
+#[cfg(target_os = "windows")]
 const LLMHF_LOWER_IL_INJECTED: u32 = 0x0000_0002;
+#[cfg(target_os = "windows")]
 const LLKHF_UP: u32 = 0x80;
+#[cfg(target_os = "windows")]
 const LLKHF_INJECTED_KBD: u32 = 0x10;
+#[cfg(target_os = "windows")]
 const LLKHF_LOWER_IL_INJECTED_KBD: u32 = 0x02;
-const EXTRA_INFO: usize = 0x4D49_484B;
-const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFC);
+#[allow(dead_code)]
+pub const EXTRA_INFO: usize = 0x4D49_484B;
+#[allow(dead_code)]
+pub const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFC);
 const TAP_QUEUE_CAP: usize = 8;
 const EDGE_CHANNEL_CAP: usize = 256;
 const HOLD_THRESHOLD: Duration = Duration::from_millis(400);
+#[cfg(target_os = "windows")]
 const HOTKEY_PAUSE: i32 = 1;
+#[cfg(target_os = "windows")]
 const HOTKEY_SCROLL: i32 = 2;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -354,8 +445,10 @@ pub trait InputInjector: Send + 'static {
     fn is_physical_down(&self, vk: VIRTUAL_KEY) -> bool;
 }
 
+#[cfg(target_os = "windows")]
 pub struct Win32Injector;
 
+#[cfg(target_os = "windows")]
 impl InputInjector for Win32Injector {
     fn send_keys(&mut self, specs: &[KeySpec], down: bool) -> Result<(), SendReport> {
         if specs.is_empty() {
@@ -849,7 +942,7 @@ impl<I: InputInjector> InputStateMachine<I> {
 }
 
 #[derive(Default)]
-struct RecorderState {
+pub(crate) struct RecorderState {
     physical_held: HashSet<u32>,
     max_chord: Vec<String>,
     chip_modifiers: HashSet<String>,
@@ -857,14 +950,14 @@ struct RecorderState {
 }
 
 impl RecorderState {
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.physical_held.clear();
         self.max_chord.clear();
         self.chip_modifiers.clear();
         self.last_emitted.clear();
     }
 
-    fn on_key(&mut self, vk: u32, down: bool) -> Vec<String> {
+    pub(crate) fn on_key(&mut self, vk: u32, down: bool) -> Vec<String> {
         if down {
             self.physical_held.insert(vk);
             let mut current: Vec<String> = self
@@ -973,6 +1066,7 @@ pub enum InputCmd {
         generation: u64,
     },
     ResetState(ResetReason),
+    #[allow(dead_code)]
     EmergencyStop,
     UpdateMappings {
         generation: u64,
@@ -983,21 +1077,22 @@ pub enum InputCmd {
     RecordCancel,
 }
 
-struct Engine {
-    cfg: RwLock<AppConfig>,
-    compiled: ArcSwap<CompiledMappings>,
-    paused: AtomicBool,
-    listening: AtomicBool,
-    recording: AtomicBool,
-    window_visible: AtomicBool,
-    last: RwLock<Option<Pulse>>,
-    cmd_tx: Sender<InputCmd>,
-    edge_tx: Sender<InputCmd>,
-    telem_tx: Sender<Pulse>,
-    recorder: RwLock<RecorderState>,
+pub(crate) struct Engine {
+    pub(crate) cfg: RwLock<AppConfig>,
+    pub(crate) compiled: ArcSwap<CompiledMappings>,
+    pub(crate) paused: AtomicBool,
+    pub(crate) listening: AtomicBool,
+    pub(crate) recording: AtomicBool,
+    pub(crate) window_visible: AtomicBool,
+    pub(crate) last: RwLock<Option<Pulse>>,
+    pub(crate) cmd_tx: Sender<InputCmd>,
+    pub(crate) edge_tx: Sender<InputCmd>,
+    pub(crate) telem_tx: Sender<Pulse>,
+    pub(crate) recorder: RwLock<RecorderState>,
 }
 
-static ENGINE: OnceLock<Engine> = OnceLock::new();
+pub(crate) static ENGINE: OnceLock<Engine> = OnceLock::new();
+#[allow(dead_code)]
 static HOOK_TID: AtomicU32 = AtomicU32::new(0);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1005,7 +1100,7 @@ static SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PHYSICAL_DOWN: OnceLock<RwLock<HashSet<u32>>> = OnceLock::new();
 static WORKER_DONE: OnceLock<Mutex<Option<Receiver<()>>>> = OnceLock::new();
 
-fn physical_down_set() -> &'static RwLock<HashSet<u32>> {
+pub(crate) fn physical_down_set() -> &'static RwLock<HashSet<u32>> {
     PHYSICAL_DOWN.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
@@ -1151,6 +1246,7 @@ fn replace_file_atomic(from: &PathBuf, to: &PathBuf) -> Result<(), String> {
 }
 
 pub fn xmbc_running() -> bool {
+    #[cfg(target_os = "windows")]
     unsafe {
         let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             Ok(h) => h,
@@ -1182,6 +1278,10 @@ pub fn xmbc_running() -> bool {
         }
         let _ = windows::Win32::Foundation::CloseHandle(snap);
         found
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
     }
 }
 
@@ -1291,11 +1391,18 @@ pub fn shutdown() {
         e.listening.store(false, Ordering::Relaxed);
         let _ = e.cmd_tx.send(InputCmd::ResetState(ResetReason::Shutdown));
     }
-    let tid = HOOK_TID.load(Ordering::Relaxed);
-    if tid != 0 {
-        unsafe {
-            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+    #[cfg(target_os = "windows")]
+    {
+        let tid = HOOK_TID.load(Ordering::Relaxed);
+        if tid != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::stop_hook();
     }
     if let Some(slot) = WORKER_DONE.get() {
         if let Ok(mut guard) = slot.lock() {
@@ -1361,10 +1468,17 @@ pub fn start(
     thread::Builder::new()
         .name("mi-worker".into())
         .spawn(move || {
+            #[cfg(target_os = "windows")]
+            let injector = Win32Injector;
+            #[cfg(target_os = "macos")]
+            let injector = crate::macos::MacosInjector::default();
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            let injector = FakeInjector::new();
+
             worker_loop(
                 cmd_rx,
                 edge_rx,
-                Win32Injector,
+                injector,
                 on_listen,
                 on_record,
                 on_record_cancel,
@@ -1376,10 +1490,17 @@ pub fn start(
         })
         .expect("worker thread");
 
+    #[cfg(target_os = "windows")]
     thread::Builder::new()
         .name("mi-hook".into())
         .spawn(hook_loop)
         .expect("hook thread");
+
+    #[cfg(target_os = "macos")]
+    thread::Builder::new()
+        .name("mi-macos-tap".into())
+        .spawn(crate::macos::hook_loop)
+        .expect("macos tap thread");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1500,6 +1621,7 @@ fn worker_loop<I: InputInjector>(
     }
 }
 
+#[cfg(target_os = "windows")]
 fn hook_loop() {
     unsafe {
         HOOK_TID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -1567,11 +1689,13 @@ fn hook_loop() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn is_injected_key(kb: &KBDLLHOOKSTRUCT) -> bool {
     kb.flags.0 & (LLKHF_INJECTED_KBD | LLKHF_LOWER_IL_INJECTED_KBD) != 0
         || kb.dwExtraInfo == EXTRA_INFO
 }
 
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
@@ -1625,6 +1749,14 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
 }
 
 fn vk_to_token(vk: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    if !cfg!(test) {
+        return crate::macos::keycode_to_token(vk as u16);
+    }
+    win_vk_to_token(vk)
+}
+
+fn win_vk_to_token(vk: u32) -> Option<String> {
     Some(match vk {
         0xA2 => "LControl".into(),
         0xA3 => "RControl".into(),
@@ -1684,6 +1816,7 @@ fn vk_to_token(vk: u32) -> Option<String> {
     })
 }
 
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
@@ -1756,6 +1889,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
+#[cfg(target_os = "windows")]
 #[inline(always)]
 fn classify(msg: u32, mouse_data: u32) -> Option<(MouseButton, bool)> {
     let xhi = ((mouse_data >> 16) & 0xffff) as u16;
@@ -1784,6 +1918,14 @@ fn classify(msg: u32, mouse_data: u32) -> Option<(MouseButton, bool)> {
 }
 
 fn key_spec(name: &str) -> Option<KeySpec> {
+    #[cfg(target_os = "macos")]
+    if !cfg!(test) {
+        return crate::macos::key_spec(name);
+    }
+    win_key_spec(name)
+}
+
+fn win_key_spec(name: &str) -> Option<KeySpec> {
     let n = name.trim();
     let (vk, extended) = match n {
         "LControl" | "Control" | "Ctrl" => (VK_LCONTROL, false),
@@ -1859,11 +2001,19 @@ fn key_spec(name: &str) -> Option<KeySpec> {
     Some(KeySpec { vk, extended })
 }
 
+#[cfg(target_os = "windows")]
 #[inline(always)]
 fn is_alt_or_win(vk: VIRTUAL_KEY) -> bool {
     matches!(vk, VK_LMENU | VK_RMENU | VK_MENU | VK_LWIN | VK_RWIN)
 }
 
+#[cfg(not(target_os = "windows"))]
+#[inline(always)]
+fn is_alt_or_win(_vk: VIRTUAL_KEY) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
 fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
     let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as u16 };
     let mut flags = KEYBD_EVENT_FLAGS(0);
@@ -1887,10 +2037,12 @@ fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn make_input(spec: &KeySpec, down: bool) -> INPUT {
     make_raw_input(spec.vk, spec.extended, down)
 }
 
+#[cfg(target_os = "windows")]
 fn execute_send_inputs(inputs: &[INPUT]) -> Result<u32, SendReport> {
     if inputs.is_empty() {
         return Ok(0);
