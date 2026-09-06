@@ -29,8 +29,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    TranslateMessage, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
@@ -44,8 +44,6 @@ const EXTRA_INFO: usize = 0x4D49_484B;
 const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFC);
 const TAP_QUEUE_CAP: usize = 8;
 const EDGE_CHANNEL_CAP: usize = 256;
-const WM_MI_KBD_ON: u32 = WM_APP + 1;
-const WM_MI_KBD_OFF: u32 = WM_APP + 2;
 const HOTKEY_PAUSE: i32 = 1;
 const HOTKEY_SCROLL: i32 = 2;
 
@@ -871,15 +869,6 @@ fn save_lock() -> &'static Mutex<()> {
     SAVE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn post_hook_message(msg: u32) {
-    let tid = HOOK_TID.load(Ordering::Relaxed);
-    if tid != 0 {
-        unsafe {
-            let _ = PostThreadMessageW(tid, msg, WPARAM(0), LPARAM(0));
-        }
-    }
-}
-
 fn engine() -> &'static Engine {
     ENGINE.get().expect("engine not started")
 }
@@ -1118,14 +1107,12 @@ pub fn arm_record() {
     let e = engine();
     e.recorder.write().reset();
     e.recording.store(true, Ordering::Relaxed);
-    post_hook_message(WM_MI_KBD_ON);
 }
 
 pub fn disarm_record() {
     let e = engine();
     e.recording.store(false, Ordering::Relaxed);
     e.recorder.write().reset();
-    post_hook_message(WM_MI_KBD_OFF);
 }
 
 pub fn add_record_key(key: String) {
@@ -1141,7 +1128,6 @@ pub fn take_record_keys() -> Vec<String> {
     e.recording.store(false, Ordering::Relaxed);
     let keys = e.recorder.read().max_chord.clone();
     e.recorder.write().reset();
-    post_hook_message(WM_MI_KBD_OFF);
     keys
 }
 
@@ -1152,7 +1138,6 @@ pub fn shutdown() {
         e.listening.store(false, Ordering::Relaxed);
         let _ = e.cmd_tx.send(InputCmd::ResetState(ResetReason::Shutdown));
     }
-    post_hook_message(WM_MI_KBD_OFF);
     let tid = HOOK_TID.load(Ordering::Relaxed);
     if tid != 0 {
         unsafe {
@@ -1386,7 +1371,13 @@ fn hook_loop() {
             VK_SCROLL.0 as u32,
         );
 
-        let mut kbd: Option<HHOOK> = None;
+        let kbd = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), None, 0) {
+            Ok(h) => Some(h),
+            Err(err) => {
+                eprintln!("[MouseInsight] SetWindowsHookEx WH_KEYBOARD_LL failed: {err}");
+                None
+            }
+        };
         let mut msg = MSG::default();
         loop {
             let status = GetMessageW(&mut msg, None, 0, 0);
@@ -1404,22 +1395,6 @@ fn hook_loop() {
                         let _ = e.cmd_tx.send(InputCmd::EmergencyStop);
                     }
                 }
-                m if m == WM_MI_KBD_ON => {
-                    if kbd.is_none() {
-                        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), None, 0) {
-                            Ok(h) => kbd = Some(h),
-                            Err(err) => {
-                                eprintln!("[MouseInsight] SetWindowsHookEx WH_KEYBOARD_LL failed: {err}");
-                            }
-                        }
-                    }
-                }
-                m if m == WM_MI_KBD_OFF => {
-                    if let Some(h) = kbd.take() {
-                        let _ = UnhookWindowsHookEx(h);
-                    }
-                    physical_down_set().write().clear();
-                }
                 _ => {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -1427,7 +1402,7 @@ fn hook_loop() {
             }
         }
 
-        if let Some(h) = kbd.take() {
+        if let Some(h) = kbd {
             let _ = UnhookWindowsHookEx(h);
         }
         let _ = UnhookWindowsHookEx(mouse);
@@ -1474,7 +1449,6 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     if down && kb.vkCode == VK_ESCAPE.0 as u32 {
         eng.recording.store(false, Ordering::Relaxed);
         let _ = eng.cmd_tx.send(InputCmd::RecordCancel);
-        post_hook_message(WM_MI_KBD_OFF);
         return LRESULT(1);
     }
 
@@ -2743,6 +2717,16 @@ mod tests {
             ctrl_ups, 0,
             "Synthetic KeyUp must be suppressed when key is physically held down"
         );
+    }
+
+    #[test]
+    fn recorder_emits_first_physical_key() {
+        let mut rec = RecorderState::default();
+        assert_eq!(rec.on_key(0x41, true), vec!["A".to_string()]);
+        assert!(rec.on_key(0x41, true).is_empty(), "key repeat must not re-emit");
+        rec.on_key(0xA2, true);
+        assert!(rec.max_chord.iter().any(|k| k == "A"));
+        assert!(rec.max_chord.iter().any(|k| k == "LControl"));
     }
 
     #[test]

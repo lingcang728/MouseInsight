@@ -11,6 +11,7 @@ import {
   normalizeKeyChord,
   getAllowedModesForButton,
   sanitizeMappings,
+  codeToToken,
 } from "./logic";
 
 type Pulse = {
@@ -632,12 +633,6 @@ $("record-mask").addEventListener("click", (e) => {
   }
 });
 
-window.addEventListener("blur", () => {
-  if (currentDraft) {
-    closeRecord();
-  }
-});
-
 $("record-chips").addEventListener("click", async (e) => {
   const t = e.target as HTMLElement;
   const key = t.dataset.key;
@@ -657,6 +652,10 @@ window.addEventListener(
     }
     e.preventDefault();
     e.stopPropagation();
+    if (e.repeat) return;
+    const token = codeToToken(e.code);
+    if (!token) return;
+    void invoke("add_record_key", { key: token });
   },
   true
 );

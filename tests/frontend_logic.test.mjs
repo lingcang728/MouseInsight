@@ -9,6 +9,7 @@ import {
   getAllowedModesForButton,
   sanitizeMappings,
   DraftSession,
+  codeToToken,
 } from "../src/logic.ts";
 
 // 轻量、高可读性的纯逻辑测试执行器
@@ -446,6 +447,30 @@ await suite("5. 数据清洗与安全性校验 sanitizeMappings", async () => {
     assert.equal(cleaned.length, 2);
     assert.equal(cleaned[0].mode, "click");
     assert.equal(cleaned[1].mode, "click");
+  });
+});
+
+await suite("6. codeToToken 键盘事件兜底映射", async () => {
+  await test("左右修饰键映射到 L/R token", () => {
+    assert.equal(codeToToken("ControlLeft"), "LControl");
+    assert.equal(codeToToken("ControlRight"), "RControl");
+    assert.equal(codeToToken("AltLeft"), "LAlt");
+    assert.equal(codeToToken("AltRight"), "RAlt");
+    assert.equal(codeToToken("ShiftLeft"), "LShift");
+    assert.equal(codeToToken("MetaLeft"), "LWin");
+  });
+
+  await test("字母数字与功能键", () => {
+    assert.equal(codeToToken("KeyA"), "A");
+    assert.equal(codeToToken("Digit1"), "1");
+    assert.equal(codeToToken("Enter"), "Enter");
+    assert.equal(codeToToken("F5"), "F5");
+    assert.equal(codeToToken("Space"), "Space");
+  });
+
+  await test("无法识别的 code 返回 null", () => {
+    assert.equal(codeToToken(""), null);
+    assert.equal(codeToToken("Unidentified"), null);
   });
 });
 

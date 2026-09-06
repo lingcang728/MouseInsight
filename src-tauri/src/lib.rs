@@ -222,9 +222,6 @@ pub fn run() {
                 engine::set_window_visible(false);
                 WINDOW_ACTIVE.store(false, Ordering::Relaxed);
             }
-            WindowEvent::Focused(false) => {
-                engine::disarm_record();
-            }
             _ => {}
         })
         .setup(move |app| {

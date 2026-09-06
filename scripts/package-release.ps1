@@ -73,10 +73,15 @@ if (Test-Path $portableExe) {
     $copied++
 }
 
-# 安装包 (NSIS)
+$pkgJson = Get-Content -Raw -Path (Join-Path $root 'package.json') | ConvertFrom-Json
+$appVersion = [string]$pkgJson.version
+
+# 安装包 (NSIS) — 只收当前版本，避免把 cargo-target 里旧 setup 一并拷进来
 if (Test-Path $bundleDir) {
     Get-ChildItem -Path $bundleDir -Recurse -Include *.exe, *.msi |
-        Where-Object { $_.Name -like 'Mouse Insight*' -and $_.FullName -notmatch '\\deps\\' } |
+        Where-Object {
+            $_.Name -like "Mouse Insight*$appVersion*" -and $_.FullName -notmatch '\\deps\\'
+        } |
         ForEach-Object {
             $dest = Join-Path $releaseDir $_.Name
             Copy-Item -Path $_.FullName -Destination $dest -Force

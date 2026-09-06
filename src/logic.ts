@@ -188,6 +188,61 @@ export function inferTriggerMode(button: string, keys: string[]): "hold" | "clic
 }
 
 /**
+ * 把 KeyboardEvent.code 映射成引擎 token。录制时作为 LL 钩子的兜底，
+ * 避免钩子没挂上时页面 preventDefault 把按键吃掉却什么都不录。
+ */
+export function codeToToken(code: string): string | null {
+  if (!code) return null;
+  const mapped: Record<string, string> = {
+    ControlLeft: "LControl",
+    ControlRight: "RControl",
+    AltLeft: "LAlt",
+    AltRight: "RAlt",
+    ShiftLeft: "LShift",
+    ShiftRight: "RShift",
+    MetaLeft: "LWin",
+    MetaRight: "RWin",
+    Space: "Space",
+    Enter: "Enter",
+    NumpadEnter: "Enter",
+    Tab: "Tab",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    Insert: "Insert",
+    Home: "Home",
+    End: "End",
+    PageUp: "PageUp",
+    PageDown: "PageDown",
+    ArrowLeft: "ArrowLeft",
+    ArrowRight: "ArrowRight",
+    ArrowUp: "ArrowUp",
+    ArrowDown: "ArrowDown",
+    Minus: "Minus",
+    Equal: "Equal",
+    Comma: "Comma",
+    Period: "Period",
+    Slash: "Slash",
+    Backquote: "Backquote",
+    BracketLeft: "BracketLeft",
+    Backslash: "Backslash",
+    BracketRight: "BracketRight",
+    Quote: "Quote",
+    Semicolon: "Semicolon",
+    NumpadMultiply: "NumpadMultiply",
+    NumpadAdd: "NumpadAdd",
+    NumpadSubtract: "NumpadSubtract",
+    NumpadDecimal: "NumpadDecimal",
+    NumpadDivide: "NumpadDivide",
+  };
+  if (mapped[code]) return mapped[code];
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^Numpad[0-9]$/.test(code)) return code;
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  return null;
+}
+
+/**
  * 按钮能力矩阵规则检查
  * - left / right：不允许建立任何映射（仅用于硬件检测）
  * - wheelup / wheeldown：仅允许 "click"，不允许 "hold" 或 "toggle"
