@@ -11,7 +11,7 @@ fi
 APP=$1
 DMG=${2:-}
 
-if [[ ! -d $APP ]]; then
+if [[ ! -d "$APP" ]]; then
   echo "missing app bundle: $APP" >&2
   exit 1
 fi

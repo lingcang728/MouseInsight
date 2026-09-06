@@ -180,18 +180,37 @@ jobs:
           echo "universal binary archs: $archs"
           echo "$archs" | grep -q 'x86_64'
           echo "$archs" | grep -q 'arm64'
-          mkdir -p dist-macos
-          cp "$dmg" dist-macos/
           dmg_name=$(basename "$dmg")
-          (
-            cd dist-macos
-            shasum -a 256 "$dmg_name" > SHA256SUMS-macos.txt
-          )
           echo "APP_PATH=$app" >> "$GITHUB_OUTPUT"
           echo "DMG_PATH=$dmg" >> "$GITHUB_OUTPUT"
           echo "DMG_NAME=$dmg_name" >> "$GITHUB_OUTPUT"
           echo "app=$app"
           echo "dmg=$dmg"
+
+      - name: Notarize and staple the downloadable DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="${{ steps.bundle.outputs.DMG_PATH }}"
+          echo "== codesign dmg =="
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dmg"
+          codesign --verify --verbose=2 "$dmg"
+          echo "== notarytool submit dmg =="
+          xcrun notarytool submit "$dmg" \
+            --issuer "$APPLE_API_ISSUER" \
+            --key-id "$APPLE_API_KEY" \
+            --key "$APPLE_API_KEY_PATH" \
+            --wait \
+            --timeout 20m
+          echo "== stapler staple dmg =="
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          mkdir -p dist-macos
+          cp "$dmg" "dist-macos/${{ steps.bundle.outputs.DMG_NAME }}"
+          (
+            cd dist-macos
+            shasum -a 256 "${{ steps.bundle.outputs.DMG_NAME }}" > SHA256SUMS-macos.txt
+          )
 
       - name: Verify signature, Gatekeeper, and stapling
         shell: bash
