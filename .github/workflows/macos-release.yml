@@ -148,13 +148,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # APPLE_SIGNING_IDENTITY and APPLE_API_KEY_PATH were written to
+          # GITHUB_ENV above, so they are now regular runner environment
+          # variables. Do not rebind them through the workflow env context.
           unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_PRIVATE_KEY_BASE64
           npm run tauri -- build --target universal-apple-darwin --bundles dmg
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ env.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ env.APPLE_API_KEY }}
-          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
 
       - name: Locate bundle and confirm universal binary
         id: bundle
