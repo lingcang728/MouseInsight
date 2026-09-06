@@ -138,6 +138,15 @@ if (Test-Path $portableExe) {
     Set-ItemProperty -Path $runRegPath -Name 'Mouse Insight' -Value $autostartCmd
     Write-Host "已配置开机自启注册表指向便携版: $autostartCmd" -ForegroundColor Green
 
+    # 复制独立图标文件到 release 目录，供快捷方式直接引用（彻底绕过 Windows 对 exe 的陈旧图标缓存）
+    $srcIco = Join-Path $root 'src-tauri\icons\icon.ico'
+    $releaseIco = Join-Path $releaseDir 'app.ico'
+    if (Test-Path $srcIco) {
+        Copy-Item -Path $srcIco -Destination $releaseIco -Force
+    }
+
+    $iconTarget = if (Test-Path $releaseIco) { "$releaseIco,0" } else { "$portableExe,0" }
+
     $wsh = New-Object -ComObject WScript.Shell
     
     # 1) 桌面快捷方式
@@ -146,9 +155,9 @@ if (Test-Path $portableExe) {
     $desktopLnk.TargetPath = $portableExe
     $desktopLnk.WorkingDirectory = $releaseDir
     $desktopLnk.Description = "Mouse Insight (Portable)"
-    $desktopLnk.IconLocation = "$portableExe,0"
+    $desktopLnk.IconLocation = $iconTarget
     $desktopLnk.Save()
-    Write-Host "已更新桌面快捷方式: $desktopLnkPath -> $portableExe" -ForegroundColor Green
+    Write-Host "已更新桌面快捷方式: $desktopLnkPath -> $portableExe (图标: $iconTarget)" -ForegroundColor Green
 
     # 2) 开始菜单快捷方式 (Programs\Mouse Insight\Mouse Insight.lnk)
     $startMenuDir = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Mouse Insight')
@@ -160,9 +169,9 @@ if (Test-Path $portableExe) {
     $startMenuLnk.TargetPath = $portableExe
     $startMenuLnk.WorkingDirectory = $releaseDir
     $startMenuLnk.Description = "Mouse Insight (Portable)"
-    $startMenuLnk.IconLocation = "$portableExe,0"
+    $startMenuLnk.IconLocation = $iconTarget
     $startMenuLnk.Save()
-    Write-Host "已更新开始菜单快捷方式: $startMenuLnkPath -> $portableExe" -ForegroundColor Green
+    Write-Host "已更新开始菜单快捷方式: $startMenuLnkPath -> $portableExe (图标: $iconTarget)" -ForegroundColor Green
 
     # 3) 根目录开始菜单快捷方式 (Windows 搜索栏直接索引)
     $rootProgramsLnk = [System.IO.Path]::Combine([Environment]::GetFolderPath('Programs'), 'Mouse Insight.lnk')
@@ -170,9 +179,23 @@ if (Test-Path $portableExe) {
     $rootLnk.TargetPath = $portableExe
     $rootLnk.WorkingDirectory = $releaseDir
     $rootLnk.Description = "Mouse Insight (Portable)"
-    $rootLnk.IconLocation = "$portableExe,0"
+    $rootLnk.IconLocation = $iconTarget
     $rootLnk.Save()
-    Write-Host "已更新 Windows 搜索栏索引快捷方式: $rootProgramsLnk -> $portableExe" -ForegroundColor Green
+    Write-Host "已更新 Windows 搜索栏索引快捷方式: $rootProgramsLnk -> $portableExe (图标: $iconTarget)" -ForegroundColor Green
+
+    # 4) 通知 Windows Shell 刷新图标
+    try {
+        $shellCode = @"
+using System;
+using System.Runtime.InteropServices;
+public class ShellNotifier {
+    [DllImport("shell32.dll")]
+    public static extern void SHChangeNotify(int wEventId, int uFlags, IntPtr dwItem1, IntPtr dwItem2);
+}
+"@
+        Add-Type -TypeDefinition $shellCode -ErrorAction SilentlyContinue
+        [ShellNotifier]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)
+    } catch {}
 } else {
     Write-Warning "未找到便携版 $portableExe ，跳过快捷方式映射。"
 }

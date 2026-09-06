@@ -11,6 +11,7 @@ src-tauri/gen/
 release/*.exe
 release/*.msi
 release/*.txt
+release/*.ico
 release/.portable
 release/*.bak
 release/*.tmp
