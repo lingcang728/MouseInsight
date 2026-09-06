@@ -1,0 +1,108 @@
+name: CI
+
+# Unsigned tests and packaging only. Never reads Apple secrets and never
+# references the production-signing environment.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend unit tests
+        run: node tests/frontend_logic.test.mjs
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Frontend production build
+        run: npm run build
+
+      - name: Windows NSIS bundle
+        run: npm run tauri -- build --bundles nsis
+
+  macos:
+    name: macOS
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend unit tests
+        run: node tests/frontend_logic.test.mjs
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Frontend production build
+        run: npm run build
+
+      - name: Unsigned universal app and DMG
+        run: npm run tauri -- build --target universal-apple-darwin --bundles app,dmg --no-sign
+
+      - name: Confirm universal binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(find src-tauri/target/universal-apple-darwin/release/bundle -name '*.app' -type d | head -n 1)
+          if [[ -z $app ]]; then
+            echo "unsigned universal .app was not produced" >&2
+            find src-tauri/target -name '*.app' -o -name '*.dmg' >&2 || true
+            exit 1
+          fi
+          bin="$app/Contents/MacOS/Mouse Insight"
+          if [[ ! -f $bin ]]; then
+            echo "missing app binary: $bin" >&2
+            exit 1
+          fi
+          archs=$(lipo -archs "$bin")
+          echo "universal binary archs: $archs"
+          echo "$archs" | grep -q 'x86_64'
+          echo "$archs" | grep -q 'arm64'
+          dmg=$(find src-tauri/target/universal-apple-darwin/release/bundle -name '*.dmg' | head -n 1)
+          if [[ -z $dmg ]]; then
+            echo "unsigned universal .dmg was not produced" >&2
+            exit 1
+          fi
+          echo "app=$app"
+          echo "dmg=$dmg"

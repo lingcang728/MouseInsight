@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "node tests/frontend_logic.test.mjs && cargo test --manifest-path src-tauri/Cargo.toml",
+    "check:release-version": "node scripts/check-release-version.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
