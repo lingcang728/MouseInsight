@@ -54,7 +54,7 @@ if (-not (Test-Path $releaseDir)) {
 
 # 4. 执行前端构建与 Tauri 编译
 Write-Host "[4/6] 开始执行构建 (TypeScript 校验 + Vite 构建 + Tauri 打包)..." -ForegroundColor Green
-npm run tauri:build
+npm run tauri:build -- --bundles nsis
 if ($LASTEXITCODE -ne 0) {
     throw "Tauri 打包失败，退出码: $LASTEXITCODE"
 }

@@ -2,10 +2,11 @@
   <img src="icons/icon.png" width="96" height="96" alt="Mouse Insight">
   <h1>Mouse Insight</h1>
   <p><strong>看见系统刚收到哪颗鼠标键，再把它绑成键盘快捷键。</strong></p>
-  <p>专为 Windows 设计的轻量级鼠标侧键与按键重映射工具，未配置的按键一律放行，纯本地运行。</p>
+  <p>轻量级鼠标侧键与按键重映射工具。未配置的按键一律放行，纯本地运行，支持 Windows 与 macOS。</p>
 
   [![License: MIT](https://img.shields.io/github/license/lingcang728/MouseInsight?color=69b48b)](LICENSE)
   [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows11&logoColor=white)](#下载与运行)
+  [![macOS](https://img.shields.io/badge/macOS-10.15%2B-000000?logo=apple&logoColor=white)](#下载与运行)
   [![Release](https://img.shields.io/github/v/release/lingcang728/MouseInsight?color=8FB348&label=版本)](https://github.com/lingcang728/MouseInsight/releases)
 </div>
 
@@ -29,7 +30,7 @@ Mouse Insight 解决的是这几件很具体的事：
 - **按键状态机与引用计数。** 统一按键所有权（Key Ledger），按下时打快照，即使按住鼠标时修改了配置，松开时也只会精准释放原本按下的按键；多修饰键重叠时带引用计数，彻底杜绝误松开和按键卡死。
 - **非阻塞调度与兼容性驻留。** 单次触发使用短暂的可控驻留时间提高热键兼容性，并通过非阻塞定时调度确保高频触发下事件不丢失、不阻塞工作线程与其它按键。
 - **绝对紧急自救（EmergencyStop）。** 任何时候按键盘物理 `Pause` 或 `Scroll Lock` 键，Mouse Insight 会**无条件立即释放所有按下的虚拟键**，并无条件置为暂停状态（即使此前已经是暂停状态也会执行无条件释放）。恢复映射只能由用户通过界面「继续映射」或系统托盘菜单显式恢复，安全键不再承担切换恢复的职责，彻底杜绝卡键。
-- **窗口关闭即释放内存。** 关闭主界面后，自动销毁前端 WebView2 运行时，后台常驻系统托盘的纯 Rust 核心仅占用约 10MB 内存。
+- **窗口关闭即释放内存。** 关闭主界面后会销毁控制面板，后台常驻系统托盘的纯 Rust 核心仅占用约 10MB 内存。
 
 ---
 
@@ -44,26 +45,54 @@ Mouse Insight 解决的是这几件很具体的事：
 | **滚轮下滚 (Wheel Down)** | ✅ 支持 | **仅支持「单次触发」** | 滚轮属于瞬时脉冲无持续按住状态，不支持跟随按住与切换保持。 |
 | **鼠标左键 (Left)** | ❌ 仅检测 | 不允许建立映射 | 安全底线：仅检测，绝不干预，绝不拦截，防止误操作锁死系统。 |
 | **鼠标右键 (Right)** | ❌ 仅检测 | 不允许建立映射 | 安全底线：仅检测，绝不干预，绝不拦截，防止误操作锁死系统。 |
-| **未配置的按键** | — | — | 一律原样交还给 Windows 系统处理，零副作用。 |
+| **未配置的按键** | — | — | 一律原样交还给操作系统处理，零副作用。 |
 
 ---
 
 ## 下载与运行
 
-到 [Releases](https://github.com/lingcang728/MouseInsight/releases) 页面下载最新版本。
+到 [Releases](https://github.com/lingcang728/MouseInsight/releases) 页面下载最新版本。当前提供 **Windows 10 / 11** 与 **macOS 10.15+**（Universal，同时支持 Apple Silicon 与 Intel）。
 
-### 方式一：绿色便携版（推荐）
+### Windows
+
+#### 方式一：绿色便携版（推荐）
 1. 下载 `Mouse Insight.exe`，放到你喜欢的文件夹里（无需安装，解压即用）；
 2. 目录下会自动维护 `.portable` 标记文件，所有配置均保存在同级目录的 `config.json` 中，绝不向系统盘写入碎片；
 3. 支持完整的开机自启（在界面勾选「开机自启动」后，开机静默常驻托盘，不弹窗打扰）。
 
-### 方式二：标准安装包
+#### 方式二：标准安装包
 1. 下载 `Mouse Insight_<版本>_x64-setup.exe` 并运行安装；
 2. 安装至当前用户目录，不需要管理员权限。
 
 > [!NOTE]
 > **关于 Windows SmartScreen 提示**：  
-> 本项目为开源项目，未购买商业机构昂贵的代码签名证书。首次运行时如果 Windows 提示「未知发布者」，点击 **「更多信息」→「仍要运行」** 即可。本项目的每一行源码均开源在 GitHub 上，无任何后门或联网行为。
+> 本项目为开源项目，Windows 版未购买商业代码签名证书。首次运行时如果 Windows 提示「未知发布者」，点击 **「更多信息」→「仍要运行」** 即可。本项目的每一行源码均开源在 GitHub 上。
+
+### macOS
+
+1. 下载 Universal DMG（文件名类似 `Mouse Insight_<版本>_universal.dmg`）；
+2. 打开 DMG，把 **Mouse Insight** 拖进 `Applications`；
+3. 从「应用程序」启动。
+
+首次使用必须授予 **辅助功能（Accessibility）** 权限，否则无法监听或拦截鼠标侧键：
+
+1. 打开 **系统设置 → 隐私与安全性 → 辅助功能**；
+2. 打开 **Mouse Insight** 开关。
+
+程序启动时会向系统请求该权限。若列表里还没有 Mouse Insight，先启动一次应用，再回到设置页刷新。
+
+Mouse Insight 需要辅助功能，是因为它要：
+
+- 监听鼠标侧键、中键和滚轮；
+- 拦截已经被映射的鼠标事件，避免原按键和键盘快捷键叠在一起；
+- 按你的配置注入键盘快捷键。
+
+当前实现使用 `CGEventTap` 的可修改事件点，权限以 **辅助功能** 为准。不需要再单独打开「输入监控（Input Monitoring）」。
+
+安装版配置保存在 `~/Library/Application Support/MouseInsight/config.json`。
+
+> [!NOTE]
+> **关于 macOS Gatekeeper**：正式签名并公证过的 DMG 一般可以直接打开。若系统仍提示无法验证开发者，打开 **系统设置 → 隐私与安全性**，在被拦截的应用旁选择仍要打开。
 
 ---
 
@@ -102,13 +131,16 @@ Mouse Insight 解决的是这几件很具体的事：
 随时按下键盘物理 **`Pause`** 或 **`Scroll Lock`** 键。Mouse Insight 会**无条件立即释放所有按下的虚拟键**，并无条件置为暂停状态（即使此前已经是暂停状态也会执行无条件释放）。恢复映射只能由用户通过界面「继续映射」或系统托盘菜单显式恢复，安全键不再承担切换恢复的职责，彻底杜绝卡键。
 
 **程序占用资源大吗？**  
-关主窗口会销毁 WebView2，后台只留钩子引擎；点托盘会重建控制面板。若托盘单击无响应，用右键菜单「打开控制面板」。
+关主窗口会销毁控制面板（Windows 上是 WebView2），后台只留钩子引擎；点托盘会重建控制面板。若托盘单击无响应，用右键菜单「打开控制面板」。
 
 **我的配置保存在哪里？换电脑或更新会丢吗？**  
-便携版存放在程序同级目录的 `config.json`；安装版存放在 `%APPDATA%\MouseInsight\config.json`。配置保存采用临时文件刷盘与原子重命名机制，并自动维护 `.bak` 备份，即便突发断电也不会损坏配置。更新程序时只需替换 exe，配置完整保留。
+Windows 便携版存放在程序同级目录的 `config.json`；Windows 安装版存放在 `%APPDATA%\MouseInsight\config.json`；macOS 安装版存放在 `~/Library/Application Support/MouseInsight/config.json`。配置保存采用临时文件刷盘与原子重命名机制，并自动维护 `.bak` 备份，即便突发断电也不会损坏配置。Windows 更新程序时只需替换 exe，配置完整保留。
+
+**macOS 上侧键没反应？**  
+先确认 **系统设置 → 隐私与安全性 → 辅助功能** 里已经打开 Mouse Insight。该权限被关掉时，全局事件点创建会失败，应用窗口还能开，但无法监听或拦截鼠标键。
 
 **它会收集我的按键记录吗？**  
-绝对不会。Mouse Insight 为 100% 纯本地运行的离线工具，没有配置任何后端服务器，不发起任何网络请求，绝不记录、存储或上传任何键鼠隐私数据。
+绝对不会。Mouse Insight 为 100% 纯本地运行的离线工具，没有配置任何后端服务器。「检查更新」只会读取 GitHub Release 的版本信息并打开发布页面，绝不记录、存储或上传任何键鼠隐私数据。
 
 ---
 
@@ -123,9 +155,11 @@ npm install
 # 2. 启动开发模式
 npm run tauri:dev
 
-# 3. 本地打包发布产物（自动生成便携版与安装包）
+# 3. Windows 本地打包发布产物（便携版 exe + NSIS 安装包）
 npm run package:release
 ```
+
+macOS 开发机可同样使用 `npm run tauri:dev`。正式 Universal DMG 由 GitHub Actions 在 `v*` tag 上签名、公证后上传到 Draft Release，不走 Windows 的 `package-release.ps1`。
 
 ---
 

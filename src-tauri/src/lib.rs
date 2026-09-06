@@ -116,6 +116,7 @@ fn config_dir() -> String {
 #[tauri::command]
 fn open_config_dir() -> Result<(), String> {
     let dir = engine::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;

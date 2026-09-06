@@ -10,6 +10,8 @@ src-tauri/gen/
 # Local build / user data next to the exe
 release/*.exe
 release/*.msi
+release/*.dmg
+release/*.app
 release/*.txt
 release/*.ico
 release/.portable

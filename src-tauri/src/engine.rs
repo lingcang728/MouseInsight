@@ -1134,11 +1134,30 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
 
     if is_portable_mode() {
-        exe_dir
-    } else {
+        return exe_dir;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
         std::env::var_os("APPDATA")
             .map(|appdata| PathBuf::from(appdata).join("MouseInsight"))
             .unwrap_or(exe_dir)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Installed .app bundles are not writable; keep user data out of /Applications.
+        std::env::var_os("HOME")
+            .map(|home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("MouseInsight")
+            })
+            .unwrap_or(exe_dir)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        exe_dir
     }
 }
 
@@ -3190,5 +3209,20 @@ mod tests {
         assert_eq!(action.mode, TriggerMode::Dual);
         assert_eq!(action.tap_specs.len(), 2);
         assert_eq!(action.hold_specs.len(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_installed_config_dir_uses_application_support() {
+        let dir = super::config_dir();
+        let text = dir.to_string_lossy();
+        assert!(
+            text.contains("Application Support"),
+            "macOS config dir should be under Application Support, got {text}"
+        );
+        assert!(
+            text.ends_with("MouseInsight"),
+            "macOS config dir should end with MouseInsight, got {text}"
+        );
     }
 }
