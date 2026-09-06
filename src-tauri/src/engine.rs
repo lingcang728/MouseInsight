@@ -846,9 +846,14 @@ fn release_active_specs(
     }
 
     if !to_release.is_empty() {
-        let mut inputs: Vec<INPUT> = to_release.iter().map(|s| make_input(s, false)).collect();
+        let mut inputs: Vec<INPUT> = Vec::with_capacity(to_release.len() + 2);
         if had_alt_or_win {
             inputs.push(make_raw_input(VK_MASK_KEY, false, true));
+        }
+        for s in to_release.iter() {
+            inputs.push(make_input(s, false));
+        }
+        if had_alt_or_win {
             inputs.push(make_raw_input(VK_MASK_KEY, false, false));
         }
         if let Err(report) = execute_send_inputs(&inputs) {
@@ -859,24 +864,37 @@ fn release_active_specs(
 }
 
 fn press_specs_once(specs: &[KeySpec], on_send_error: &impl Fn(SendReport)) {
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(specs.len() * 2 + 2);
-    let mut had_alt_or_win = false;
+    if specs.is_empty() {
+        return;
+    }
 
-    for s in specs {
-        inputs.push(make_input(s, true));
+    // 1. 发送所有按键的按下事件
+    let down_inputs: Vec<INPUT> = specs.iter().map(|s| make_input(s, true)).collect();
+    if let Err(report) = execute_send_inputs(&down_inputs) {
+        *engine().last_send_error.write() = Some(report.clone());
+        on_send_error(report);
+        return;
+    }
+
+    // 2. 关键：提供 30ms 的硬件级按键停留时间（Dwell Time）
+    // Windows 应用程序（如各类输入框、聊天软件、浏览器、游戏）的消息循环依赖 GetKeyState 校验
+    // 若 0 延迟同时发送按下与松开，应用程序在处理 KeyDown 时按键状态已处于释放，会被当作毛刺忽略丢弃
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    // 3. 释放按键
+    let had_alt_or_win = specs.iter().any(|s| is_alt_or_win(s.vk));
+    let mut up_inputs: Vec<INPUT> = Vec::with_capacity(specs.len() + 2);
+    if had_alt_or_win {
+        up_inputs.push(make_raw_input(VK_MASK_KEY, false, true));
     }
     for s in specs.iter().rev() {
-        inputs.push(make_input(s, false));
-        if is_alt_or_win(s.vk) {
-            had_alt_or_win = true;
-        }
+        up_inputs.push(make_input(s, false));
     }
     if had_alt_or_win {
-        inputs.push(make_raw_input(VK_MASK_KEY, false, true));
-        inputs.push(make_raw_input(VK_MASK_KEY, false, false));
+        up_inputs.push(make_raw_input(VK_MASK_KEY, false, false));
     }
 
-    if let Err(report) = execute_send_inputs(&inputs) {
+    if let Err(report) = execute_send_inputs(&up_inputs) {
         *engine().last_send_error.write() = Some(report.clone());
         on_send_error(report);
     }
