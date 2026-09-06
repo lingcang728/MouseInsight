@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "mouse_insight"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "crossbeam-channel",

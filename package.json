@@ -1,12 +1,13 @@
 {
   "name": "mouse-insight",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Mouse Insight",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "test": "node tests/frontend_logic.test.mjs && cargo test --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",

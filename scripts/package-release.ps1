@@ -132,11 +132,7 @@ if (Test-Path $portableExe) {
         New-Item -ItemType File -Path $portableMarker -Force | Out-Null
     }
 
-    # 更新开机自启注册表指向便携版
-    $runRegPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-    $autostartCmd = "`"$portableExe`" --autostart"
-    Set-ItemProperty -Path $runRegPath -Name 'Mouse Insight' -Value $autostartCmd
-    Write-Host "已配置开机自启注册表指向便携版: $autostartCmd" -ForegroundColor Green
+    Write-Host "开机自启由应用内开关与 tauri-plugin-autostart 管理，打包脚本不再改写 Run 键。" -ForegroundColor DarkCyan
 
     # 复制独立图标文件到 release 目录，供快捷方式直接引用（彻底绕过 Windows 对 exe 的陈旧图标缓存）
     $srcIco = Join-Path $root 'src-tauri\icons\icon.ico'

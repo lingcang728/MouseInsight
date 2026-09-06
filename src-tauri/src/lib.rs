@@ -1,9 +1,9 @@
 mod engine;
 
-use engine::{Mapping, Pulse, SendReport, Snapshot};
+use engine::{Mapping, Pulse, RuntimeBindingState, SendReport, Snapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
@@ -104,17 +104,26 @@ pub fn sync_engine_paused_state(app: &tauri::AppHandle, paused: bool) {
     }
 
     if let Some(state) = app.try_state::<TrayState>() {
-        let text = if paused { "恢复映射" } else { "暂停映射" };
+        let text = if paused {
+            "恢复映射"
+        } else {
+            "暂停映射"
+        };
         let _ = state.pause_item.set_text(text);
     }
 
-    let _ = app.emit("engine-state-changed", serde_json::json!({ "paused": paused }));
+    let _ = app.emit(
+        "engine-state-changed",
+        serde_json::json!({ "paused": paused }),
+    );
 }
 
 fn bring_hwnd_to_front(w: &tauri::WebviewWindow) {
-    let _ = w.show();
     let _ = w.unminimize();
+    let _ = w.show();
     let _ = w.set_focus();
+    let _ = w.set_always_on_top(true);
+    let _ = w.set_always_on_top(false);
 
     #[cfg(target_os = "windows")]
     if let Ok(hwnd) = w.hwnd() {
@@ -148,23 +157,46 @@ fn bring_hwnd_to_front(w: &tauri::WebviewWindow) {
     }
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        bring_hwnd_to_front(&w);
-        engine::set_window_visible(true);
-        WINDOW_ACTIVE.store(true, Ordering::Relaxed);
-    } else if let Ok(w) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+fn create_main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Mouse Insight")
         .inner_size(1180.0, 760.0)
         .min_inner_size(920.0, 620.0)
         .center()
         .decorations(true)
+        .visible(true)
         .build()
     {
-        WINDOW_ACTIVE.store(true, Ordering::Relaxed);
-        engine::set_window_visible(true);
-        bring_hwnd_to_front(&w);
+        Ok(w) => Some(w),
+        Err(err) => {
+            eprintln!("[MouseInsight] failed to create main window: {err}");
+            None
+        }
     }
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        bring_hwnd_to_front(&w);
+        engine::set_window_visible(true);
+        WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app_handle.get_webview_window("main") {
+            bring_hwnd_to_front(&w);
+            engine::set_window_visible(true);
+            WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+            return;
+        }
+        if let Some(w) = create_main_window(&app_handle) {
+            bring_hwnd_to_front(&w);
+            engine::set_window_visible(true);
+            WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -186,6 +218,7 @@ pub fn run() {
                 WINDOW_ACTIVE.store(false, Ordering::Relaxed);
             }
             WindowEvent::Destroyed => {
+                engine::disarm_record();
                 engine::set_window_visible(false);
                 WINDOW_ACTIVE.store(false, Ordering::Relaxed);
             }
@@ -201,6 +234,7 @@ pub fn run() {
             let handle4 = app.handle().clone();
             let handle_pause = app.handle().clone();
             let handle_err = app.handle().clone();
+            let handle_state = app.handle().clone();
 
             engine::start(
                 move |pulse: Pulse| {
@@ -231,6 +265,11 @@ pub fn run() {
                         let _ = handle_err.emit("injection-error", report);
                     }
                 },
+                move |state: RuntimeBindingState| {
+                    if WINDOW_ACTIVE.load(Ordering::Relaxed) {
+                        let _ = handle_state.emit("runtime-binding-changed", state);
+                    }
+                },
             );
 
             let initial_snap = engine::snapshot();
@@ -240,7 +279,11 @@ pub fn run() {
             let pause_item = MenuItem::with_id(
                 app,
                 "toggle_pause",
-                if is_paused { "恢复映射" } else { "暂停映射" },
+                if is_paused {
+                    "恢复映射"
+                } else {
+                    "暂停映射"
+                },
                 true,
                 None::<&str>,
             )?;
@@ -277,21 +320,18 @@ pub fn run() {
                     }
                     _ => {}
                 })
-                .on_tray_icon_event(|tray, event| {
-                    match event {
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        }
-                        | TrayIconEvent::DoubleClick {
-                            button: MouseButton::Left,
-                            ..
-                        } => {
-                            show_main_window(tray.app_handle());
-                        }
-                        _ => {}
+                .on_tray_icon_event(|tray, event| match event {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        ..
                     }
+                    | TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        show_main_window(tray.app_handle());
+                    }
+                    _ => {}
                 })
                 .build(app)?;
 

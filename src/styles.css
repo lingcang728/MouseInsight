@@ -220,25 +220,192 @@ button { cursor: pointer; }
 }
 .ghost:hover { background: var(--surface-2); }
 
-.maps { display: flex; flex-direction: column; gap: 8px; }
+.maps { display: flex; flex-direction: column; gap: 10px; }
 .map {
-  display: grid;
-  grid-template-columns: 104px 88px minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 8px 10px;
+  padding: 10px 12px;
+  min-width: 0;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+}
+.map.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.map.live {
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+.map-primary-row {
+  display: grid;
+  grid-template-columns: 104px 104px auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
   min-width: 0;
 }
-.map.live { border-color: var(--accent); }
+.map-primary-row:has(.pill.hidden),
+.map-primary-row:has(.status-pill.hidden) {
+  grid-template-columns: 104px 104px minmax(0, 1fr) auto;
+}
 .map select {
   background: var(--key-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 7px 8px;
   min-width: 0;
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 0.15s ease;
+}
+.map select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.map-btn-record {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 7px 10px;
+  min-width: 0;
+}
+
+/* 运行时状态指示 Badge / Pill 样式 */
+.pill,
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  padding: 3px 8px;
+  border-radius: 6px;
+  line-height: 1.2;
+  white-space: nowrap;
+  user-select: none;
+  border: 1px solid transparent;
+  box-sizing: border-box;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.pill::before,
+.status-pill::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+/* 按住中：跟随按住激活，浅蓝色/品牌色微光，具有微弱活跃感 */
+.pill-hold {
+  background: rgba(43, 127, 212, 0.10);
+  color: #1765b2;
+  border-color: rgba(43, 127, 212, 0.32);
+  box-shadow: 0 0 0 1px rgba(43, 127, 212, 0.12), 0 0 8px rgba(43, 127, 212, 0.20);
+  animation: pill-hold-breathe 2s ease-in-out infinite;
+}
+.pill-hold::before {
+  box-shadow: 0 0 4px currentColor;
+}
+
+[data-theme="dark"] .pill-hold {
+  background: rgba(43, 127, 212, 0.22);
+  color: #93c9fc;
+  border-color: rgba(126, 182, 234, 0.45);
+  box-shadow: 0 0 0 1px rgba(126, 182, 234, 0.22), 0 0 8px rgba(66, 153, 225, 0.30);
+  animation: pill-hold-breathe-dark 2s ease-in-out infinite;
+}
+
+@keyframes pill-hold-breathe {
+  0%, 100% {
+    box-shadow: 0 0 0 1px rgba(43, 127, 212, 0.12), 0 0 6px rgba(43, 127, 212, 0.16);
+    opacity: 0.94;
+  }
+  50% {
+    box-shadow: 0 0 0 1px rgba(43, 127, 212, 0.28), 0 0 10px rgba(43, 127, 212, 0.32);
+    opacity: 1;
+  }
+}
+
+@keyframes pill-hold-breathe-dark {
+  0%, 100% {
+    box-shadow: 0 0 0 1px rgba(126, 182, 234, 0.18), 0 0 6px rgba(66, 153, 225, 0.24);
+    opacity: 0.94;
+  }
+  50% {
+    box-shadow: 0 0 0 1px rgba(126, 182, 234, 0.38), 0 0 12px rgba(66, 153, 225, 0.44);
+    opacity: 1;
+  }
+}
+
+/* 保持中：Toggle 开启保持状态，醒目的激活高亮（翡翠绿） */
+.pill-on {
+  background: #eaf8ee;
+  color: #0c6a32;
+  border-color: rgba(16, 185, 129, 0.45);
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.15), 0 1px 3px rgba(12, 106, 50, 0.12);
+}
+.pill-on::before {
+  box-shadow: 0 0 4px currentColor;
+}
+
+[data-theme="dark"] .pill-on {
+  background: rgba(16, 185, 129, 0.18);
+  color: #34d399;
+  border-color: rgba(52, 211, 153, 0.45);
+  box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.20), 0 0 8px rgba(16, 185, 129, 0.28);
+}
+
+/* 已关闭：Toggle 关闭状态，柔和的灰色/muted 文本与背景 */
+.pill-off,
+.status-pill.inactive {
+  background: var(--surface-2);
+  color: var(--muted);
+  border-color: var(--border);
+  box-shadow: none;
+}
+.pill-off::before,
+.status-pill.inactive::before {
+  opacity: 0.45;
+}
+
+/* 兼容原有 .status-pill.active 类名 */
+.status-pill.active:not(.pill-on):not(.pill-hold) {
+  background: #e1effe;
+  color: #1a56db;
+  border-color: #76a9fa;
+  box-shadow: 0 1px 3px rgba(26, 86, 219, 0.12);
+}
+[data-theme="dark"] .status-pill.active:not(.pill-on):not(.pill-hold) {
+  background: rgba(43, 127, 212, 0.25);
+  color: #90cdf4;
+  border-color: rgba(144, 205, 244, 0.4);
+  box-shadow: 0 0 8px rgba(66, 153, 225, 0.2);
+}
+
+/* 模式说明文案：字号 11px、颜色 var(--muted)、行高适宜，避免换行破坏卡片整体高度 */
+.mode-hint,
+.map-desc {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 2px;
 }
 .danger {
   background: transparent;
@@ -284,20 +451,7 @@ button { cursor: pointer; }
 .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 .row .solid { width: auto; }
 
-/* Map selected state */
-.map {
-  cursor: pointer;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-.map.selected {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
-}
-.map.live {
-  border-color: var(--accent);
-  background: var(--surface-2);
-}
-.map select, .map button {
+.map button {
   cursor: pointer;
 }
 .path {
@@ -324,6 +478,14 @@ button { cursor: pointer; }
   .insight {
     grid-template-columns: 1fr;
     gap: 12px;
+  }
+  .map-primary-row {
+    grid-template-columns: 98px 98px auto minmax(0, 1fr) auto;
+    gap: 6px;
+  }
+  .map-primary-row:has(.pill.hidden),
+  .map-primary-row:has(.status-pill.hidden) {
+    grid-template-columns: 98px 98px minmax(0, 1fr) auto;
   }
 }
 
@@ -352,8 +514,21 @@ button { cursor: pointer; }
     font-size: 11px;
     line-height: 1.4;
   }
+  .map-primary-row {
+    grid-template-columns: 92px 92px auto minmax(0, 1fr) auto;
+    gap: 6px;
+  }
+  .map-primary-row:has(.pill.hidden),
+  .map-primary-row:has(.status-pill.hidden) {
+    grid-template-columns: 92px 92px minmax(0, 1fr) auto;
+  }
+  .map select {
+    font-size: 12px;
+    padding: 6px 6px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
+  .pill-hold { animation: none !important; }
 }

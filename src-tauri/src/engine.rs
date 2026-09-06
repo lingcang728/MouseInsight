@@ -1,43 +1,53 @@
 use arc_swap::ArcSwap;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-    TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_BACK,
-    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT,
-    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4,
-    VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS,
-    VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN,
-    VK_SCROLL, VK_SPACE, VK_TAB, VK_UP,
+    MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    MAPVK_VK_TO_VSC, MOD_NOREPEAT, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+    VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
+    VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, MSLLHOOKSTRUCT, MSG,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 const LLMHF_INJECTED: u32 = 0x0000_0001;
 const LLMHF_LOWER_IL_INJECTED: u32 = 0x0000_0002;
 const LLKHF_UP: u32 = 0x80;
 const LLKHF_INJECTED_KBD: u32 = 0x10;
-const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFF);
+const LLKHF_LOWER_IL_INJECTED_KBD: u32 = 0x02;
+const EXTRA_INFO: usize = 0x4D49_484B;
+const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFC);
+const TAP_QUEUE_CAP: usize = 8;
+const EDGE_CHANNEL_CAP: usize = 256;
+const WM_MI_KBD_ON: u32 = WM_APP + 1;
+const WM_MI_KBD_OFF: u32 = WM_APP + 2;
+const HOTKEY_PAUSE: i32 = 1;
+const HOTKEY_SCROLL: i32 = 2;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,45 +132,60 @@ impl std::hash::Hash for KeySpec {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledAction {
+    pub mapping_id: String,
     pub mode: TriggerMode,
     pub specs: Vec<KeySpec>,
 }
 
 #[derive(Clone, Default, Debug)]
 pub struct CompiledMappings {
-    pub slots: [Option<CompiledAction>; MouseButton::COUNT],
+    pub slots: [Option<Arc<CompiledAction>>; MouseButton::COUNT],
+    pub generation: u64,
 }
 
 impl CompiledMappings {
     #[inline(always)]
-    pub fn get(&self, btn: MouseButton) -> Option<&CompiledAction> {
+    pub fn get(&self, btn: MouseButton) -> Option<&Arc<CompiledAction>> {
         self.slots[btn as usize].as_ref()
     }
 }
 
+#[allow(dead_code)]
 pub fn compile_mappings(mappings: &[Mapping]) -> CompiledMappings {
-    let mut slots = [None, None, None, None, None, None, None];
+    compile_mappings_with_gen(mappings, 0)
+}
+
+pub fn compile_mappings_with_gen(mappings: &[Mapping], generation: u64) -> CompiledMappings {
+    let mut slots: [Option<Arc<CompiledAction>>; MouseButton::COUNT] = Default::default();
     for m in mappings {
         if m.keys.is_empty() {
             continue;
         }
         if let Some(btn) = MouseButton::from_str_fast(&m.button) {
+            // Capability 规则 1: Left / Right 绝不允许建立映射（后端防线）
+            if btn.is_primary() {
+                continue;
+            }
+            let mut mode = TriggerMode::from_str_fast(&m.mode);
+            if btn.is_wheel() {
+                mode = TriggerMode::Click;
+            }
             let idx = btn as usize;
             if slots[idx].is_none() {
                 let specs: Vec<KeySpec> = m.keys.iter().filter_map(|k| key_spec(k)).collect();
                 if !specs.is_empty() {
-                    let mode = TriggerMode::from_str_fast(&m.mode);
-                    slots[idx] = Some(CompiledAction {
+                    slots[idx] = Some(Arc::new(CompiledAction {
+                        mapping_id: m.id.clone(),
                         mode,
                         specs,
-                    });
+                    }));
                 }
             }
         }
     }
-    CompiledMappings { slots }
+    CompiledMappings { slots, generation }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -177,14 +202,22 @@ pub struct Mapping {
 pub struct AppConfig {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default)]
     pub autostart: bool,
+    #[serde(default)]
     pub paused: bool,
+    #[serde(default)]
     pub mappings: Vec<Mapping>,
 }
 
 fn default_schema_version() -> u32 {
     1
+}
+
+fn default_theme() -> String {
+    "dark".into()
 }
 
 impl Default for AppConfig {
@@ -226,36 +259,468 @@ pub struct SendReport {
     pub is_uipi_blocked: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct ActiveBinding {
-    pub specs: Vec<KeySpec>,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeBindingState {
+    pub mapping_id: String,
+    pub button: String,
     pub mode: TriggerMode,
+    pub active: bool,
 }
 
-#[derive(Default)]
-pub struct InputState {
-    pub active_bindings: HashMap<MouseButton, ActiveBinding>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetReason {
+    UserPause,
+    EmergencyStop,
+    ConfigChanged,
+    Shutdown,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    Down,
+    Up,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectedRecord {
+    pub spec: KeySpec,
+    pub action: KeyAction,
+    pub is_mask: bool,
+}
+
+pub trait InputInjector: Send + 'static {
+    #[allow(dead_code)]
+    fn send_key(&mut self, spec: &KeySpec, down: bool) -> Result<(), SendReport> {
+        self.send_keys(std::slice::from_ref(spec), down)
+    }
+    fn send_keys(&mut self, specs: &[KeySpec], down: bool) -> Result<(), SendReport>;
+    fn send_mask(&mut self) -> Result<(), SendReport>;
+    fn is_physical_down(&self, vk: VIRTUAL_KEY) -> bool;
+}
+
+pub struct Win32Injector;
+
+impl InputInjector for Win32Injector {
+    fn send_keys(&mut self, specs: &[KeySpec], down: bool) -> Result<(), SendReport> {
+        if specs.is_empty() {
+            return Ok(());
+        }
+        let inputs: Vec<INPUT> = specs.iter().map(|s| make_input(s, down)).collect();
+        execute_send_inputs(&inputs).map(|_| ())
+    }
+
+    fn send_mask(&mut self) -> Result<(), SendReport> {
+        let inputs = [
+            make_raw_input(VK_MASK_KEY, false, true),
+            make_raw_input(VK_MASK_KEY, false, false),
+        ];
+        execute_send_inputs(&inputs).map(|_| ())
+    }
+
+    fn is_physical_down(&self, vk: VIRTUAL_KEY) -> bool {
+        physical_down_set().read().contains(&(vk.0 as u32))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Default, Clone)]
+pub struct FakeInjector {
+    pub records: Arc<parking_lot::Mutex<Vec<InjectedRecord>>>,
+    pub physical_held: Arc<parking_lot::Mutex<HashSet<u16>>>,
+    pub batches: Arc<parking_lot::Mutex<Vec<usize>>>,
+}
+
+#[allow(dead_code)]
+impl FakeInjector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_physical_down(&self, vk: VIRTUAL_KEY, down: bool) {
+        let mut held = self.physical_held.lock();
+        if down {
+            held.insert(vk.0);
+        } else {
+            held.remove(&vk.0);
+        }
+    }
+
+    pub fn events(&self) -> Vec<InjectedRecord> {
+        self.records.lock().clone()
+    }
+
+    pub fn clear(&self) {
+        self.records.lock().clear();
+        self.batches.lock().clear();
+    }
+}
+
+impl InputInjector for FakeInjector {
+    fn send_keys(&mut self, specs: &[KeySpec], down: bool) -> Result<(), SendReport> {
+        if specs.is_empty() {
+            return Ok(());
+        }
+        self.batches.lock().push(specs.len());
+        let mut recs = self.records.lock();
+        for spec in specs {
+            recs.push(InjectedRecord {
+                spec: *spec,
+                action: if down { KeyAction::Down } else { KeyAction::Up },
+                is_mask: false,
+            });
+        }
+        Ok(())
+    }
+
+    fn send_mask(&mut self) -> Result<(), SendReport> {
+        self.records.lock().push(InjectedRecord {
+            spec: KeySpec {
+                vk: VK_MASK_KEY,
+                extended: false,
+            },
+            action: KeyAction::Down,
+            is_mask: true,
+        });
+        self.records.lock().push(InjectedRecord {
+            spec: KeySpec {
+                vk: VK_MASK_KEY,
+                extended: false,
+            },
+            action: KeyAction::Up,
+            is_mask: true,
+        });
+        Ok(())
+    }
+
+    fn is_physical_down(&self, vk: VIRTUAL_KEY) -> bool {
+        self.physical_held.lock().contains(&vk.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ActiveTap {
+    mapping_id: String,
+    specs: Vec<KeySpec>,
+    due: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedTap {
+    mapping_id: String,
+    specs: Vec<KeySpec>,
+}
+
+pub struct InputStateMachine<I: InputInjector> {
+    pub injector: I,
     pub key_refs: HashMap<KeySpec, u32>,
-    pub toggle_on: HashMap<MouseButton, bool>,
+    active_holds: HashMap<MouseButton, (String, Vec<KeySpec>)>,
+    active_toggles: HashMap<MouseButton, (String, Vec<KeySpec>)>,
+    tap_in_flight: HashMap<MouseButton, ActiveTap>,
+    tap_queue: HashMap<MouseButton, VecDeque<QueuedTap>>,
+    current_generation: u64,
+    paused: bool,
+    tap_dwell: Duration,
+    on_state_change: Option<Box<dyn Fn(RuntimeBindingState) + Send + 'static>>,
+    on_send_error: Option<Box<dyn Fn(SendReport) + Send + 'static>>,
 }
 
-impl InputState {
-    pub fn reset_all(&mut self) {
+impl<I: InputInjector> InputStateMachine<I> {
+    pub fn new(injector: I) -> Self {
+        Self {
+            injector,
+            key_refs: HashMap::new(),
+            active_holds: HashMap::new(),
+            active_toggles: HashMap::new(),
+            tap_in_flight: HashMap::new(),
+            tap_queue: HashMap::new(),
+            current_generation: 0,
+            paused: false,
+            tap_dwell: Duration::from_millis(30),
+            on_state_change: None,
+            on_send_error: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_dwell(mut self, dwell: Duration) -> Self {
+        self.tap_dwell = dwell;
+        self
+    }
+
+    pub fn set_callbacks(
+        &mut self,
+        on_state_change: Option<Box<dyn Fn(RuntimeBindingState) + Send + 'static>>,
+        on_send_error: Option<Box<dyn Fn(SendReport) + Send + 'static>>,
+    ) {
+        self.on_state_change = on_state_change;
+        self.on_send_error = on_send_error;
+    }
+
+    #[allow(dead_code)]
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    #[allow(dead_code)]
+    pub fn set_paused_raw(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        if paused {
+            self.reset_all(ResetReason::UserPause);
+        }
+    }
+
+    pub fn emergency_stop(&mut self) {
+        self.paused = true;
+        self.reset_all(ResetReason::EmergencyStop);
+    }
+
+    pub fn update_config(&mut self, generation: u64) {
+        self.current_generation = generation;
+        self.reset_all(ResetReason::ConfigChanged);
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.tap_in_flight.values().map(|t| t.due).min()
+    }
+
+    fn emit_state_change(
+        &self,
+        mapping_id: String,
+        button: MouseButton,
+        mode: TriggerMode,
+        active: bool,
+    ) {
+        if let Some(cb) = &self.on_state_change {
+            cb(RuntimeBindingState {
+                mapping_id,
+                button: button.as_str().to_string(),
+                mode,
+                active,
+            });
+        }
+    }
+
+    pub fn acquire_specs(&mut self, specs: &[KeySpec]) {
+        let mut to_press: Vec<KeySpec> = Vec::new();
+        for s in specs {
+            let count = self.key_refs.entry(*s).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                to_press.push(*s);
+            }
+        }
+        if !to_press.is_empty() {
+            if let Err(report) = self.injector.send_keys(&to_press, true) {
+                if let Some(cb) = &self.on_send_error {
+                    cb(report);
+                }
+            }
+        }
+    }
+
+    pub fn release_specs(&mut self, specs: &[KeySpec]) {
+        let mut to_release: Vec<KeySpec> = Vec::new();
         let mut had_alt_or_win = false;
-        for (spec, count) in &self.key_refs {
-            if *count > 0 {
-                send_key(spec, false);
+        for s in specs.iter().rev() {
+            if let Some(count) = self.key_refs.get_mut(s) {
+                if *count > 0 {
+                    *count -= 1;
+                    if *count == 0 && !self.injector.is_physical_down(s.vk) {
+                        to_release.push(*s);
+                        if is_alt_or_win(s.vk) {
+                            had_alt_or_win = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !to_release.is_empty() {
+            if let Err(report) = self.injector.send_keys(&to_release, false) {
+                if let Some(cb) = &self.on_send_error {
+                    cb(report);
+                }
+            }
+        }
+        if had_alt_or_win {
+            if let Err(report) = self.injector.send_mask() {
+                if let Some(cb) = &self.on_send_error {
+                    cb(report);
+                }
+            }
+        }
+    }
+
+    pub fn tick(&mut self, now: Instant) {
+        let mut expired_buttons = Vec::new();
+        for (btn, tap) in &self.tap_in_flight {
+            if tap.due <= now {
+                expired_buttons.push(*btn);
+            }
+        }
+
+        for btn in expired_buttons {
+            if let Some(tap) = self.tap_in_flight.remove(&btn) {
+                self.release_specs(&tap.specs);
+                self.emit_state_change(tap.mapping_id, btn, TriggerMode::Click, false);
+
+                if let Some(q) = self.tap_queue.get_mut(&btn) {
+                    if let Some(next) = q.pop_front() {
+                        self.acquire_specs(&next.specs);
+                        self.tap_in_flight.insert(
+                            btn,
+                            ActiveTap {
+                                mapping_id: next.mapping_id.clone(),
+                                specs: next.specs.clone(),
+                                due: now + self.tap_dwell,
+                            },
+                        );
+                        self.emit_state_change(next.mapping_id, btn, TriggerMode::Click, true);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn handle_mouse_edge(
+        &mut self,
+        button: MouseButton,
+        down: bool,
+        action: Option<Arc<CompiledAction>>,
+        generation: u64,
+        now: Instant,
+    ) {
+        self.tick(now);
+
+        if self.paused {
+            if !down {
+                if let Some((mapping_id, specs)) = self.active_holds.remove(&button) {
+                    self.release_specs(&specs);
+                    self.emit_state_change(mapping_id, button, TriggerMode::Hold, false);
+                }
+            }
+            return;
+        }
+
+        if down {
+            if generation < self.current_generation {
+                return;
+            }
+            let Some(action) = action else {
+                return;
+            };
+            match action.mode {
+                TriggerMode::Hold => {
+                    if self.active_holds.contains_key(&button) {
+                        return;
+                    }
+                    self.acquire_specs(&action.specs);
+                    self.active_holds
+                        .insert(button, (action.mapping_id.clone(), action.specs.clone()));
+                    self.emit_state_change(
+                        action.mapping_id.clone(),
+                        button,
+                        TriggerMode::Hold,
+                        true,
+                    );
+                }
+                TriggerMode::Click => {
+                    if self.tap_in_flight.contains_key(&button) {
+                        let q = self.tap_queue.entry(button).or_default();
+                        if q.len() < TAP_QUEUE_CAP {
+                            q.push_back(QueuedTap {
+                                mapping_id: action.mapping_id.clone(),
+                                specs: action.specs.clone(),
+                            });
+                        }
+                    } else {
+                        self.acquire_specs(&action.specs);
+                        self.tap_in_flight.insert(
+                            button,
+                            ActiveTap {
+                                mapping_id: action.mapping_id.clone(),
+                                specs: action.specs.clone(),
+                                due: now + self.tap_dwell,
+                            },
+                        );
+                        self.emit_state_change(
+                            action.mapping_id.clone(),
+                            button,
+                            TriggerMode::Click,
+                            true,
+                        );
+                    }
+                }
+                TriggerMode::Toggle => {
+                    if let Some((mapping_id, specs)) = self.active_toggles.remove(&button) {
+                        self.release_specs(&specs);
+                        self.emit_state_change(mapping_id, button, TriggerMode::Toggle, false);
+                    } else {
+                        self.acquire_specs(&action.specs);
+                        self.active_toggles
+                            .insert(button, (action.mapping_id.clone(), action.specs.clone()));
+                        self.emit_state_change(
+                            action.mapping_id.clone(),
+                            button,
+                            TriggerMode::Toggle,
+                            true,
+                        );
+                    }
+                }
+            }
+        } else {
+            // MouseUp 优先释放 active_holds 中记录的 snapshot，绝不依赖新配置
+            if let Some((mapping_id, specs)) = self.active_holds.remove(&button) {
+                self.release_specs(&specs);
+                self.emit_state_change(mapping_id, button, TriggerMode::Hold, false);
+            }
+        }
+    }
+
+    pub fn reset_all(&mut self, _reason: ResetReason) {
+        let holds: Vec<(MouseButton, (String, Vec<KeySpec>))> = self.active_holds.drain().collect();
+        for (btn, (id, specs)) in holds {
+            self.release_specs(&specs);
+            self.emit_state_change(id, btn, TriggerMode::Hold, false);
+        }
+
+        let toggles: Vec<(MouseButton, (String, Vec<KeySpec>))> =
+            self.active_toggles.drain().collect();
+        for (btn, (id, specs)) in toggles {
+            self.release_specs(&specs);
+            self.emit_state_change(id, btn, TriggerMode::Toggle, false);
+        }
+
+        let taps: Vec<(MouseButton, ActiveTap)> = self.tap_in_flight.drain().collect();
+        for (btn, tap) in taps {
+            self.release_specs(&tap.specs);
+            self.emit_state_change(tap.mapping_id, btn, TriggerMode::Click, false);
+        }
+
+        self.tap_queue.clear();
+
+        let mut had_alt_or_win = false;
+        let leftover_keys: Vec<(KeySpec, u32)> = self.key_refs.drain().collect();
+        let mut to_release: Vec<KeySpec> = Vec::new();
+        for (spec, count) in leftover_keys {
+            if count > 0 && !self.injector.is_physical_down(spec.vk) {
+                to_release.push(spec);
                 if is_alt_or_win(spec.vk) {
                     had_alt_or_win = true;
                 }
             }
         }
-        if had_alt_or_win {
-            send_mask_key();
+        if !to_release.is_empty() {
+            let _ = self.injector.send_keys(&to_release, false);
         }
-        self.active_bindings.clear();
-        self.key_refs.clear();
-        self.toggle_on.clear();
+        if had_alt_or_win {
+            let _ = self.injector.send_mask();
+        }
     }
 }
 
@@ -264,6 +729,7 @@ struct RecorderState {
     physical_held: HashSet<u32>,
     max_chord: Vec<String>,
     chip_modifiers: HashSet<String>,
+    last_emitted: Vec<String>,
 }
 
 impl RecorderState {
@@ -271,6 +737,7 @@ impl RecorderState {
         self.physical_held.clear();
         self.max_chord.clear();
         self.chip_modifiers.clear();
+        self.last_emitted.clear();
     }
 
     fn on_key(&mut self, vk: u32, down: bool) -> Vec<String> {
@@ -290,10 +757,15 @@ impl RecorderState {
             if normalized.len() >= self.max_chord.len() {
                 self.max_chord = normalized.clone();
             }
-            self.max_chord.clone()
+            if self.max_chord == self.last_emitted {
+                Vec::new()
+            } else {
+                self.last_emitted = self.max_chord.clone();
+                self.max_chord.clone()
+            }
         } else {
             self.physical_held.remove(&vk);
-            self.max_chord.clone()
+            Vec::new()
         }
     }
 
@@ -313,7 +785,12 @@ impl RecorderState {
         if normalized.len() >= self.max_chord.len() {
             self.max_chord = normalized.clone();
         }
-        self.max_chord.clone()
+        if self.max_chord == self.last_emitted {
+            Vec::new()
+        } else {
+            self.last_emitted = self.max_chord.clone();
+            self.max_chord.clone()
+        }
     }
 }
 
@@ -346,10 +823,19 @@ pub fn normalize_key_chord(keys: &[String]) -> Vec<String> {
     deduped
 }
 
-enum InputCmd {
-    Fire { button: MouseButton, down: bool },
-    ResetState,
-    EmergencyPause,
+pub enum InputCmd {
+    MouseEdge {
+        button: MouseButton,
+        down: bool,
+        action: Option<Arc<CompiledAction>>,
+        generation: u64,
+    },
+    ResetState(ResetReason),
+    EmergencyStop,
+    UpdateMappings {
+        generation: u64,
+    },
+    SetPaused(bool),
     ListenCaptured(String),
     Record(Vec<String>),
     RecordCancel,
@@ -363,14 +849,36 @@ struct Engine {
     recording: AtomicBool,
     window_visible: AtomicBool,
     last: RwLock<Option<Pulse>>,
-    last_send_error: RwLock<Option<SendReport>>,
     cmd_tx: Sender<InputCmd>,
+    edge_tx: Sender<InputCmd>,
     telem_tx: Sender<Pulse>,
     recorder: RwLock<RecorderState>,
 }
 
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 static HOOK_TID: AtomicU32 = AtomicU32::new(0);
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
+static SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PHYSICAL_DOWN: OnceLock<RwLock<HashSet<u32>>> = OnceLock::new();
+static WORKER_DONE: OnceLock<Mutex<Option<Receiver<()>>>> = OnceLock::new();
+
+fn physical_down_set() -> &'static RwLock<HashSet<u32>> {
+    PHYSICAL_DOWN.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+fn save_lock() -> &'static Mutex<()> {
+    SAVE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn post_hook_message(msg: u32) {
+    let tid = HOOK_TID.load(Ordering::Relaxed);
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, msg, WPARAM(0), LPARAM(0));
+        }
+    }
+}
 
 fn engine() -> &'static Engine {
     ENGINE.get().expect("engine not started")
@@ -388,9 +896,7 @@ pub fn is_portable_mode() -> bool {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    exe_dir.join(".portable").is_file()
-        || exe_dir.join("portable").is_file()
-        || exe_dir.join("config.json").is_file()
+    exe_dir.join(".portable").is_file() || exe_dir.join("portable").is_file()
 }
 
 pub fn config_dir() -> PathBuf {
@@ -416,51 +922,50 @@ fn config_bak_path() -> PathBuf {
     config_dir().join("config.json.bak")
 }
 
+fn try_parse_config(path: &PathBuf) -> Option<AppConfig> {
+    let s = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<AppConfig>(&s).ok()
+}
+
 fn load_config() -> AppConfig {
     let path = config_path();
-    if !path.exists() {
-        return AppConfig::default();
+    if let Some(cfg) = try_parse_config(&path) {
+        return cfg;
     }
-    match fs::read_to_string(&path) {
-        Ok(s) => match serde_json::from_str::<AppConfig>(&s) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                eprintln!("[MouseInsight] config.json parse error: {err}. Attempting backup recovery...");
-                let bak = config_bak_path();
-                if bak.exists() {
-                    if let Ok(bak_s) = fs::read_to_string(&bak) {
-                        if let Ok(bak_cfg) = serde_json::from_str::<AppConfig>(&bak_s) {
-                            eprintln!("[MouseInsight] Restored config from config.json.bak successfully.");
-                            return bak_cfg;
-                        }
-                    }
-                }
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let corrupt_path = config_dir().join(format!("config.json.corrupted.{ts}"));
-                let _ = fs::copy(&path, &corrupt_path);
-                eprintln!("[MouseInsight] Preserved corrupted config at {:?}", corrupt_path);
-                AppConfig::default()
-            }
-        },
-        Err(e) => {
-            eprintln!("[MouseInsight] Failed to read config file: {e}");
-            AppConfig::default()
-        }
+    let bak = config_bak_path();
+    if let Some(cfg) = try_parse_config(&bak) {
+        eprintln!("[MouseInsight] Restored config from config.json.bak");
+        return cfg;
     }
+    if path.exists() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let corrupt_path = config_dir().join(format!("config.json.corrupted.{ts}"));
+        let _ = fs::copy(&path, &corrupt_path);
+        eprintln!(
+            "[MouseInsight] Preserved corrupted config at {:?}",
+            corrupt_path
+        );
+    }
+    AppConfig::default()
 }
 
 fn save_config(cfg: &AppConfig) -> Result<(), String> {
+    let _guard = save_lock()
+        .lock()
+        .map_err(|_| "config save lock poisoned".to_string())?;
+
     let dir = config_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {e}"))?;
 
     let json = serde_json::to_string_pretty(cfg)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
 
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let tmp_path = dir.join(format!("config.json.{pid}.tmp"));
+    let tmp_path = dir.join(format!("config.json.{pid}.{seq}.tmp"));
     let file_path = config_path();
     let bak_path = config_bak_path();
 
@@ -481,17 +986,35 @@ fn save_config(cfg: &AppConfig) -> Result<(), String> {
         let _ = fs::copy(&file_path, &bak_path);
     }
 
-    if let Err(e) = fs::rename(&tmp_path, &file_path) {
-        if file_path.exists() {
-            let _ = fs::remove_file(&file_path);
-        }
-        if let Err(replace_err) = fs::rename(&tmp_path, &file_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("Atomic config swap failed: {e} / {replace_err}"));
-        }
-    }
-
+    replace_file_atomic(&tmp_path, &file_path)?;
+    let _ = fs::remove_file(&tmp_path);
     Ok(())
+}
+
+fn replace_file_atomic(from: &PathBuf, to: &PathBuf) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        let src: Vec<u16> = from.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let dst: Vec<u16> = to.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let ok = unsafe {
+            MoveFileExW(
+                PCWSTR(src.as_ptr()),
+                PCWSTR(dst.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok.is_ok() {
+            return Ok(());
+        }
+        let err = unsafe { GetLastError() };
+        return Err(format!("MoveFileExW replace failed: {}", err.0));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        fs::rename(from, to).map_err(|e| format!("rename failed: {e}"))
+    }
 }
 
 pub fn xmbc_running() -> bool {
@@ -543,14 +1066,15 @@ pub fn snapshot() -> Snapshot {
 
 pub fn set_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
     let e = engine();
-    let compiled = compile_mappings(&mappings);
-    e.compiled.store(Arc::new(compiled));
+    let gen = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let compiled = Arc::new(compile_mappings_with_gen(&mappings, gen));
+    e.compiled.store(compiled);
     let cfg = {
         let mut w = e.cfg.write();
         w.mappings = mappings;
         w.clone()
     };
-    let _ = e.cmd_tx.try_send(InputCmd::ResetState);
+    let _ = e.cmd_tx.send(InputCmd::UpdateMappings { generation: gen });
     save_config(&cfg)
 }
 
@@ -567,9 +1091,7 @@ pub fn set_theme(theme: String) -> Result<(), String> {
 pub fn set_paused(paused: bool) -> Result<(), String> {
     let e = engine();
     e.paused.store(paused, Ordering::SeqCst);
-    if paused {
-        let _ = e.cmd_tx.try_send(InputCmd::ResetState);
-    }
+    let _ = e.cmd_tx.send(InputCmd::SetPaused(paused));
     let cfg = {
         let mut w = e.cfg.write();
         w.paused = paused;
@@ -596,18 +1118,22 @@ pub fn arm_record() {
     let e = engine();
     e.recorder.write().reset();
     e.recording.store(true, Ordering::Relaxed);
+    post_hook_message(WM_MI_KBD_ON);
 }
 
 pub fn disarm_record() {
     let e = engine();
     e.recording.store(false, Ordering::Relaxed);
     e.recorder.write().reset();
+    post_hook_message(WM_MI_KBD_OFF);
 }
 
 pub fn add_record_key(key: String) {
     let e = engine();
     let chord = e.recorder.write().add_chip(key);
-    let _ = e.cmd_tx.try_send(InputCmd::Record(chord));
+    if !chord.is_empty() {
+        let _ = e.cmd_tx.send(InputCmd::Record(chord));
+    }
 }
 
 pub fn take_record_keys() -> Vec<String> {
@@ -615,6 +1141,7 @@ pub fn take_record_keys() -> Vec<String> {
     e.recording.store(false, Ordering::Relaxed);
     let keys = e.recorder.read().max_chord.clone();
     e.recorder.write().reset();
+    post_hook_message(WM_MI_KBD_OFF);
     keys
 }
 
@@ -623,12 +1150,20 @@ pub fn shutdown() {
         e.paused.store(true, Ordering::SeqCst);
         e.recording.store(false, Ordering::Relaxed);
         e.listening.store(false, Ordering::Relaxed);
-        let _ = e.cmd_tx.try_send(InputCmd::ResetState);
+        let _ = e.cmd_tx.send(InputCmd::ResetState(ResetReason::Shutdown));
     }
+    post_hook_message(WM_MI_KBD_OFF);
     let tid = HOOK_TID.load(Ordering::Relaxed);
     if tid != 0 {
         unsafe {
             let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+    if let Some(slot) = WORKER_DONE.get() {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(rx) = guard.take() {
+                let _ = rx.recv_timeout(Duration::from_millis(800));
+            }
         }
     }
 }
@@ -640,27 +1175,41 @@ pub fn start(
     on_record_cancel: impl Fn() + Send + 'static,
     on_emergency_pause: impl Fn(bool) + Send + 'static,
     on_send_error: impl Fn(SendReport) + Send + 'static,
+    on_binding_state: impl Fn(RuntimeBindingState) + Send + 'static,
 ) {
-    let (cmd_tx, cmd_rx) = bounded::<InputCmd>(64);
-    let (telem_tx, telem_rx) = bounded::<Pulse>(16);
+    if ENGINE.get().is_some() {
+        return;
+    }
+
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<InputCmd>();
+    let (edge_tx, edge_rx) = crossbeam_channel::bounded::<InputCmd>(EDGE_CHANNEL_CAP);
+    let (telem_tx, telem_rx) = crossbeam_channel::bounded::<Pulse>(16);
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+    let _ = WORKER_DONE.set(Mutex::new(Some(done_rx)));
 
     let cfg = load_config();
     let paused = cfg.paused;
-    let compiled = compile_mappings(&cfg.mappings);
+    let gen = NEXT_GENERATION.load(Ordering::SeqCst);
+    let compiled = compile_mappings_with_gen(&cfg.mappings, gen);
 
-    let _ = ENGINE.set(Engine {
-        cfg: RwLock::new(cfg),
-        compiled: ArcSwap::from_pointee(compiled),
-        paused: AtomicBool::new(paused),
-        listening: AtomicBool::new(false),
-        recording: AtomicBool::new(false),
-        window_visible: AtomicBool::new(false),
-        last: RwLock::new(None),
-        last_send_error: RwLock::new(None),
-        cmd_tx,
-        telem_tx,
-        recorder: RwLock::new(RecorderState::default()),
-    });
+    if ENGINE
+        .set(Engine {
+            cfg: RwLock::new(cfg),
+            compiled: ArcSwap::from_pointee(compiled),
+            paused: AtomicBool::new(paused),
+            listening: AtomicBool::new(false),
+            recording: AtomicBool::new(false),
+            window_visible: AtomicBool::new(false),
+            last: RwLock::new(None),
+            cmd_tx,
+            edge_tx,
+            telem_tx,
+            recorder: RwLock::new(RecorderState::default()),
+        })
+        .is_err()
+    {
+        return;
+    }
 
     thread::Builder::new()
         .name("mi-telemetry".into())
@@ -676,12 +1225,16 @@ pub fn start(
         .spawn(move || {
             worker_loop(
                 cmd_rx,
+                edge_rx,
+                Win32Injector,
                 on_listen,
                 on_record,
                 on_record_cancel,
                 on_emergency_pause,
                 on_send_error,
-            )
+                on_binding_state,
+            );
+            let _ = done_tx.send(());
         })
         .expect("worker thread");
 
@@ -691,233 +1244,204 @@ pub fn start(
         .expect("hook thread");
 }
 
-fn worker_loop(
-    rx: Receiver<InputCmd>,
-    on_listen: impl Fn(String),
-    on_record: impl Fn(Vec<String>),
-    on_record_cancel: impl Fn(),
-    on_emergency_pause: impl Fn(bool),
-    on_send_error: impl Fn(SendReport),
+#[allow(clippy::too_many_arguments)]
+fn worker_loop<I: InputInjector>(
+    ctrl_rx: Receiver<InputCmd>,
+    edge_rx: Receiver<InputCmd>,
+    injector: I,
+    on_listen: impl Fn(String) + Send + 'static,
+    on_record: impl Fn(Vec<String>) + Send + 'static,
+    on_record_cancel: impl Fn() + Send + 'static,
+    on_emergency_pause: impl Fn(bool) + Send + 'static,
+    on_send_error: impl Fn(SendReport) + Send + 'static,
+    on_binding_state: impl Fn(RuntimeBindingState) + Send + 'static,
 ) {
-    let mut state = InputState::default();
+    let mut state_machine = InputStateMachine::new(injector);
+    state_machine.set_callbacks(
+        Some(Box::new(on_binding_state)),
+        Some(Box::new(on_send_error)),
+    );
 
-    while let Ok(cmd) = rx.recv() {
-        let e = engine();
+    loop {
+        let now = Instant::now();
+        state_machine.tick(now);
+
+        let timeout = match state_machine.next_deadline() {
+            Some(due) => {
+                let now = Instant::now();
+                if due <= now {
+                    Duration::from_millis(1)
+                } else {
+                    due - now
+                }
+            }
+            None => Duration::MAX,
+        };
+
+        let mut sel = crossbeam_channel::Select::new();
+        let ctrl_idx = sel.recv(&ctrl_rx);
+        let edge_idx = sel.recv(&edge_rx);
+        let oper = if timeout == Duration::MAX {
+            sel.select()
+        } else {
+            match sel.select_timeout(timeout) {
+                Ok(oper) => oper,
+                Err(_) => continue,
+            }
+        };
+
+        let cmd = if oper.index() == ctrl_idx {
+            match oper.recv(&ctrl_rx) {
+                Ok(cmd) => cmd,
+                Err(_) => {
+                    state_machine.reset_all(ResetReason::Shutdown);
+                    break;
+                }
+            }
+        } else if oper.index() == edge_idx {
+            match oper.recv(&edge_rx) {
+                Ok(cmd) => cmd,
+                Err(_) => continue,
+            }
+        } else {
+            continue;
+        };
+
+        let now = Instant::now();
         match cmd {
-            InputCmd::Fire { button, down } => {
-                if e.paused.load(Ordering::Relaxed) {
-                    continue;
-                }
-                apply_input_state(&mut state, button, down, &on_send_error);
+            InputCmd::MouseEdge {
+                button,
+                down,
+                action,
+                generation,
+            } => {
+                state_machine.handle_mouse_edge(button, down, action, generation, now);
             }
-            InputCmd::ResetState => {
-                state.reset_all();
+            InputCmd::ResetState(reason) => {
+                state_machine.reset_all(reason);
+                if matches!(reason, ResetReason::Shutdown) {
+                    break;
+                }
             }
-            InputCmd::EmergencyPause => {
-                let current = e.paused.load(Ordering::SeqCst);
-                let next = !current;
-                e.paused.store(next, Ordering::SeqCst);
-                if next {
-                    state.reset_all();
+            InputCmd::EmergencyStop => {
+                let already = ENGINE
+                    .get()
+                    .map(|e| e.paused.swap(true, Ordering::SeqCst))
+                    .unwrap_or(false);
+                state_machine.emergency_stop();
+                if !already {
+                    if let Some(e) = ENGINE.get() {
+                        let cfg_clone = {
+                            let mut w = e.cfg.write();
+                            w.paused = true;
+                            w.clone()
+                        };
+                        thread::spawn(move || {
+                            let _ = save_config(&cfg_clone);
+                        });
+                    }
+                    on_emergency_pause(true);
                 }
-                {
-                    let mut w = e.cfg.write();
-                    w.paused = next;
-                    let cfg_clone = w.clone();
-                    drop(w);
-                    let _ = save_config(&cfg_clone);
-                }
-                on_emergency_pause(next);
+            }
+            InputCmd::SetPaused(paused) => {
+                state_machine.set_paused(paused);
+            }
+            InputCmd::UpdateMappings { generation } => {
+                state_machine.update_config(generation);
             }
             InputCmd::ListenCaptured(btn) => {
                 on_listen(btn);
             }
-            InputCmd::Record(keys) => on_record(keys),
-            InputCmd::RecordCancel => on_record_cancel(),
-        }
-    }
-}
-
-fn apply_input_state(
-    state: &mut InputState,
-    button: MouseButton,
-    down: bool,
-    on_send_error: &impl Fn(SendReport),
-) {
-    let e = engine();
-    let compiled_guard = e.compiled.load();
-    let Some(action) = compiled_guard.get(button) else {
-        if !down {
-            if let Some(binding) = state.active_bindings.remove(&button) {
-                if binding.mode == TriggerMode::Hold {
-                    release_active_specs(state, &binding.specs, on_send_error);
-                }
+            InputCmd::Record(keys) => {
+                on_record(keys);
+            }
+            InputCmd::RecordCancel => {
+                on_record_cancel();
             }
         }
-        return;
-    };
-
-    match action.mode {
-        TriggerMode::Hold => {
-            if down {
-                if state.active_bindings.contains_key(&button) {
-                    return;
-                }
-                let binding = ActiveBinding {
-                    specs: action.specs.clone(),
-                    mode: TriggerMode::Hold,
-                };
-                press_active_specs(state, &action.specs, on_send_error);
-                state.active_bindings.insert(button, binding);
-            } else if let Some(binding) = state.active_bindings.remove(&button) {
-                release_active_specs(state, &binding.specs, on_send_error);
-            }
-        }
-        TriggerMode::Toggle => {
-            if !down {
-                return;
-            }
-            let is_on = state.toggle_on.entry(button).or_insert(false);
-            if *is_on {
-                *is_on = false;
-                if let Some(binding) = state.active_bindings.remove(&button) {
-                    release_active_specs(state, &binding.specs, on_send_error);
-                }
-            } else {
-                *is_on = true;
-                let binding = ActiveBinding {
-                    specs: action.specs.clone(),
-                    mode: TriggerMode::Toggle,
-                };
-                press_active_specs(state, &action.specs, on_send_error);
-                state.active_bindings.insert(button, binding);
-            }
-        }
-        TriggerMode::Click => {
-            if down {
-                press_specs_once(&action.specs, on_send_error);
-            }
-        }
-    }
-}
-
-fn press_active_specs(
-    state: &mut InputState,
-    specs: &[KeySpec],
-    on_send_error: &impl Fn(SendReport),
-) {
-    let mut to_press: Vec<KeySpec> = Vec::new();
-    for s in specs {
-        let count = state.key_refs.entry(*s).or_insert(0);
-        *count += 1;
-        if *count == 1 {
-            to_press.push(*s);
-        }
-    }
-    if !to_press.is_empty() {
-        let inputs: Vec<INPUT> = to_press.iter().map(|s| make_input(s, true)).collect();
-        if let Err(report) = execute_send_inputs(&inputs) {
-            *engine().last_send_error.write() = Some(report.clone());
-            on_send_error(report);
-        }
-    }
-}
-
-fn release_active_specs(
-    state: &mut InputState,
-    specs: &[KeySpec],
-    on_send_error: &impl Fn(SendReport),
-) {
-    let mut to_release: Vec<KeySpec> = Vec::new();
-    let mut had_alt_or_win = false;
-
-    for s in specs.iter().rev() {
-        if let Some(count) = state.key_refs.get_mut(s) {
-            if *count > 0 {
-                *count -= 1;
-                if *count == 0 {
-                    to_release.push(*s);
-                    if is_alt_or_win(s.vk) {
-                        had_alt_or_win = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if !to_release.is_empty() {
-        let mut inputs: Vec<INPUT> = Vec::with_capacity(to_release.len() + 2);
-        if had_alt_or_win {
-            inputs.push(make_raw_input(VK_MASK_KEY, false, true));
-        }
-        for s in to_release.iter() {
-            inputs.push(make_input(s, false));
-        }
-        if had_alt_or_win {
-            inputs.push(make_raw_input(VK_MASK_KEY, false, false));
-        }
-        if let Err(report) = execute_send_inputs(&inputs) {
-            *engine().last_send_error.write() = Some(report.clone());
-            on_send_error(report);
-        }
-    }
-}
-
-fn press_specs_once(specs: &[KeySpec], on_send_error: &impl Fn(SendReport)) {
-    if specs.is_empty() {
-        return;
-    }
-
-    // 1. 发送所有按键的按下事件
-    let down_inputs: Vec<INPUT> = specs.iter().map(|s| make_input(s, true)).collect();
-    if let Err(report) = execute_send_inputs(&down_inputs) {
-        *engine().last_send_error.write() = Some(report.clone());
-        on_send_error(report);
-        return;
-    }
-
-    // 2. 关键：提供 30ms 的硬件级按键停留时间（Dwell Time）
-    // Windows 应用程序（如各类输入框、聊天软件、浏览器、游戏）的消息循环依赖 GetKeyState 校验
-    // 若 0 延迟同时发送按下与松开，应用程序在处理 KeyDown 时按键状态已处于释放，会被当作毛刺忽略丢弃
-    std::thread::sleep(std::time::Duration::from_millis(30));
-
-    // 3. 释放按键
-    let had_alt_or_win = specs.iter().any(|s| is_alt_or_win(s.vk));
-    let mut up_inputs: Vec<INPUT> = Vec::with_capacity(specs.len() + 2);
-    if had_alt_or_win {
-        up_inputs.push(make_raw_input(VK_MASK_KEY, false, true));
-    }
-    for s in specs.iter().rev() {
-        up_inputs.push(make_input(s, false));
-    }
-    if had_alt_or_win {
-        up_inputs.push(make_raw_input(VK_MASK_KEY, false, false));
-    }
-
-    if let Err(report) = execute_send_inputs(&up_inputs) {
-        *engine().last_send_error.write() = Some(report.clone());
-        on_send_error(report);
     }
 }
 
 fn hook_loop() {
     unsafe {
         HOOK_TID.store(GetCurrentThreadId(), Ordering::Relaxed);
-        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0)
-            .expect("SetWindowsHookEx WH_MOUSE_LL");
-        let kbd = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), None, 0)
-            .expect("SetWindowsHookEx WH_KEYBOARD_LL");
+        let mouse = match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) {
+            Ok(h) => h,
+            Err(err) => {
+                eprintln!("[MouseInsight] SetWindowsHookEx WH_MOUSE_LL failed: {err}");
+                return;
+            }
+        };
+
+        let _ = RegisterHotKey(
+            HWND(std::ptr::null_mut()),
+            HOTKEY_PAUSE,
+            MOD_NOREPEAT,
+            VK_PAUSE.0 as u32,
+        );
+        let _ = RegisterHotKey(
+            HWND(std::ptr::null_mut()),
+            HOTKEY_SCROLL,
+            MOD_NOREPEAT,
+            VK_SCROLL.0 as u32,
+        );
+
+        let mut kbd: Option<HHOOK> = None;
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).into() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        loop {
+            let status = GetMessageW(&mut msg, None, 0, 0);
+            if status.0 == 0 {
+                break;
+            }
+            if status.0 == -1 {
+                eprintln!("[MouseInsight] GetMessageW failed: {:?}", GetLastError());
+                break;
+            }
+
+            match msg.message {
+                WM_HOTKEY => {
+                    if let Some(e) = ENGINE.get() {
+                        let _ = e.cmd_tx.send(InputCmd::EmergencyStop);
+                    }
+                }
+                m if m == WM_MI_KBD_ON => {
+                    if kbd.is_none() {
+                        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), None, 0) {
+                            Ok(h) => kbd = Some(h),
+                            Err(err) => {
+                                eprintln!("[MouseInsight] SetWindowsHookEx WH_KEYBOARD_LL failed: {err}");
+                            }
+                        }
+                    }
+                }
+                m if m == WM_MI_KBD_OFF => {
+                    if let Some(h) = kbd.take() {
+                        let _ = UnhookWindowsHookEx(h);
+                    }
+                    physical_down_set().write().clear();
+                }
+                _ => {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+
+        if let Some(h) = kbd.take() {
+            let _ = UnhookWindowsHookEx(h);
         }
         let _ = UnhookWindowsHookEx(mouse);
-        let _ = UnhookWindowsHookEx(kbd);
+        let _ = UnregisterHotKey(HWND(std::ptr::null_mut()), HOTKEY_PAUSE);
+        let _ = UnregisterHotKey(HWND(std::ptr::null_mut()), HOTKEY_SCROLL);
         if let Some(eng) = ENGINE.get() {
-            let _ = eng.cmd_tx.try_send(InputCmd::ResetState);
+            let _ = eng.cmd_tx.send(InputCmd::ResetState(ResetReason::Shutdown));
         }
     }
+}
+
+fn is_injected_key(kb: &KBDLLHOOKSTRUCT) -> bool {
+    kb.flags.0 & (LLKHF_INJECTED_KBD | LLKHF_LOWER_IL_INJECTED_KBD) != 0
+        || kb.dwExtraInfo == EXTRA_INFO
 }
 
 unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -925,17 +1449,19 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    if kb.flags.0 & LLKHF_INJECTED_KBD != 0 {
+    if is_injected_key(kb) {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
     let msg = wparam.0 as u32;
     let down = kb.flags.0 & LLKHF_UP == 0 && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
 
-    if down && (kb.vkCode == VK_PAUSE.0 as u32 || kb.vkCode == VK_SCROLL.0 as u32) {
-        if let Some(e) = ENGINE.get() {
-            let _ = e.cmd_tx.try_send(InputCmd::EmergencyPause);
+    {
+        let mut held = physical_down_set().write();
+        if down {
+            held.insert(kb.vkCode);
+        } else {
+            held.remove(&kb.vkCode);
         }
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
     let Some(eng) = ENGINE.get() else {
@@ -947,17 +1473,28 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
 
     if down && kb.vkCode == VK_ESCAPE.0 as u32 {
         eng.recording.store(false, Ordering::Relaxed);
-        let _ = eng.cmd_tx.try_send(InputCmd::RecordCancel);
+        let _ = eng.cmd_tx.send(InputCmd::RecordCancel);
+        post_hook_message(WM_MI_KBD_OFF);
         return LRESULT(1);
     }
 
-    let is_key_event = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP;
+    let is_key_event =
+        msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP;
     if is_key_event {
+        if vk_to_token(kb.vkCode).is_none() && !down {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+        if vk_to_token(kb.vkCode).is_none() {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
         let chord = eng.recorder.write().on_key(kb.vkCode, down);
-        let _ = eng.cmd_tx.try_send(InputCmd::Record(chord));
+        if !chord.is_empty() {
+            let _ = eng.cmd_tx.send(InputCmd::Record(chord));
+        }
+        return LRESULT(1);
     }
 
-    LRESULT(1)
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 fn vk_to_token(vk: u32) -> Option<String> {
@@ -1001,6 +1538,21 @@ fn vk_to_token(vk: u32) -> Option<String> {
         other if (0x41..=0x5A).contains(&other) => ((other as u8) as char).to_string(),
         other if (0x30..=0x39).contains(&other) => ((other as u8) as char).to_string(),
         other if (0x70..=0x87).contains(&other) => format!("F{}", other - 0x6F),
+        0x60 => "Numpad0".into(),
+        0x61 => "Numpad1".into(),
+        0x62 => "Numpad2".into(),
+        0x63 => "Numpad3".into(),
+        0x64 => "Numpad4".into(),
+        0x65 => "Numpad5".into(),
+        0x66 => "Numpad6".into(),
+        0x67 => "Numpad7".into(),
+        0x68 => "Numpad8".into(),
+        0x69 => "Numpad9".into(),
+        0x6A => "NumpadMultiply".into(),
+        0x6B => "NumpadAdd".into(),
+        0x6D => "NumpadSubtract".into(),
+        0x6E => "NumpadDecimal".into(),
+        0x6F => "NumpadDivide".into(),
         _ => return None,
     })
 }
@@ -1014,7 +1566,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     };
 
     let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-    if ms.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 {
+    if ms.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0
+        || ms.dwExtraInfo == EXTRA_INFO
+    {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
@@ -1023,27 +1577,35 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     };
 
     if down && eng.listening.swap(false, Ordering::Relaxed) {
-        let _ = eng.cmd_tx.try_send(InputCmd::ListenCaptured(button.as_str().to_string()));
+        let _ = eng
+            .cmd_tx
+            .send(InputCmd::ListenCaptured(button.as_str().to_string()));
     }
 
     let paused = eng.paused.load(Ordering::Relaxed);
-    let compiled_guard = eng.compiled.load();
-    let action_opt = compiled_guard.get(button);
+    let compiled = eng.compiled.load_full();
+    let action_opt = compiled.get(button).cloned();
     let is_mapped = action_opt.is_some() && !paused;
     let swallow = is_mapped && !button.is_primary();
 
     if is_mapped {
-        let _ = eng.cmd_tx.try_send(InputCmd::Fire { button, down });
-        if button.is_wheel() {
-            let _ = eng.cmd_tx.try_send(InputCmd::Fire {
-                button,
-                down: false,
-            });
-        }
+        let _ = eng.edge_tx.try_send(InputCmd::MouseEdge {
+            button,
+            down,
+            action: action_opt,
+            generation: compiled.generation,
+        });
+    } else if !down && !button.is_primary() {
+        let _ = eng.edge_tx.try_send(InputCmd::MouseEdge {
+            button,
+            down: false,
+            action: None,
+            generation: compiled.generation,
+        });
     }
 
-    let need_telemetry = eng.window_visible.load(Ordering::Relaxed)
-        || eng.listening.load(Ordering::Relaxed);
+    let need_telemetry =
+        eng.window_visible.load(Ordering::Relaxed) || eng.listening.load(Ordering::Relaxed);
 
     if need_telemetry {
         let t = SystemTime::now()
@@ -1131,6 +1693,21 @@ fn key_spec(name: &str) -> Option<KeySpec> {
         "BracketRight" | "]" => (VK_OEM_6, false),
         "Quote" | "'" => (VK_OEM_7, false),
         "Semicolon" | ";" => (VK_OEM_1, false),
+        "Numpad0" => (VIRTUAL_KEY(0x60), false),
+        "Numpad1" => (VIRTUAL_KEY(0x61), false),
+        "Numpad2" => (VIRTUAL_KEY(0x62), false),
+        "Numpad3" => (VIRTUAL_KEY(0x63), false),
+        "Numpad4" => (VIRTUAL_KEY(0x64), false),
+        "Numpad5" => (VIRTUAL_KEY(0x65), false),
+        "Numpad6" => (VIRTUAL_KEY(0x66), false),
+        "Numpad7" => (VIRTUAL_KEY(0x67), false),
+        "Numpad8" => (VIRTUAL_KEY(0x68), false),
+        "Numpad9" => (VIRTUAL_KEY(0x69), false),
+        "NumpadMultiply" => (VIRTUAL_KEY(0x6A), false),
+        "NumpadAdd" => (VIRTUAL_KEY(0x6B), false),
+        "NumpadSubtract" => (VIRTUAL_KEY(0x6D), false),
+        "NumpadDecimal" => (VIRTUAL_KEY(0x6E), false),
+        "NumpadDivide" => (VIRTUAL_KEY(0x6F), true),
         other if other.len() == 1 => {
             let c = other.chars().next()?.to_ascii_uppercase() as u8;
             if c.is_ascii_alphanumeric() {
@@ -1177,7 +1754,7 @@ fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: EXTRA_INFO,
             },
         },
     }
@@ -1185,19 +1762,6 @@ fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
 
 fn make_input(spec: &KeySpec, down: bool) -> INPUT {
     make_raw_input(spec.vk, spec.extended, down)
-}
-
-fn send_key(spec: &KeySpec, down: bool) {
-    let input = make_input(spec, down);
-    let _ = execute_send_inputs(&[input]);
-}
-
-fn send_mask_key() {
-    let inputs = [
-        make_raw_input(VK_MASK_KEY, false, true),
-        make_raw_input(VK_MASK_KEY, false, false),
-    ];
-    let _ = execute_send_inputs(&inputs);
 }
 
 fn execute_send_inputs(inputs: &[INPUT]) -> Result<u32, SendReport> {
@@ -1229,6 +1793,15 @@ fn execute_send_inputs(inputs: &[INPUT]) -> Result<u32, SendReport> {
 mod tests {
     use super::*;
 
+    fn dummy_action(id: &str, mode: TriggerMode, key_names: &[&str]) -> Arc<CompiledAction> {
+        let specs: Vec<KeySpec> = key_names.iter().map(|k| key_spec(k).unwrap()).collect();
+        Arc::new(CompiledAction {
+            mapping_id: id.into(),
+            mode,
+            specs,
+        })
+    }
+
     #[test]
     fn test_normalize_key_chord() {
         let keys = vec![
@@ -1243,27 +1816,991 @@ mod tests {
 
     #[test]
     fn test_mouse_button_conversion() {
-        assert_eq!(MouseButton::from_str_fast("xbutton1"), Some(MouseButton::XButton1));
-        assert_eq!(MouseButton::from_str_fast("xbutton2"), Some(MouseButton::XButton2));
-        assert_eq!(MouseButton::from_str_fast("middle"), Some(MouseButton::Middle));
+        assert_eq!(
+            MouseButton::from_str_fast("xbutton1"),
+            Some(MouseButton::XButton1)
+        );
+        assert_eq!(
+            MouseButton::from_str_fast("xbutton2"),
+            Some(MouseButton::XButton2)
+        );
+        assert_eq!(
+            MouseButton::from_str_fast("middle"),
+            Some(MouseButton::Middle)
+        );
         assert_eq!(MouseButton::XButton1.as_str(), "xbutton1");
     }
 
     #[test]
     fn test_compile_mappings_precompilation() {
-        let mappings = vec![
-            Mapping {
-                id: "1".into(),
-                button: "xbutton1".into(),
-                mode: "hold".into(),
-                keys: vec!["LControl".into(), "LAlt".into()],
-                label: "".into(),
-            },
-        ];
+        let mappings = vec![Mapping {
+            id: "1".into(),
+            button: "xbutton1".into(),
+            mode: "hold".into(),
+            keys: vec!["LControl".into(), "LAlt".into()],
+            label: "".into(),
+        }];
         let compiled = compile_mappings(&mappings);
         let action = compiled.get(MouseButton::XButton1).expect("compiled slot");
         assert_eq!(action.mode, TriggerMode::Hold);
         assert_eq!(action.specs.len(), 2);
     }
-}
 
+    // ==========================================
+    // Hold 模式测试
+    // ==========================================
+
+    #[test]
+    fn hold_down_press_once() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now);
+
+        let evs = injector.events();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].action, KeyAction::Down);
+        assert_eq!(evs[0].spec.vk, VK_LCONTROL);
+        assert_eq!(*sm.key_refs.get(&evs[0].spec).unwrap(), 1);
+    }
+
+    #[test]
+    fn hold_duplicate_down_does_not_double_press() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act.clone()), 1, now);
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now);
+
+        let evs = injector.events();
+        assert_eq!(
+            evs.len(),
+            1,
+            "Duplicate down must not trigger another KeyDown"
+        );
+        assert_eq!(*sm.key_refs.get(&evs[0].spec).unwrap(), 1);
+    }
+
+    #[test]
+    fn hold_up_releases_snapshot() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now);
+        sm.handle_mouse_edge(MouseButton::XButton1, false, None, 1, now);
+
+        let evs = injector.events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].action, KeyAction::Down);
+        assert_eq!(evs[1].action, KeyAction::Up);
+        assert_eq!(evs[1].spec.vk, VK_LCONTROL);
+        assert_eq!(*sm.key_refs.get(&evs[0].spec).unwrap_or(&0), 0);
+    }
+
+    #[test]
+    fn hold_up_after_mapping_changed_releases_old_snapshot() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let old_act = dummy_action("m1", TriggerMode::Hold, &["LControl"]);
+        let new_act = dummy_action("m1", TriggerMode::Click, &["Enter"]);
+        let now = Instant::now();
+
+        // 1. 按下旧配置 (Hold Ctrl)
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(old_act), 1, now);
+
+        // 2. 配置发生变更，但由于按键依然物理按住，松开时传入新的 action 或 None
+        sm.handle_mouse_edge(MouseButton::XButton1, false, Some(new_act), 2, now);
+
+        // 验证：释放的仍然是旧配置的 Ctrl Up，而不是 Enter
+        let evs = injector.events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].action, KeyAction::Down);
+        assert_eq!(evs[0].spec.vk, VK_LCONTROL);
+        assert_eq!(evs[1].action, KeyAction::Up);
+        assert_eq!(evs[1].spec.vk, VK_LCONTROL);
+    }
+
+    #[test]
+    fn hold_reset_releases_every_owned_key() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl", "LAlt"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now);
+        sm.reset_all(ResetReason::UserPause);
+
+        let evs = injector.events();
+        let non_mask_ups: Vec<_> = evs
+            .iter()
+            .filter(|e| !e.is_mask && e.action == KeyAction::Up)
+            .collect();
+        assert_eq!(non_mask_ups.len(), 2);
+        assert!(sm.key_refs.is_empty() || sm.key_refs.values().all(|&v| v == 0));
+    }
+
+    // ==========================================
+    // Click 模式测试
+    // ==========================================
+
+    #[test]
+    fn click_down_emits_one_tap() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let act = dummy_action("m2", TriggerMode::Click, &["Enter"]);
+        let t0 = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, t0);
+        assert_eq!(
+            injector.events().len(),
+            1,
+            "Click down only emits KeyDown immediately"
+        );
+        assert_eq!(injector.events()[0].action, KeyAction::Down);
+
+        // 未到达 deadline 前 tick
+        sm.tick(t0 + Duration::from_millis(15));
+        assert_eq!(injector.events().len(), 1);
+
+        // 到达 deadline 后 tick
+        sm.tick(t0 + dwell);
+        let evs = injector.events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].action, KeyAction::Up);
+        assert_eq!(evs[1].spec.vk, VK_RETURN);
+    }
+
+    #[test]
+    fn click_mouse_up_does_nothing() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let act = dummy_action("m2", TriggerMode::Click, &["Enter"]);
+        let t0 = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act.clone()), 1, t0);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            false,
+            Some(act),
+            1,
+            t0 + Duration::from_millis(5),
+        );
+
+        // 鼠标松开不应提前触发任何事件
+        assert_eq!(injector.events().len(), 1);
+        assert_eq!(injector.events()[0].action, KeyAction::Down);
+    }
+
+    #[test]
+    fn click_dwell_does_not_block_other_hold_event() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let click_act = dummy_action("m2", TriggerMode::Click, &["Enter"]);
+        let hold_act = dummy_action("m1", TriggerMode::Hold, &["LAlt"]);
+        let t0 = Instant::now();
+
+        // 1. Click 启动
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(click_act), 1, t0);
+
+        // 2. 5ms 后收到另一个键的 Hold
+        sm.handle_mouse_edge(
+            MouseButton::XButton2,
+            true,
+            Some(hold_act),
+            1,
+            t0 + Duration::from_millis(5),
+        );
+
+        // 验证：Hold 的 LAlt 立即被发出，完全没有被 Click 的 dwell 阻塞！
+        let evs = injector.events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].spec.vk, VK_RETURN);
+        assert_eq!(evs[1].spec.vk, VK_LMENU);
+        assert_eq!(evs[1].action, KeyAction::Down);
+    }
+
+    #[test]
+    fn two_fast_clicks_produce_two_taps() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let act = dummy_action("m2", TriggerMode::Click, &["Enter"]);
+        let t0 = Instant::now();
+
+        // 快速连续两次 click down (间隔 10ms)
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act.clone()), 1, t0);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(act),
+            1,
+            t0 + Duration::from_millis(10),
+        );
+
+        // 此时仅发出第一次 Down
+        assert_eq!(injector.events().len(), 1);
+
+        // 第 1 次 tap 到期 (t0 + 30ms)
+        sm.tick(t0 + dwell);
+        let evs = injector.events();
+        assert_eq!(evs.len(), 3, "Should have [Down1, Up1, Down2]");
+        assert_eq!(evs[0].action, KeyAction::Down);
+        assert_eq!(evs[1].action, KeyAction::Up);
+        assert_eq!(evs[2].action, KeyAction::Down);
+
+        // 第 2 次 tap 到期 (t0 + 60ms)
+        sm.tick(t0 + dwell * 2);
+        let evs = injector.events();
+        assert_eq!(evs.len(), 4, "Should have [Down1, Up1, Down2, Up2]");
+        assert_eq!(evs[3].action, KeyAction::Up);
+    }
+
+    #[test]
+    fn click_shared_modifier_does_not_release_hold_modifier() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let hold_act = dummy_action("m1", TriggerMode::Hold, &["LControl", "LAlt"]);
+        let click_act = dummy_action("m2", TriggerMode::Click, &["LControl", "Enter"]);
+        let t0 = Instant::now();
+
+        // 1. Hold Ctrl+Alt
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, t0);
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(*sm.key_refs.get(&key_spec("LAlt").unwrap()).unwrap(), 1);
+
+        // 2. Click Ctrl+Enter
+        sm.handle_mouse_edge(
+            MouseButton::XButton2,
+            true,
+            Some(click_act),
+            1,
+            t0 + Duration::from_millis(5),
+        );
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 2);
+        assert_eq!(*sm.key_refs.get(&key_spec("Enter").unwrap()).unwrap(), 1);
+
+        // 3. Click 到期释放
+        sm.tick(t0 + Duration::from_millis(35));
+
+        // 验证：Enter 释放了，但是 LControl 的 refs 依然是 1，绝不能发出 LControl Up！
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+        let ctrl_ups: Vec<_> = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.spec.vk == VK_LCONTROL && e.action == KeyAction::Up)
+            .collect();
+        assert!(
+            ctrl_ups.is_empty(),
+            "Hold's LControl must NOT be released by Click!"
+        );
+
+        // 4. Hold 松开
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            false,
+            Some(hold_act),
+            1,
+            t0 + Duration::from_millis(50),
+        );
+        assert_eq!(
+            *sm.key_refs
+                .get(&key_spec("LControl").unwrap())
+                .unwrap_or(&0),
+            0
+        );
+        let final_ctrl_ups: Vec<_> = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.spec.vk == VK_LCONTROL && e.action == KeyAction::Up)
+            .collect();
+        assert_eq!(
+            final_ctrl_ups.len(),
+            1,
+            "LControl released only when Hold is released"
+        );
+    }
+
+    #[test]
+    fn click_shared_modifier_does_not_release_toggle_modifier() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let toggle_act = dummy_action("m1", TriggerMode::Toggle, &["LControl"]);
+        let click_act = dummy_action("m2", TriggerMode::Click, &["LControl", "Enter"]);
+        let t0 = Instant::now();
+
+        // 1. Toggle Ctrl 开启
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act), 1, t0);
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+
+        // 2. Click Ctrl+Enter
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(click_act),
+            1,
+            t0 + Duration::from_millis(5),
+        );
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 2);
+
+        // 3. Click 到期释放
+        sm.tick(t0 + Duration::from_millis(35));
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+        let ctrl_ups: Vec<_> = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.spec.vk == VK_LCONTROL && e.action == KeyAction::Up)
+            .collect();
+        assert!(
+            ctrl_ups.is_empty(),
+            "Toggle's LControl must NOT be released by Click!"
+        );
+    }
+
+    // ==========================================
+    // Toggle 模式测试
+    // ==========================================
+
+    #[test]
+    fn toggle_first_down_acquires() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Toggle, &["LShift"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, now);
+
+        let evs = injector.events();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].action, KeyAction::Down);
+        assert_eq!(evs[0].spec.vk, VK_LSHIFT);
+        assert_eq!(*sm.key_refs.get(&evs[0].spec).unwrap(), 1);
+    }
+
+    #[test]
+    fn toggle_up_does_nothing() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Toggle, &["LShift"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act.clone()), 1, now);
+        sm.handle_mouse_edge(MouseButton::Middle, false, Some(act), 1, now);
+
+        let evs = injector.events();
+        assert_eq!(evs.len(), 1, "Toggle Up does not release key");
+        assert_eq!(*sm.key_refs.get(&evs[0].spec).unwrap(), 1);
+    }
+
+    #[test]
+    fn toggle_second_down_releases() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Toggle, &["LShift"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act.clone()), 1, now);
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, now);
+
+        let evs = injector.events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].action, KeyAction::Down);
+        assert_eq!(evs[1].action, KeyAction::Up);
+        assert_eq!(*sm.key_refs.get(&evs[0].spec).unwrap_or(&0), 0);
+    }
+
+    #[test]
+    fn toggle_reset_releases() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Toggle, &["LShift"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, now);
+        sm.reset_all(ResetReason::UserPause);
+
+        let evs = injector.events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].action, KeyAction::Up);
+        assert!(sm.active_toggles.is_empty());
+    }
+
+    #[test]
+    fn toggle_config_change_releases() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Toggle, &["LShift"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, now);
+        sm.update_config(2);
+
+        let evs = injector.events();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].action, KeyAction::Up);
+        assert!(sm.active_toggles.is_empty());
+    }
+
+    #[test]
+    fn toggle_runtime_status_on_off_is_emitted() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector);
+        let states = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let st_clone = states.clone();
+        sm.set_callbacks(
+            Some(Box::new(move |s| {
+                st_clone.lock().push(s);
+            })),
+            None,
+        );
+
+        let act = dummy_action("m_toggle", TriggerMode::Toggle, &["LShift"]);
+        let now = Instant::now();
+
+        // 第一次 Down -> active: true
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act.clone()), 1, now);
+        // 第二次 Down -> active: false
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, now);
+
+        let list = states.lock().clone();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].mapping_id, "m_toggle");
+        assert!(list[0].active);
+        assert_eq!(list[1].mapping_id, "m_toggle");
+        assert!(!list[1].active);
+    }
+
+    // ==========================================
+    // Queue & Safety 测试
+    // ==========================================
+
+    #[test]
+    fn state_commands_never_drop_when_more_than_64_events() {
+        let (tx, rx) = crossbeam_channel::unbounded::<InputCmd>();
+        for i in 0..100 {
+            tx.send(InputCmd::MouseEdge {
+                button: MouseButton::XButton1,
+                down: true,
+                action: None,
+                generation: i,
+            })
+            .expect("Unbounded channel must never drop or fail on send");
+        }
+        assert_eq!(rx.len(), 100);
+    }
+
+    #[test]
+    fn emergency_always_pauses() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector);
+        sm.emergency_stop();
+        assert!(sm.is_paused());
+    }
+
+    #[test]
+    fn emergency_always_resets_even_when_already_paused() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl"]);
+        let now = Instant::now();
+
+        // 处于某种原因已被 paused 且仍有残留
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now);
+        sm.set_paused_raw(true);
+        injector.clear();
+
+        // 再次触发 EmergencyStop，必须无条件执行 reset 且保持 paused
+        sm.emergency_stop();
+        assert!(sm.is_paused());
+        let evs = injector.events();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].action, KeyAction::Up);
+        assert_eq!(evs[0].spec.vk, VK_LCONTROL);
+    }
+
+    #[test]
+    fn pause_resets_pending_click() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let act = dummy_action("m1", TriggerMode::Click, &["Enter"]);
+        let t0 = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act.clone()), 1, t0);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(act),
+            1,
+            t0 + Duration::from_millis(5),
+        );
+
+        // 暂停
+        sm.set_paused(true);
+
+        // 验证正在进行的 tap 立即释放，队列中的 tap 被清空
+        let ups: Vec<_> = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.action == KeyAction::Up)
+            .collect();
+        assert_eq!(ups.len(), 1);
+        assert!(sm.tap_queue.is_empty());
+        assert!(sm.tap_in_flight.is_empty());
+    }
+
+    #[test]
+    fn shutdown_resets_pending_click() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let act = dummy_action("m1", TriggerMode::Click, &["Enter"]);
+        let t0 = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, t0);
+        sm.reset_all(ResetReason::Shutdown);
+
+        let ups: Vec<_> = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.action == KeyAction::Up)
+            .collect();
+        assert_eq!(ups.len(), 1);
+        assert!(sm.tap_in_flight.is_empty());
+    }
+
+    #[test]
+    fn stale_generation_down_is_ignored_after_config_change() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl"]);
+        let now = Instant::now();
+
+        sm.update_config(2);
+        // 发送携带旧 generation=1 的 down
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now);
+
+        assert!(
+            injector.events().is_empty(),
+            "Stale down event must be ignored"
+        );
+    }
+
+    // ==========================================
+    // Capability 规则测试
+    // ==========================================
+
+    #[test]
+    fn compile_skips_left_right_mapping() {
+        let mappings = vec![
+            Mapping {
+                id: "1".into(),
+                button: "left".into(),
+                mode: "hold".into(),
+                keys: vec!["LControl".into()],
+                label: "".into(),
+            },
+            Mapping {
+                id: "2".into(),
+                button: "right".into(),
+                mode: "click".into(),
+                keys: vec!["Enter".into()],
+                label: "".into(),
+            },
+            Mapping {
+                id: "3".into(),
+                button: "middle".into(),
+                mode: "hold".into(),
+                keys: vec!["Space".into()],
+                label: "".into(),
+            },
+        ];
+
+        let compiled = compile_mappings(&mappings);
+        assert!(compiled.get(MouseButton::Left).is_none());
+        assert!(compiled.get(MouseButton::Right).is_none());
+        assert!(compiled.get(MouseButton::Middle).is_some());
+    }
+
+    #[test]
+    fn wheel_accepts_click_only() {
+        let mappings = vec![
+            Mapping {
+                id: "1".into(),
+                button: "wheelup".into(),
+                mode: "hold".into(),
+                keys: vec!["ArrowUp".into()],
+                label: "".into(),
+            },
+            Mapping {
+                id: "2".into(),
+                button: "wheeldown".into(),
+                mode: "toggle".into(),
+                keys: vec!["ArrowDown".into()],
+                label: "".into(),
+            },
+            Mapping {
+                id: "3".into(),
+                button: "wheelup".into(),
+                mode: "click".into(),
+                keys: vec!["PageUp".into()],
+                label: "".into(),
+            },
+        ];
+
+        let compiled = compile_mappings(&mappings);
+        let wheel_down = compiled
+            .get(MouseButton::WheelDown)
+            .expect("wheeldown toggle is coerced to click");
+        assert_eq!(wheel_down.mode, TriggerMode::Click);
+        let wheel_up = compiled
+            .get(MouseButton::WheelUp)
+            .expect("wheelup hold is coerced to click");
+        assert_eq!(wheel_up.mode, TriggerMode::Click);
+    }
+
+    // ==========================================
+    // 重叠与并发测试 (Overlap regression cases)
+    // ==========================================
+
+    #[test]
+    fn test_overlap_hold_ctrl_alt_and_click_ctrl_enter() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(30);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+
+        let hold_act = dummy_action("h", TriggerMode::Hold, &["LControl", "LAlt"]);
+        let click_act = dummy_action("c", TriggerMode::Click, &["LControl", "Enter"]);
+        let t0 = Instant::now();
+
+        // 1. Hold Ctrl+Alt down
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, t0);
+        // 2. Click Ctrl+Enter down
+        sm.handle_mouse_edge(
+            MouseButton::XButton2,
+            true,
+            Some(click_act),
+            1,
+            t0 + Duration::from_millis(5),
+        );
+
+        // 3. Click 到期
+        sm.tick(t0 + Duration::from_millis(35));
+
+        // 此时 Ctrl 必须保持 held，Enter 释放
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(*sm.key_refs.get(&key_spec("LAlt").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&key_spec("Enter").unwrap()).unwrap_or(&0),
+            0
+        );
+
+        // 4. Hold Ctrl+Alt up
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            false,
+            Some(hold_act),
+            1,
+            t0 + Duration::from_millis(50),
+        );
+        assert_eq!(
+            *sm.key_refs
+                .get(&key_spec("LControl").unwrap())
+                .unwrap_or(&0),
+            0
+        );
+        assert_eq!(
+            *sm.key_refs.get(&key_spec("LAlt").unwrap()).unwrap_or(&0),
+            0
+        );
+    }
+
+    #[test]
+    fn test_overlap_hold_ctrl_alt_and_toggle_ctrl_shift() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+
+        let hold_act = dummy_action("h", TriggerMode::Hold, &["LControl", "LAlt"]);
+        let toggle_act = dummy_action("t", TriggerMode::Toggle, &["LControl", "LShift"]);
+        let now = Instant::now();
+
+        // 1. Hold Ctrl+Alt
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now);
+        // 2. Toggle Ctrl+Shift (ON)
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act.clone()), 1, now);
+
+        // 3. Hold release
+        sm.handle_mouse_edge(MouseButton::XButton1, false, Some(hold_act), 1, now);
+
+        // 验证：Ctrl 和 Shift 仍由 Toggle 保持！Alt 释放！
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(*sm.key_refs.get(&key_spec("LShift").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&key_spec("LAlt").unwrap()).unwrap_or(&0),
+            0
+        );
+
+        // 4. Toggle second down (OFF)
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act), 1, now);
+        assert_eq!(
+            *sm.key_refs
+                .get(&key_spec("LControl").unwrap())
+                .unwrap_or(&0),
+            0
+        );
+        assert_eq!(
+            *sm.key_refs.get(&key_spec("LShift").unwrap()).unwrap_or(&0),
+            0
+        );
+    }
+
+    #[test]
+    fn test_overlap_toggle_shift_and_hold_shift() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+
+        let toggle_act = dummy_action("t", TriggerMode::Toggle, &["LShift"]);
+        let hold_act = dummy_action("h", TriggerMode::Hold, &["LShift"]);
+        let now = Instant::now();
+
+        // 1. Toggle Shift ON
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act.clone()), 1, now);
+        // 2. Hold Shift down
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now);
+        // 3. Hold Shift up
+        sm.handle_mouse_edge(MouseButton::XButton1, false, Some(hold_act), 1, now);
+
+        // Shift 仍应被 Toggle 保持
+        assert_eq!(*sm.key_refs.get(&key_spec("LShift").unwrap()).unwrap(), 1);
+
+        // 4. Toggle Shift OFF
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act), 1, now);
+        assert_eq!(
+            *sm.key_refs.get(&key_spec("LShift").unwrap()).unwrap_or(&0),
+            0
+        );
+    }
+
+    #[test]
+    fn test_overlap_hold_ctrl_and_emergency() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let hold_act = dummy_action("h", TriggerMode::Hold, &["LControl"]);
+        let now = Instant::now();
+
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act), 1, now);
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+
+        sm.emergency_stop();
+        assert!(sm.is_paused());
+        assert_eq!(
+            *sm.key_refs
+                .get(&key_spec("LControl").unwrap())
+                .unwrap_or(&0),
+            0
+        );
+    }
+
+    #[test]
+    fn test_overlap_tap_enter_burst_while_hold_ctrl_remains_active() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(10);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+
+        let hold_act = dummy_action("h", TriggerMode::Hold, &["LControl"]);
+        let click_act = dummy_action("c", TriggerMode::Click, &["Enter"]);
+        let mut now = Instant::now();
+
+        // 1. Hold Ctrl
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now);
+
+        // 2. 连续 5 次快速 Click Enter
+        for _ in 0..5 {
+            sm.handle_mouse_edge(MouseButton::XButton2, true, Some(click_act.clone()), 1, now);
+            now += Duration::from_millis(1);
+        }
+
+        // 依次推进时间让 5 次 tap 全部排队完成
+        for _ in 0..6 {
+            now += dwell;
+            sm.tick(now);
+        }
+
+        // 检查整个过程中 Ctrl 始终在 held
+        assert_eq!(*sm.key_refs.get(&key_spec("LControl").unwrap()).unwrap(), 1);
+
+        // 验证正好产生了 5 次独立的 Enter Down 和 5 次独立的 Enter Up
+        let enter_downs = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.spec.vk == VK_RETURN && e.action == KeyAction::Down)
+            .count();
+        let enter_ups = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.spec.vk == VK_RETURN && e.action == KeyAction::Up)
+            .count();
+        assert_eq!(enter_downs, 5);
+        assert_eq!(enter_ups, 5);
+
+        // 3. 最终释放 Hold Ctrl
+        sm.handle_mouse_edge(MouseButton::XButton1, false, Some(hold_act), 1, now);
+        assert_eq!(
+            *sm.key_refs
+                .get(&key_spec("LControl").unwrap())
+                .unwrap_or(&0),
+            0
+        );
+    }
+
+    #[test]
+    fn test_wheel_200_detents_stress() {
+        let injector = FakeInjector::new();
+        let dwell = Duration::from_millis(2);
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(dwell);
+        let wheel_act = dummy_action("w", TriggerMode::Click, &["ArrowUp"]);
+        let hold_act = dummy_action("h", TriggerMode::Hold, &["LAlt"]);
+        let mut now = Instant::now();
+
+        for i in 0..250 {
+            sm.handle_mouse_edge(MouseButton::WheelUp, true, Some(wheel_act.clone()), 1, now);
+            if i == 100 {
+                sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now);
+                assert_eq!(*sm.key_refs.get(&key_spec("LAlt").unwrap()).unwrap(), 1);
+            }
+            if i == 150 {
+                sm.handle_mouse_edge(MouseButton::XButton1, false, Some(hold_act.clone()), 1, now);
+            }
+        }
+
+        let queued = sm
+            .tap_queue
+            .get(&MouseButton::WheelUp)
+            .map(|q| q.len())
+            .unwrap_or(0);
+        assert!(queued <= TAP_QUEUE_CAP);
+        assert!(sm.tap_in_flight.contains_key(&MouseButton::WheelUp));
+
+        while sm.tap_in_flight.contains_key(&MouseButton::WheelUp)
+            || sm
+                .tap_queue
+                .get(&MouseButton::WheelUp)
+                .is_some_and(|q| !q.is_empty())
+        {
+            now += dwell;
+            sm.tick(now);
+        }
+
+        let arrow_downs = injector
+            .events()
+            .iter()
+            .filter(|e| e.spec.vk == VK_UP && e.action == KeyAction::Down)
+            .count();
+        let arrow_ups = injector
+            .events()
+            .iter()
+            .filter(|e| e.spec.vk == VK_UP && e.action == KeyAction::Up)
+            .count();
+
+        assert!(arrow_downs <= TAP_QUEUE_CAP + 1);
+        assert_eq!(arrow_downs, arrow_ups);
+        assert!(sm.key_refs.is_empty() || sm.key_refs.values().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_release_preserves_physically_held_key() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl"]);
+        let now = Instant::now();
+
+        // 模拟物理键盘真实按住了 Ctrl
+        injector.set_physical_down(VK_LCONTROL, true);
+
+        // MouseInsight 触发 Hold Ctrl
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act.clone()), 1, now);
+
+        // 释放 Hold Ctrl
+        sm.handle_mouse_edge(MouseButton::XButton1, false, Some(act), 1, now);
+
+        // 验证：因为物理 Ctrl 仍被真实按住，绝不发送 synthetic KeyUp 打掉用户物理按键！
+        let ctrl_ups = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.spec.vk == VK_LCONTROL && e.action == KeyAction::Up)
+            .count();
+        assert_eq!(
+            ctrl_ups, 0,
+            "Synthetic KeyUp must be suppressed when key is physically held down"
+        );
+    }
+
+    #[test]
+    fn hold_ctrl_alt_is_one_batch() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl", "LAlt"]);
+        let now = Instant::now();
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now);
+        let batches = injector.batches.lock().clone();
+        assert_eq!(batches, vec![2], "chord must be one SendInput batch");
+        assert_eq!(injector.events().len(), 2);
+    }
+
+    #[test]
+    fn release_sends_up_even_if_injected_keys_look_down() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone());
+        let act = dummy_action("m1", TriggerMode::Hold, &["LControl", "LAlt"]);
+        let now = Instant::now();
+        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act.clone()), 1, now);
+        sm.handle_mouse_edge(MouseButton::XButton1, false, None, 1, now);
+        let ups = injector
+            .events()
+            .into_iter()
+            .filter(|e| e.action == KeyAction::Up && !e.is_mask)
+            .count();
+        assert_eq!(ups, 2);
+    }
+
+    #[test]
+    fn tap_queue_is_capped() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone()).with_dwell(Duration::from_millis(30));
+        let act = dummy_action("m2", TriggerMode::Click, &["Enter"]);
+        let now = Instant::now();
+        for _ in 0..40 {
+            sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act.clone()), 1, now);
+        }
+        let queued = sm
+            .tap_queue
+            .get(&MouseButton::XButton1)
+            .map(|q| q.len())
+            .unwrap_or(0);
+        assert!(queued <= TAP_QUEUE_CAP);
+        assert!(sm.tap_in_flight.contains_key(&MouseButton::XButton1));
+    }
+
+    #[test]
+    fn replace_file_overwrites_existing() {
+        let dir = std::env::temp_dir().join(format!("mi-cfg-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let from = dir.join("src.tmp");
+        let to = dir.join("dst.json");
+        fs::write(&to, b"old").unwrap();
+        fs::write(&from, b"new").unwrap();
+        replace_file_atomic(&from, &to).expect("replace");
+        assert_eq!(fs::read_to_string(&to).unwrap(), "new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
