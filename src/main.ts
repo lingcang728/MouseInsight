@@ -53,6 +53,7 @@ type RuntimeState = {
 
 let mappings: Mapping[] = [];
 let selectedMappingId: string | null = null;
+const collapsedMappings = new Set<string>();
 let currentDraft: DraftMapping | null = null;
 let recordBuf: string[] = [];
 let isPaused = false;
@@ -122,7 +123,7 @@ function renderKeys(
 
 function applyTheme(theme: string) {
   document.documentElement.dataset.theme = theme;
-  $("btn-theme").textContent = theme === "dark" ? "换成浅色" : "换成深色";
+  $("btn-theme").textContent = theme === "dark" ? "浅色外观" : "深色外观";
 }
 
 function setPausedUi(paused: boolean) {
@@ -262,10 +263,14 @@ function makeComboRow(
 }
 
 function renderMaps(liveButton?: string) {
+  resetDeck();
   const host = $("maps");
   $("mapping-count").textContent = `${mappings.length} / 5 已配置`;
   document.querySelectorAll<HTMLButtonElement>("[data-add-button]").forEach((button) => {
-    button.disabled = mappings.some((m) => m.button === button.dataset.addButton);
+    const existing = mappings.find((m) => m.button === button.dataset.addButton);
+    button.textContent = `${existing ? "" : "＋ "}${BUTTON_LABEL[button.dataset.addButton!]}`;
+    button.classList.toggle("active", existing?.id === selectedMappingId);
+    button.setAttribute("aria-pressed", String(existing?.id === selectedMappingId));
   });
   if (!mappings.length) {
     host.replaceChildren();
@@ -284,7 +289,7 @@ function renderMaps(liveButton?: string) {
   }
 
   host.replaceChildren();
-  mappings.forEach((m) => {
+  [...mappings].sort((a, b) => Number(b.id === selectedMappingId) - Number(a.id === selectedMappingId)).forEach((m) => {
     const article = document.createElement("article");
     const isLive = m.button === liveButton;
     const isSelected = m.id === selectedMappingId;
@@ -336,7 +341,17 @@ function renderMaps(liveButton?: string) {
     btnDel.setAttribute("aria-label", "删除");
     btnDel.textContent = "删除";
 
-    row.append(selButton, selMode, pill, btnDel);
+    const collapse = document.createElement("button");
+    collapse.className = "ghost collapse-toggle";
+    collapse.dataset.act = "collapse";
+    collapse.textContent = collapsedMappings.has(m.id) ? "展开" : "折叠";
+    collapse.setAttribute("aria-expanded", String(!collapsedMappings.has(m.id)));
+    article.classList.toggle("collapsed", collapsedMappings.has(m.id));
+    const grip = document.createElement("div");
+    grip.className = "card-grip";
+    grip.textContent = BUTTON_LABEL[m.button] + " · 拖动切换";
+    article.append(grip);
+    row.append(selButton, selMode, pill, collapse, btnDel);
     article.append(row);
 
     const isWheel = m.button === "wheelup" || m.button === "wheeldown";
@@ -386,6 +401,13 @@ function selectMapping(id: string) {
   selectedMappingId = id;
   document.querySelectorAll<HTMLElement>(".map").forEach((el) => {
     el.classList.toggle("selected", el.dataset.id === id);
+  });
+  const selected = document.querySelector<HTMLElement>(`.map[data-id="${CSS.escape(id)}"]`);
+  if (selected) $("maps").prepend(selected);
+  document.querySelectorAll<HTMLElement>("[data-add-button]").forEach(button => {
+    const active = mappings.find(m => m.id === id)?.button === button.dataset.addButton;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
   });
   renderDock();
 }
@@ -555,6 +577,14 @@ async function checkHook(attempt = 0): Promise<void> {
 }
 
 async function boot() {
+  await listen("mappings-changed", async () => {
+    await saveQueue;
+    const latest = await invoke<Snapshot>("get_snapshot");
+    mappings = sanitizeMappings(latest.config.mappings);
+    confirmedMappings = structuredClone(mappings);
+    renderMaps();
+    $("save-status").textContent = "已保存 · 即时生效";
+  });
   const snap = await invoke<Snapshot>("get_snapshot");
   const rawMappings = snap.config.mappings ?? [];
   mappings = sanitizeMappings(rawMappings);
@@ -773,7 +803,13 @@ $("btn-listen").addEventListener("click", async () => {
 
 $("quick-add").addEventListener("click", async (event) => {
   const button = (event.target as HTMLElement).closest<HTMLElement>("[data-add-button]")?.dataset.addButton;
-  if (!button || currentDraft || mappings.some((m) => m.button === button)) return;
+  if (!button || currentDraft) return;
+  const existing = mappings.find(m => m.button === button);
+  if (existing) {
+    selectedMappingId = existing.id;
+    renderMaps();
+    return;
+  }
   await stopListening();
   await openRecordForNew(button);
 });
@@ -803,6 +839,7 @@ $("maps").addEventListener("change", async (e) => {
   const m = mappings.find((x) => x.id === row.dataset.id);
   if (!m) return;
   const sel = t as HTMLSelectElement;
+  if (!sel.matches("select[data-k]")) return;
 
   if (sel.dataset.k === "button") {
     const nextBtn = sel.value;
@@ -849,6 +886,13 @@ $("maps").addEventListener("click", async (e) => {
   if (!row) return;
   const id = row.dataset.id!;
 
+  if (t.dataset.act === "collapse") {
+    if (collapsedMappings.has(id)) collapsedMappings.delete(id); else collapsedMappings.add(id);
+    row.classList.toggle("collapsed", collapsedMappings.has(id));
+    t.textContent = collapsedMappings.has(id) ? "展开" : "折叠";
+    t.setAttribute("aria-expanded", String(!collapsedMappings.has(id)));
+    return;
+  }
   if (t.dataset.act === "del") {
     const target = mappings.find((m) => m.id === id);
     if (target) {
@@ -1022,3 +1066,152 @@ boot()
   .catch((err) => {
     showAlert(`无法连接映射引擎，请重新打开控制面板：${String(err)}`);
   });
+
+type CardDrag = { x: number; lastX: number; lastTime: number; velocity: number; dx: number; id: number; grip: HTMLElement; card: HTMLElement };
+let drag: CardDrag | null = null;
+let deckBusy = false;
+let deckEpoch = 0;
+let dragFrame = 0;
+const deckAnimations = new Set<Animation>();
+let preview: HTMLElement | null = null;
+let previewTarget: HTMLElement | null = null;
+
+function resetDeck() {
+  ++deckEpoch;
+  const previous = drag;
+  drag = null;
+  if (previous?.grip.hasPointerCapture(previous.id)) previous.grip.releasePointerCapture(previous.id);
+  cancelAnimationFrame(dragFrame);
+  dragFrame = 0;
+  for (const animation of deckAnimations) animation.cancel();
+  deckAnimations.clear();
+  document.querySelectorAll<HTMLElement>("#maps > .map").forEach(card => {
+    card.style.removeProperty("transform");
+    card.style.removeProperty("filter");
+    card.style.removeProperty("opacity");
+  });
+  preview?.remove();
+  preview = previewTarget = null;
+  $("maps").style.removeProperty("min-height");
+  $("maps").classList.remove("deck-moving");
+  deckBusy = false;
+}
+function nextCard(direction: number): HTMLElement | null {
+  const cards = [...$("maps").querySelectorAll<HTMLElement>(":scope > .map")];
+  return cards.length < 2 ? null : direction > 0 ? cards[1] : cards[cards.length - 1];
+}
+function preparePreview(direction: number) {
+  const target = nextCard(direction);
+  if (!target || previewTarget === target) return;
+  preview?.remove();
+  previewTarget = target;
+  preview = target.cloneNode(true) as HTMLElement;
+  preview.className = `deck-preview${target.classList.contains("collapsed") ? " collapsed" : ""}`;
+  preview.removeAttribute("data-id");
+  preview.removeAttribute("data-button");
+  preview.inert = true;
+  preview.setAttribute("aria-hidden", "true");
+  $("maps").append(preview);
+}
+function paintDrag() {
+  dragFrame = 0;
+  if (!drag) return;
+  preparePreview(drag.dx >= 0 ? 1 : -1);
+  const width = $("maps").clientWidth;
+  const dx = Math.max(-width, Math.min(width, drag.dx));
+  const progress = Math.min(1, Math.abs(dx) / width);
+  drag.card.style.transform = `translateX(${dx}px) rotate(${dx / width * 3}deg)`;
+  drag.card.style.filter = reducedMotion.matches ? "none" : `blur(${progress * 2}px)`;
+  if (preview) {
+    preview.style.transform = `translateY(${12 * (1 - progress)}px) scale(${.96 + .04 * progress})`;
+    preview.style.filter = reducedMotion.matches ? "none" : `blur(${4 * (1 - progress)}px)`;
+    preview.style.opacity = String(.5 + .5 * progress);
+  }
+}
+async function animateDeck(el: HTMLElement, frames: Keyframe[], duration: number) {
+  if (reducedMotion.matches) return;
+  const animation = el.animate(frames, { duration, easing: "cubic-bezier(.22,.75,.25,1)", fill: "forwards" });
+  deckAnimations.add(animation);
+  try { await animation.finished; } catch { /* Cancelled by blur, capture loss or a rerender. */ }
+}
+async function cycleCard(direction: number, fromDrag = false) {
+  if (deckBusy || currentDraft) return;
+  const host = $("maps");
+  const first = host.querySelector<HTMLElement>(":scope > .map");
+  const next = nextCard(direction);
+  if (!first || !next) { resetDeck(); return; }
+  deckBusy = true;
+  const epoch = deckEpoch;
+  host.classList.add("deck-moving");
+  host.style.minHeight = `${host.offsetHeight}px`;
+  preparePreview(direction);
+  const transform = fromDrag ? first.style.transform : "none";
+  await Promise.all([
+    animateDeck(first, [
+      { transform, filter: first.style.filter || "blur(0px)", opacity: 1 },
+      { transform: `translateX(${direction * (host.clientWidth + 40)}px) rotate(${direction * 3}deg)`, filter: "blur(4px)", opacity: 0 }
+    ], 260),
+    ...(preview ? [animateDeck(preview, [
+      { transform: preview.style.transform || "translateY(12px) scale(.96)", filter: preview.style.filter || "blur(4px)", opacity: preview.style.opacity || .5 },
+      { transform: "none", filter: "blur(0px)", opacity: 1 }
+    ], 260)] : [])
+  ]);
+  if (epoch !== deckEpoch) return;
+  resetDeck();
+  if (direction > 0) host.append(first); else host.prepend(next);
+  selectMapping(next.dataset.id!);
+}
+$("deck-prev").onclick = () => { void cycleCard(-1); };
+$("deck-next").onclick = () => { void cycleCard(1); };
+$("maps").addEventListener("pointerdown", e => {
+  const grip = (e.target as HTMLElement).closest<HTMLElement>(".card-grip");
+  if (!grip || e.button !== 0 || !e.isPrimary || deckBusy || mappings.length < 2) return;
+  resetDeck();
+  const card = grip.closest<HTMLElement>(".map")!;
+  drag = { x: e.clientX, lastX: e.clientX, lastTime: e.timeStamp, velocity: 0, dx: 0, id: e.pointerId, grip, card };
+  grip.setPointerCapture(e.pointerId);
+  $("maps").classList.add("deck-moving");
+});
+$("maps").addEventListener("pointermove", e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  if (!(e.buttons & 1)) { resetDeck(); return; }
+  const elapsed = e.timeStamp - drag.lastTime;
+  if (elapsed > 0) drag.velocity = (e.clientX - drag.lastX) / elapsed;
+  drag.lastX = e.clientX;
+  drag.lastTime = e.timeStamp;
+  drag.dx = e.clientX - drag.x;
+  if (!dragFrame) dragFrame = requestAnimationFrame(paintDrag);
+});
+$("maps").addEventListener("pointerup", e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  cancelAnimationFrame(dragFrame);
+  drag.dx = e.clientX - drag.x;
+  paintDrag();
+  const finished = drag;
+  drag = null; // Clear before releasing capture: lostpointercapture must not cancel the settle.
+  if (finished.grip.hasPointerCapture(e.pointerId)) finished.grip.releasePointerCapture(e.pointerId);
+  const distance = Math.abs(finished.dx);
+  const flick = e.timeStamp - finished.lastTime < 100 && Math.abs(finished.velocity) > .5 && distance > 25;
+  if (distance >= Math.min(110, $("maps").clientWidth * .18) || flick) {
+    void cycleCard(finished.dx >= 0 ? 1 : -1, true);
+  } else {
+    const epoch = deckEpoch;
+    deckBusy = true;
+    void animateDeck(finished.card, [
+      { transform: finished.card.style.transform, filter: finished.card.style.filter },
+      { transform: "none", filter: "blur(0px)" }
+    ], 180).then(() => { if (epoch === deckEpoch) resetDeck(); });
+  }
+});
+$("maps").addEventListener("pointercancel", resetDeck);
+$("maps").addEventListener("lostpointercapture", () => { if (drag) resetDeck(); });
+window.addEventListener("blur", resetDeck);
+window.addEventListener("keydown", () => { if (drag || deckBusy) resetDeck(); });
+window.addEventListener("resize", resetDeck);
+document.addEventListener("visibilitychange", () => { if (document.hidden) resetDeck(); });
+reducedMotion.addEventListener("change", resetDeck);
+document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach(link => {
+  link.addEventListener("click", () => {
+    document.querySelectorAll(".rail-link").forEach(el => el.classList.toggle("active", el === link));
+  });
+});

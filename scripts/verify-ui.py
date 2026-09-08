@@ -70,6 +70,70 @@ with sync_playwright() as playwright:
     page.keyboard.press('Escape')
     assert first_select.evaluate('(element) => element.isConnected')
 
+    # Card-only interactions must never mutate configuration or select labels.
+    saved = invoke('get_snapshot')['config']['mappings']
+    page.locator('.map:visible [data-act="collapse"]').click()
+    expect(page.locator('.map:visible .gesture').first).to_be_hidden()
+    page.locator('.map:visible [data-act="collapse"]').click()
+    expect(page.locator('.map:visible .gesture').first).to_be_visible()
+    old_id = page.locator('.map:visible').get_attribute('data-id')
+    page.locator('#deck-next').click()
+    expect(page.locator('.map:visible')).not_to_have_attribute('data-id', old_id)
+    page.locator('#deck-prev').click()
+    expect(page.locator('.map:visible')).to_have_attribute('data-id', old_id)
+    grip = page.locator('.map:visible .card-grip').bounding_box()
+    page.mouse.move(grip['x'] + 15, grip['y'] + 8)
+    page.mouse.down()
+    page.mouse.move(grip['x'] + 130, grip['y'] + 8, steps=8)
+    page.mouse.up()
+    expect(page.locator('.map:visible')).not_to_have_attribute('data-id', old_id)
+    page.locator('#save-status').dblclick()
+    assert page.evaluate('getSelection().toString()') == ''
+    assert invoke('get_snapshot')['config']['mappings'] == saved
+    assert page.locator('#zone-xbutton2').bounding_box()['y'] < page.locator('#zone-xbutton1').bounding_box()['y']
+    page.locator('[data-add-button="xbutton1"]').click()
+    expect(page.locator('.map:visible')).to_have_attribute('data-button', 'xbutton1')
+
+    # Mid-drag overflow and interruptions: no stuck transform after screenshot/blur.
+    def begin_drag(distance=70):
+        grip = page.locator('.map:visible .card-grip')
+        grip.scroll_into_view_if_needed()
+        box = grip.bounding_box()
+        page.mouse.move(box['x'] + 20, box['y'] + 8)
+        page.mouse.down()
+        page.mouse.move(box['x'] + 20 + distance, box['y'] + 8, steps=8)
+        page.wait_for_timeout(40)
+    def assert_reset():
+        assert page.locator('.map:visible').evaluate('(el) => el.style.transform') == ''
+        assert page.locator('.deck-preview').count() == 0
+        assert page.locator('#maps').evaluate('(el) => !el.classList.contains("deck-moving")')
+    begin_drag()
+    assert page.locator('.deck-preview').count() == 1
+    assert page.locator('.deck-preview').evaluate('(el) => parseFloat(getComputedStyle(el).filter.slice(5)) > 0')
+    assert page.locator('.stage').evaluate('(el) => el.scrollWidth <= el.clientWidth')
+    page.screenshot(path=str(args.output / 'drag-contained.png'))
+    page.evaluate('window.dispatchEvent(new Event("blur"))')
+    assert_reset()
+    page.mouse.move(700, 350)
+    assert_reset()
+    page.mouse.up()
+    begin_drag()
+    page.evaluate('window.dispatchEvent(new KeyboardEvent("keydown", {key:"Meta"}))')
+    assert_reset()
+    page.mouse.up()
+    begin_drag()
+    page.locator('.map:visible .card-grip').evaluate('(el) => el.dispatchEvent(new PointerEvent("lostpointercapture", {bubbles:true}))')
+    assert_reset()
+    page.mouse.up()
+    begin_drag(12)
+    page.wait_for_timeout(120) # A slow, short drag should return to the same card.
+    same_id = page.locator('.map:visible').get_attribute('data-id')
+    page.mouse.up()
+    page.wait_for_timeout(220)
+    assert_reset()
+    expect(page.locator('.map:visible')).to_have_attribute('data-id', same_id)
+    assert invoke('get_snapshot')['config']['mappings'] == saved
+
     # Listening cancellation, keyboard focus containment and both themes.
     page.locator('#btn-listen').click()
     expect(page.locator('#btn-listen')).to_have_text('取消识别')
@@ -83,13 +147,16 @@ with sync_playwright() as playwright:
     if page.locator('html').get_attribute('data-theme') != 'light':
         page.locator('#btn-theme').click()
     expect(page.locator('html')).to_have_attribute('data-theme', 'light')
+    page.wait_for_timeout(250)
     page.locator('.stage').evaluate('(element) => element.scrollTop = 0')
     page.screenshot(path=str(args.output / 'light.png'))
     page.locator('#btn-theme').click()
     expect(page.locator('html')).to_have_attribute('data-theme', 'dark')
+    page.wait_for_timeout(250)  # Let the theme color transitions settle before visual QA.
     page.screenshot(path=str(args.output / 'dark.png'))
     page.locator('#btn-theme').click()
 
+    page.wait_for_timeout(250)
     # CDP emulates the content viewport; native window dimensions are unchanged.
     cdp = page.context.new_cdp_session(page)
     for width, height in [(1180, 760), (920, 620)]:
@@ -102,9 +169,32 @@ with sync_playwright() as playwright:
     page.locator('[data-add-button="middle"]').click()
     assert page.locator('.record-card').evaluate('(element) => getComputedStyle(element).animationName') == 'none'
     page.locator('#record-cancel').click()
+    # Three-card wraparound and cancellation while a settle animation is running.
+    cdp.send('Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-reduced-motion', 'value': 'no-preference'}]})
+    page.locator('[data-add-button="middle"]').click()
+    page.locator('[data-preset="enter"]').click()
+    page.locator('#record-ok').click()
+    expect(page.get_by_role('dialog')).to_be_hidden()
+    expect(page.locator('.map')).to_have_count(3)
+    start_id = page.locator('.map:visible').get_attribute('data-id')
+    for direction in [1, -1]:
+        for _ in range(3):
+            old_id = page.locator('.map:visible').get_attribute('data-id')
+            begin_drag(180 * direction)
+            assert page.locator('.stage').evaluate('(el) => el.scrollWidth <= el.clientWidth')
+            page.mouse.up()
+            expect(page.locator('.map:visible')).not_to_have_attribute('data-id', old_id)
+            assert_reset()
+        expect(page.locator('.map:visible')).to_have_attribute('data-id', start_id)
+    page.locator('#deck-next').click()
+    page.evaluate('window.dispatchEvent(new Event("blur"))')
+    assert_reset()
+    page.locator('#deck-next').click()
+    expect(page.locator('.map:visible')).not_to_have_attribute('data-id', start_id)
+    page.locator('.stage').evaluate('(el) => el.scrollTop = 0')
     assert errors == [], errors
     after = invoke('get_snapshot')
     config = Path(after['config_dir']) / 'config.json'
     assert json.loads(config.read_text(encoding='utf-8'))['mappings'] == after['config']['mappings']
-    print(json.dumps({'result': 'passed', 'checks': ['native IPC recording/presets', 'right Alt roundtrip', 'cancel transaction', 'clear last key/reload', 'select identity', 'listen cancellation', 'dialog focus', 'light/dark', '1180/920 overflow', 'reduced motion', 'disk persistence'], 'page_errors': errors}, ensure_ascii=False))
+    print(json.dumps({'result': 'passed', 'checks': ['native IPC recording/presets', 'right Alt roundtrip', 'cancel transaction', 'clear last key/reload', 'select identity', 'listen cancellation', 'dialog focus', 'light/dark', '1180/920 overflow', 'reduced motion', 'disk persistence', 'card collapse/navigation/swipe', 'double-click does not select or save', 'front/rear indicator order', 'mid-drag containment/blur', 'focus/capture/screenshot cancellation', 'short-drag return', 'three-card wraparound both directions', 'settle interruption recovery'], 'page_errors': errors}, ensure_ascii=False))
     browser.close()

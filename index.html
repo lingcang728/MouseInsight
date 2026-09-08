@@ -12,16 +12,10 @@
   <body>
     <div class="app">
       <aside class="rail">
-        <div class="brand">
-          <img class="mark" src="/icon.png" alt="Mouse Insight" />
-          <div>
-            <strong>Mouse Insight</strong>
-          </div>
-        </div>
-        <div class="rail-section">工作空间</div>
-        <a class="rail-link active" href="#workspace">鼠标映射 <span>05</span></a>
-        <a class="rail-link" href="#settings">偏好设置 <span>↗</span></a>
-        <div class="rail-note safety"><strong>安心操作</strong><p id="safety-copy">左键与右键始终保留原操作。按 Pause 或 Scroll Lock 可立即暂停并释放所有映射键。</p></div>
+        <nav aria-label="主导航">
+          <a class="rail-link active" href="#workspace">鼠标映射</a>
+          <a class="rail-link" href="#settings">偏好设置</a>
+        </nav>
         <div class="rail-spacer"></div>
         <button type="button" class="ghost" id="btn-pause">暂停映射</button>
         <button type="button" class="ghost" id="btn-theme">换成深色</button>
@@ -35,9 +29,9 @@
 
       <main class="stage" id="workspace">
         <header class="hero">
-          <div class="hero-top"><span class="eyebrow">你的鼠标，更顺手</span><span id="engine-status" class="engine-status" role="status">正在连接引擎</span></div>
-          <h1>让每一键，都合你意。</h1>
-          <p>把常用快捷键交给指尖，专注正在做的事。</p>
+          <div class="hero-top"><span class="eyebrow">鼠标映射</span><span id="engine-status" class="engine-status" role="status">正在连接引擎</span></div>
+          <h1>设置你的快捷操作</h1>
+          <p>选择鼠标按键，为短按和长按分别设置快捷键。</p>
         </header>
 
         <div id="alert-banner" class="banner hidden" role="alert"></div>
@@ -54,8 +48,8 @@
             <div class="pulse-body">
               <div class="mouse" aria-hidden="true">
                 <div class="mouse-thumbs">
-                  <i id="zone-xbutton1" class="zone side s1"></i>
-                  <i id="zone-xbutton2" class="zone side s2"></i>
+                  <i id="zone-xbutton2" class="zone side s1"></i>
+                  <i id="zone-xbutton1" class="zone side s2"></i>
                 </div>
                 <div class="mouse-shell"><i class="signal-ring"></i>
                   <div class="mouse-lids">
@@ -74,7 +68,7 @@
           </div>
 
           <div class="sheet listen-sheet">
-            <div class="sheet-top"><span>添加映射</span><span class="step-mark">01 → 02</span></div>
+            <div class="sheet-top"><span>添加映射</span></div>
             <p class="listen-copy" id="listen-copy">点击识别，再按侧键、中键或滚轮。也可以直接在下方选择按键。</p>
             <button type="button" class="solid" id="btn-listen">识别鼠标键</button>
           </div>
@@ -83,7 +77,7 @@
         <section class="maps-wrap">
           <div class="sheet-top">
             <h2>按键工作台 <span class="meta" id="mapping-count">0 / 5 已配置</span></h2>
-            <span class="meta" id="save-status" role="status">更改自动保存</span>
+            <span class="meta" id="save-status" role="status">已保存</span>
           </div>
           <div class="quick-add" id="quick-add" aria-label="直接添加鼠标映射">
             <button data-add-button="xbutton1">＋ 侧键 · 后</button>
@@ -92,6 +86,7 @@
             <button data-add-button="wheelup">＋ 滚轮上</button>
             <button data-add-button="wheeldown">＋ 滚轮下</button>
           </div>
+          <div class="deck-controls"><span class="meta">拖动卡片顶部切换按键</span><button class="ghost" id="deck-prev" aria-label="上一个按键">上一张</button><button class="ghost" id="deck-next" aria-label="下一个按键">下一张</button></div>
           <div id="maps" class="maps"></div>
         </section>
       <aside class="dock" id="settings">
@@ -104,7 +99,7 @@
           <p class="meta" id="dock-hint">键盘任意键都能录。Typeless 听写可录 Left Ctrl + Left Alt。</p>
         </div>
         <div class="sheet dock-card">
-          <div class="sheet-top"><span>设置</span></div>
+          <div class="sheet-top"><span>偏好设置</span></div><p class="meta" id="safety-copy">左键与右键保留原操作。Pause 或 Scroll Lock 可紧急暂停映射。</p>
           <label class="check">
             <input type="checkbox" id="chk-autostart" />
             开机自启

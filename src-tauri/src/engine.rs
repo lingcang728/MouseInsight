@@ -1329,6 +1329,8 @@ pub fn xmbc_running() -> bool {
 pub fn hook_status() -> String { engine().hook_status.read().clone() }
 
 // Menu reads must not enumerate processes or resolve filesystem paths.
+pub fn menu_mappings() -> Vec<Mapping> { engine().cfg.read().mappings.clone() }
+
 pub fn menu_summary() -> (bool, usize, String) {
     let e = engine();
     (e.paused.load(Ordering::SeqCst), e.cfg.read().mappings.len(), hook_status())
@@ -1380,6 +1382,56 @@ pub fn set_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
     let mut cfg = e.cfg.write();
     let mut next = cfg.clone();
     next.mappings = mappings;
+    save_config(&next)?;
+    let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    e.compiled.store(Arc::new(compile_mappings_with_gen(&next.mappings, generation)));
+    *cfg = next;
+    let _ = e.cmd_tx.send(InputCmd::UpdateMappings { generation });
+    Ok(())
+}
+
+fn apply_quick_mapping(next: &mut AppConfig, button: &str, slot: &str, preset: &str) -> Result<(), String> {
+    if !["xbutton1", "xbutton2", "middle", "wheelup", "wheeldown"].contains(&button)
+        || !["tap", "hold"].contains(&slot)
+        || (slot == "hold" && button.starts_with("wheel")) { return Err("不支持的按键操作".into()); }
+    let modifier = if cfg!(target_os = "macos") { "LWin" } else { "LControl" };
+    let keys: Vec<String> = match preset {
+        "copy" => vec![modifier, "C"], "paste" => vec![modifier, "V"],
+        "undo" => vec![modifier, "Z"], "enter" => vec!["Enter"], "clear" => vec![],
+        _ => return Err("不支持的快捷操作".into()),
+    }.into_iter().map(str::to_owned).collect();
+    let index = match next.mappings.iter().position(|m| m.button == button) {
+        Some(index) => index,
+        None => {
+            if keys.is_empty() { return Ok(()); }
+            if next.mappings.len() >= 5 { return Err("最多支持 5 个鼠标按键映射".into()); }
+            let mut suffix = 0;
+            let id = loop {
+                let candidate = format!("quick-{button}-{suffix}");
+                if next.mappings.iter().all(|m| m.id != candidate) { break candidate; }
+                suffix += 1;
+            };
+            next.mappings.push(Mapping { id, button: button.into(),
+                mode: "dual".into(), keys: vec![], tap_keys: vec![], hold_keys: vec![], label: String::new() });
+            next.mappings.len() - 1
+        }
+    };
+    let m = &mut next.mappings[index];
+    if m.mode == "toggle" { return Err("此按键正在使用切换保持，请先在按键工作台更改触发方式。".into()); }
+    if m.tap_keys.is_empty() && m.hold_keys.is_empty() {
+        if m.mode == "hold" { m.hold_keys = m.keys.clone(); } else { m.tap_keys = m.keys.clone(); }
+    }
+    m.mode = if button.starts_with("wheel") { "click" } else { "dual" }.into();
+    if slot == "tap" { m.tap_keys = keys; } else { m.hold_keys = keys; }
+    m.keys = if m.tap_keys.is_empty() { m.hold_keys.clone() } else { m.tap_keys.clone() };
+    Ok(())
+}
+
+pub fn set_quick_mapping(button: &str, slot: &str, preset: &str) -> Result<(), String> {
+    let e = engine();
+    let mut cfg = e.cfg.write();
+    let mut next = cfg.clone();
+    apply_quick_mapping(&mut next, button, slot, preset)?;
     save_config(&next)?;
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     e.compiled.store(Arc::new(compile_mappings_with_gen(&next.mappings, generation)));
@@ -1720,11 +1772,16 @@ fn worker_loop<I: InputInjector>(
 fn hook_loop() {
     unsafe {
         HOOK_TID.store(GetCurrentThreadId(), Ordering::Relaxed);
-        let mouse = match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) {
+        // Both callbacks live in this executable; supply its module for global hooks.
+        let module = match windows::Win32::System::LibraryLoader::GetModuleHandleW(None) {
+            Ok(module) => windows::Win32::Foundation::HINSTANCE(module.0),
+            Err(err) => { set_hook_status(&format!("Windows 监听初始化失败：{err}")); return; }
+        };
+        let mouse = match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0) {
             Ok(h) => h,
             Err(err) => {
                 eprintln!("[MouseInsight] SetWindowsHookEx WH_MOUSE_LL failed: {err}");
-                set_hook_status("鼠标监听启动失败，请退出冲突的鼠标软件后重新启动。");
+                set_hook_status(&format!("Windows 鼠标监听启动失败：{err}。请检查安全软件拦截及其他鼠标工具。Windows 无需辅助功能授权。"));
                 return;
             }
         };
@@ -1742,16 +1799,19 @@ fn hook_loop() {
             VK_SCROLL.0 as u32,
         );
 
-        let kbd = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), None, 0) {
-            Ok(h) => Some(h),
+        let kbd = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), module, 0) {
+            Ok(h) => h,
             Err(err) => {
                 eprintln!("[MouseInsight] SetWindowsHookEx WH_KEYBOARD_LL failed: {err}");
-                None
+                set_hook_status(&format!("Windows 键盘监听启动失败：{err}。请检查安全软件拦截。"));
+                let _ = UnhookWindowsHookEx(mouse);
+                let _ = UnregisterHotKey(HWND(std::ptr::null_mut()), HOTKEY_PAUSE);
+                let _ = UnregisterHotKey(HWND(std::ptr::null_mut()), HOTKEY_SCROLL);
+                HOOK_TID.store(0, Ordering::Relaxed);
+                return;
             }
         };
-        set_hook_status(if kbd.is_some() { "ready" } else {
-            "键盘监听启动失败，无法可靠录制或保护物理修饰键，请重启应用。"
-        });
+        set_hook_status("ready");
         let mut msg = MSG::default();
         loop {
             let status = GetMessageW(&mut msg, None, 0, 0);
@@ -1759,7 +1819,7 @@ fn hook_loop() {
                 break;
             }
             if status.0 == -1 {
-                eprintln!("[MouseInsight] GetMessageW failed: {:?}", GetLastError());
+                set_hook_status(&format!("Windows 监听消息循环中断：{:?}，请重新启动应用。", GetLastError()));
                 break;
             }
 
@@ -1776,9 +1836,7 @@ fn hook_loop() {
             }
         }
 
-        if let Some(h) = kbd {
-            let _ = UnhookWindowsHookEx(h);
-        }
+        let _ = UnhookWindowsHookEx(kbd);
         let _ = UnhookWindowsHookEx(mouse);
         let _ = UnregisterHotKey(HWND(std::ptr::null_mut()), HOTKEY_PAUSE);
         let _ = UnregisterHotKey(HWND(std::ptr::null_mut()), HOTKEY_SCROLL);
@@ -3420,6 +3478,27 @@ mod tests {
         fs::remove_file(dir.join(".portable")).unwrap();
         assert_eq!(portable_config_dir(&dir), Some(dir.join("data")));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quick_menu_preserves_other_slot_and_rejects_invalid_operations() {
+        let mut config = AppConfig::default();
+        apply_quick_mapping(&mut config, "middle", "tap", "copy").unwrap();
+        apply_quick_mapping(&mut config, "middle", "hold", "enter").unwrap();
+        assert_eq!(config.mappings.len(), 1);
+        assert_eq!(config.mappings[0].tap_keys.last().unwrap(), "C");
+        assert_eq!(config.mappings[0].hold_keys, ["Enter"]);
+        apply_quick_mapping(&mut config, "middle", "tap", "clear").unwrap();
+        assert!(config.mappings[0].tap_keys.is_empty());
+        assert_eq!(config.mappings[0].hold_keys, ["Enter"]);
+        assert!(apply_quick_mapping(&mut config, "left", "tap", "copy").is_err());
+        assert!(apply_quick_mapping(&mut config, "wheelup", "hold", "copy").is_err());
+        config.mappings[0].mode = "toggle".into();
+        assert!(apply_quick_mapping(&mut config, "middle", "tap", "copy").is_err());
+        assert_eq!(config.mappings[0].mode, "toggle");
+        config.mappings[0].button = "xbutton1".into();
+        apply_quick_mapping(&mut config, "middle", "tap", "copy").unwrap();
+        assert_ne!(config.mappings[0].id, config.mappings[1].id);
     }
 
 }

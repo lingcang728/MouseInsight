@@ -165,3 +165,72 @@ button:disabled { cursor: default; opacity: .48; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* Compact desktop utility layout shared by Windows and macOS. */
+body { user-select: none; -webkit-user-select: none; }
+input, textarea, .path { user-select: text; -webkit-user-select: text; }
+.app { grid-template-columns: 156px minmax(0, 1fr); }
+.rail { padding: 22px 12px 16px; gap: 8px; }
+.rail nav { display: grid; gap: 6px; }
+.rail-link { padding: 11px 12px; }
+.rail > button { width: 100%; text-align: left; padding: 10px 12px; font-size: 12px; }
+.rail-foot { grid-template-columns: 1fr; gap: 6px; }
+.stage { padding: 26px 28px; }
+.hero { margin-bottom: 20px; }
+.hero-top { margin-bottom: 8px; }
+.hero h1 { font-size: 25px; letter-spacing: -.02em; }
+.hero p { font-size: 13px; }
+.insight { gap: 14px; margin-bottom: 24px; }
+.sheet { border-radius: 14px; padding: 18px; box-shadow: none; }
+.pulse-body { grid-template-columns: 78px minmax(0, 1fr); gap: 18px; }
+.pulse-name { font-size: 22px; }
+.listen-copy { line-height: 1.65; }
+.map { border-radius: 12px; padding: 16px; }
+.map-primary-row { grid-template-columns: minmax(110px, 1fr) minmax(130px, 1fr) auto auto auto; gap: 8px; }
+.card-grip { font-size: 11px; color: var(--muted); cursor: grab; touch-action: none; padding: 4px 0 10px; }
+.card-grip:active { cursor: grabbing; }
+.map.collapsed > .gesture, .map.collapsed > .map-desc { display: none; }
+.collapse-toggle { font-size: 12px; padding: 7px; }
+.deck-controls { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.deck-controls .meta { margin-right: auto; font-size: 11px; }
+.deck-controls button { font-size: 12px; padding: 7px 10px; }
+.maps { overflow: clip; }
+.mode-hint { max-width: 65ch; }
+.key-chip, .key, .chips button { font-family: var(--font); }
+@media (max-width: 760px) {
+  .app { grid-template-columns: 120px minmax(0, 1fr); }
+  .stage { padding: 18px; }
+  .insight, .dock { grid-template-columns: 1fr; }
+  .map-primary-row { grid-template-columns: 1fr 1fr; }
+}
+
+.maps { position: relative; padding-bottom: 14px; isolation: isolate; overflow: clip; }
+.maps:has(.map:nth-child(2))::before, .maps:has(.map:nth-child(3))::after {
+  content: ""; position: absolute; inset: 10px 8px 6px; z-index: -1;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
+}
+.maps:has(.map:nth-child(3))::after { inset: 18px 16px 0; z-index: -2; }
+.maps > .map:not(:first-child) { display: none; }
+.quick-add button.active { border-color: var(--accent); color: var(--accent); background: var(--surface-2); }
+
+/* Keep the entire transition inside the deck, including transformed ink overflow. */
+.stage { overflow-x: hidden; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.rail, .record-card { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+.maps { padding: 8px 6px 22px; margin: -8px -6px 0; }
+.maps > .map { position: relative; z-index: 2; transform-origin: center; }
+.deck-moving > .map { will-change: transform, filter; }
+.deck-moving .map-primary-row, .deck-moving .gesture { pointer-events: none; }
+.deck-preview {
+  position: absolute; inset: 8px 6px auto; z-index: 1; pointer-events: none;
+  display: flex; flex-direction: column; gap: 10px; padding: 16px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+  transform-origin: center; filter: blur(4px); opacity: .5;
+}
+.deck-preview select { background: var(--key-bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; min-width: 0; font-size: 13px; }
+.deck-preview.collapsed > .gesture, .deck-preview.collapsed > .map-desc { display: none; }
+@media (prefers-reduced-motion: reduce) { .deck-preview { filter: none; } }

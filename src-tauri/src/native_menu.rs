@@ -1,9 +1,9 @@
 //! Native menus only: no extra window, WebView, polling timer or UI thread I/O.
 use crate::{engine, show_main_window};
 use std::sync::OnceLock;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Emitter};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
 
@@ -11,6 +11,7 @@ struct MenuState {
     status: MenuItem<tauri::Wry>,
     pause: MenuItem<tauri::Wry>,
     error: MenuItem<tauri::Wry>,
+    slots: Vec<(String, String, Submenu<tauri::Wry>)>,
 }
 
 fn status_text(paused: bool, count: usize, hook: &str) -> String {
@@ -18,7 +19,7 @@ fn status_text(paused: bool, count: usize, hook: &str) -> String {
         if hook == "starting" {
             "正在启动监听…".into()
         } else {
-            "监听不可用 · 打开控制面板查看".into()
+            "监听不可用 · 打开按键工作台查看".into()
         }
     } else if paused {
         "映射已暂停".into()
@@ -39,6 +40,15 @@ pub fn refresh() {
         };
         let (paused, count, hook) = engine::menu_summary();
         let text = status_text(paused, count, &hook);
+        let mappings = engine::menu_mappings();
+        for (button, slot, submenu) in &state.slots {
+            let mapping = mappings.iter().find(|m| &m.button == button);
+            let keys = mapping.map(|m| if slot == "hold" { &m.hold_keys } else { &m.tap_keys });
+            let chord = keys.filter(|keys| !keys.is_empty()).map(|keys| keys.join(" + ")).unwrap_or_else(|| "未设置".into());
+            let label = if button.starts_with("wheel") { "滚动" } else if slot == "hold" { "长按" } else { "短按" };
+            let _ = submenu.set_text(format!("{label} · {chord}"));
+            let _ = submenu.set_enabled(!mapping.is_some_and(|m| m.mode == "toggle"));
+        }
         let _ = state.status.set_text(&text);
         let _ = state.pause.set_text(if paused {
             "恢复映射"
@@ -54,7 +64,7 @@ pub fn refresh() {
 fn report_error(app: &AppHandle, result: Result<(), String>) {
     if let Some(state) = app.try_state::<MenuState>() {
         let _ = state.error.set_text(if result.is_err() {
-            "操作失败 · 请检查权限或磁盘后重试"
+            "操作失败 · 请在工作台检查设置"
         } else {
             "所有配置仅保存在本机"
         });
@@ -65,6 +75,20 @@ fn report_error(app: &AppHandle, result: Result<(), String>) {
 }
 
 pub fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    if let Some(action) = event.id.as_ref().strip_prefix("quick:") {
+        let parts: Vec<String> = action.split(':').map(str::to_owned).collect();
+        if parts.len() == 3 {
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = engine::set_quick_mapping(&parts[0], &parts[1], &parts[2]);
+                if result.is_ok() { let _ = app.emit("mappings-changed", ()); }
+                refresh();
+                let handle = app.clone();
+                let _ = app.run_on_main_thread(move || report_error(&handle, result));
+            });
+        }
+        return;
+    }
     match event.id.as_ref() {
         "show" => show_main_window(app),
         "quit" => {
@@ -100,7 +124,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     let item = |id, text, shortcut: Option<&str>| MenuItem::with_id(app, id, text, true, shortcut);
     let sep = || PredefinedMenuItem::separator(app);
     let status = MenuItem::with_id(app, "status", "正在启动监听…", false, None::<&str>)?;
-    let show = item("show", "打开控制面板…", Some("CmdOrCtrl+Comma"))?;
+    let show = item("show", "打开按键工作台…", Some("CmdOrCtrl+Comma"))?;
     let pause = item(
         "toggle_pause",
         "暂停映射并释放按键",
@@ -116,7 +140,22 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         false,
         None::<&str>,
     )?;
-    let menu = Menu::with_items(app, &[&status, &sep()?, &show, &pause, &sep()?, &config])?;
+    let menu = Menu::with_items(app, &[&status, &pause, &sep()?])?;
+    let mut slots = Vec::new();
+    for (button, label) in [("xbutton2", "前侧键"), ("xbutton1", "后侧键"), ("middle", "中键"), ("wheelup", "滚轮上"), ("wheeldown", "滚轮下")] {
+        let button_menu = Submenu::new(app, label, true)?;
+        for (slot, title) in [("tap", "短按"), ("hold", "长按")] {
+            if button.starts_with("wheel") && slot == "hold" { continue; }
+            let actions = Submenu::new(app, if button.starts_with("wheel") { "滚动操作" } else { title }, true)?;
+            for (preset, title) in [("copy", "复制"), ("paste", "粘贴"), ("undo", "撤销"), ("enter", "回车"), ("clear", "清除绑定")] {
+                actions.append(&MenuItem::with_id(app, format!("quick:{button}:{slot}:{preset}"), title, true, None::<&str>)?)?;
+            }
+            button_menu.append(&actions)?;
+            slots.push((button.to_owned(), slot.to_owned(), actions));
+        }
+        menu.append(&button_menu)?;
+    }
+    menu.append_items(&[&sep()?, &show, &config])?;
     #[cfg(target_os = "macos")]
     {
         menu.append(&item("accessibility", "辅助功能设置…", None)?)?;
@@ -172,6 +211,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         status,
         pause,
         error,
+        slots,
     });
     let tray = TrayIconBuilder::with_id("main")
         .menu(&menu)

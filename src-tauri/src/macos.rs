@@ -478,7 +478,10 @@ pub fn stop_hook() {
 }
 
 pub fn hook_loop() {
-    let _ = check_accessibility_permission();
+    if !check_accessibility_permission() {
+        crate::engine::set_hook_status("macOS 尚未授予辅助功能权限。请在系统设置 → 隐私与安全性 → 辅助功能中添加当前安装的 Mouse Insight。若旧版本已勾选，请移除旧条目并重新添加，再启动应用。");
+        return;
+    }
 
     let events_of_interest = vec![
         CGEventType::OtherMouseDown,
@@ -494,7 +497,7 @@ pub fn hook_loop() {
     ];
 
     let tap = match CGEventTap::new(
-        CGEventTapLocation::HID,
+        CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         events_of_interest,
@@ -506,7 +509,7 @@ pub fn hook_loop() {
         Err(_) => {
             eprintln!("[MouseInsight] Failed to create CGEventTap. Please ensure Accessibility permissions are granted.");
             if ENGINE.get().is_some() {
-                crate::engine::set_hook_status("无法监听鼠标。请在系统设置 → 隐私与安全性 → 辅助功能中授权 Mouse Insight，然后重新启动应用。");
+                crate::engine::set_hook_status("macOS 辅助功能已授权，但监听创建失败。请检查输入监控权限及其他鼠标工具；若刚替换应用，请重新添加当前应用的权限条目。");
             }
             return;
         }
