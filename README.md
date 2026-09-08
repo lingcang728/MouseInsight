@@ -57,7 +57,7 @@ Mouse Insight 解决的是这几件很具体的事：
 
 #### 方式一：绿色便携版（推荐）
 1. 下载 `Mouse Insight.exe`，放到你喜欢的文件夹里（无需安装，解压即用）；
-2. 目录下会自动维护 `.portable` 标记文件，所有配置均保存在同级目录的 `config.json` 中，绝不向系统盘写入碎片；
+2. 本地打包目录将便携标记与映射配置放在 `data/.portable`、`data/config.json`。首次手动部署单文件版时，创建这份标记即可启用便携模式；旧版同级 `.portable` 与 `config.json` 仍兼容；
 3. 支持完整的开机自启（在界面勾选「开机自启动」后，开机静默常驻托盘，不弹窗打扰）。
 
 #### 方式二：标准安装包
@@ -136,7 +136,7 @@ Mouse Insight 需要辅助功能，是因为它要：
 关主窗口会销毁控制面板（Windows 上是 WebView2），后台只留钩子引擎；点托盘会重建控制面板。若托盘单击无响应，用右键菜单「打开控制面板」。
 
 **我的配置保存在哪里？换电脑或更新会丢吗？**  
-Windows 便携版存放在程序同级目录的 `config.json`；Windows 安装版存放在 `%APPDATA%\MouseInsight\config.json`；macOS 安装版存放在 `~/Library/Application Support/MouseInsight/config.json`。配置保存采用临时文件刷盘与原子重命名机制，并自动维护 `.bak` 备份，即便突发断电也不会损坏配置。Windows 更新程序时只需替换 exe，配置完整保留。
+Windows 便携版存放在程序目录下的 `data/config.json`（旧版同级 `.portable` 布局仍读取同级 `config.json`）；Windows 安装版存放在 `%APPDATA%\MouseInsight\config.json`；macOS 安装版存放在 `~/Library/Application Support/MouseInsight/config.json`。配置保存采用临时文件刷盘与原子重命名机制，并维护 `.bak` 备份，降低意外中断时丢失配置的风险。Windows 更新程序时只需替换 exe，配置完整保留。
 
 **macOS 上侧键没反应？**  
 先确认 **系统设置 → 隐私与安全性 → 辅助功能** 里已经打开 Mouse Insight。该权限被关掉时，全局事件点创建会失败，控制面板会显示授权提示。授权后请重新启动应用。系统临时禁用事件点时，应用会暂停映射、释放按键并重新启用监听，之后请手动恢复映射。
@@ -160,6 +160,10 @@ npm run tauri:dev
 # 3. Windows 本地打包发布产物（便携版 exe + NSIS 安装包）
 npm run package:release
 ```
+
+打包脚本先验证新程序与安装包，再替换本地 `release/`，不会创建 Tag 或发布 GitHub Release。运行中的便携版请先从托盘退出；自动替换当前实例可使用 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -StopRunningApp`。原配置按原字节迁移到 `release/data/`，旧文件备份到 `%LOCALAPPDATA%\MouseInsight\package-backups/`。
+
+`release/` 根目录只保留便携程序与当前版本安装包；`assets/` 保存快捷方式图标，`metadata/` 保存待发布版本信息与校验和，`data/` 保存便携标记和用户配置。分享软件时不要分发自己的 `data/config.json`。本地验证通过后再按发布流程打 Tag。
 
 macOS 开发机可同样使用 `npm run tauri:dev`。正式 Universal DMG 由 GitHub Actions 在 `v*` tag 上签名、公证后上传到 Draft Release，不走 Windows 的 `package-release.ps1`。
 

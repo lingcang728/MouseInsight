@@ -262,9 +262,15 @@ fn show_main_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let is_autostart = std::env::args().any(|arg| arg == "--autostart");
+    let quit_requested = std::env::args().any(|arg| arg == "--quit");
 
     let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if argv.iter().any(|arg| arg == "--quit") {
+                engine::shutdown();
+                app.exit(0);
+                return;
+            }
             show_main_window(app);
         }))
         .plugin(tauri_plugin_autostart::init(
@@ -292,6 +298,10 @@ pub fn run() {
             _ => {}
         })
         .setup(move |app| {
+            if quit_requested {
+                app.handle().exit(0);
+                return Ok(());
+            }
             let handle = app.handle().clone();
             let handle2 = app.handle().clone();
             let handle3 = app.handle().clone();

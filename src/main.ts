@@ -655,7 +655,7 @@ async function boot() {
           host.getAnimations().forEach((animation) => animation.cancel());
           const ring = document.querySelector<HTMLElement>(".signal-ring")!;
           ring.getAnimations().forEach((animation) => animation.cancel());
-          ring.animate([{ transform: "scale(.7)", opacity: .7 }, { transform: "scale(1.55)", opacity: 0 }], { duration: 480, easing: "cubic-bezier(.16,1,.3,1)" });
+          ring.animate([{ transform: "scale(.7)", opacity: "var(--impact-opacity)" }, { transform: "scale(1.55)", opacity: 0 }], { duration: 480, easing: "cubic-bezier(.16,1,.3,1)" });
           host.animate([{ transform: "scale(1)" }, { transform: "scale(1.012)" }, { transform: "scale(1)" }], { duration: 320, easing: "cubic-bezier(.2,.8,.2,1)" });
         }
         highlightMouse(pulse.button);
@@ -1016,7 +1016,7 @@ boot()
         void checkForUpdate(ver);
       });
     } catch {
-      $("app-version").textContent = "v0.2.0-beta.3";
+      $("app-version").textContent = "版本读取失败";
     }
   })
   .catch((err) => {

@@ -22,10 +22,16 @@ const cargoVersion = cargoPackageVersion(
   readFileSync(join(root, "src-tauri/Cargo.toml"), "utf8")
 );
 
+const npmLock = readJson("package-lock.json");
+const rustLock = readFileSync(join(root, "src-tauri/Cargo.lock"), "utf8");
+const cargoLockVersion = rustLock.match(/name = "mouse_insight"\r?\nversion = "([^"]+)"/)?.[1];
 const files = {
   "package.json": packageVersion,
   "src-tauri/Cargo.toml": cargoVersion,
   "src-tauri/tauri.conf.json": tauriVersion,
+  "package-lock.json": npmLock.version,
+  "package-lock.json root package": npmLock.packages[""].version,
+  "src-tauri/Cargo.lock": cargoLockVersion,
 };
 
 const mismatched = Object.entries(files).filter(([, version]) => version !== packageVersion);
@@ -58,6 +64,6 @@ if (rawTag) {
   );
 } else {
   console.log(
-    `OK: package.json / Cargo.toml / tauri.conf.json all ${packageVersion}`
+    `OK: all version manifests and lockfiles match ${packageVersion}`
   );
 }
