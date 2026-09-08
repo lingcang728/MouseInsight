@@ -1,19 +1,14 @@
 mod engine;
+mod native_menu;
 #[cfg(target_os = "macos")]
 mod macos;
 
 use engine::{Mapping, Pulse, RuntimeBindingState, SendReport, Snapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 static WINDOW_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-struct TrayState {
-    pause_item: MenuItem<tauri::Wry>,
-}
 
 #[tauri::command]
 fn get_hook_status() -> String { engine::hook_status() }
@@ -25,7 +20,9 @@ fn get_snapshot() -> Snapshot {
 
 #[tauri::command]
 async fn save_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || engine::set_mappings(mappings)).await.map_err(|e| e.to_string())?
+    let result = tauri::async_runtime::spawn_blocking(move || engine::set_mappings(mappings)).await.map_err(|e| e.to_string())?;
+    native_menu::refresh();
+    result
 }
 
 #[tauri::command]
@@ -126,16 +123,17 @@ fn config_dir() -> String {
 #[tauri::command]
 fn open_config_dir() -> Result<(), String> {
     let dir = engine::config_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create config directory failed: {e}"))?;
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        let _ = Command::new("explorer").arg(dir).spawn();
+        Command::new("explorer").arg(dir).spawn().map_err(|e| e.to_string())?;
     }
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
-        let _ = Command::new("open").arg(dir).spawn();
+        let status = Command::new("/usr/bin/open").arg(dir).status().map_err(|e| e.to_string())?;
+        if !status.success() { return Err("无法打开配置目录".into()); }
     }
     Ok(())
 }
@@ -154,23 +152,7 @@ pub fn sync_engine_paused_state(app: &tauri::AppHandle, paused: bool) -> Result<
 
 fn sync_paused_ui(app: &tauri::AppHandle, paused: bool) {
 
-    if let Some(tray) = app.tray_by_id("main") {
-        let tip = if paused {
-            "Mouse Insight · 已暂停"
-        } else {
-            "Mouse Insight · 已启用"
-        };
-        let _ = tray.set_tooltip(Some(tip));
-    }
-
-    if let Some(state) = app.try_state::<TrayState>() {
-        let text = if paused {
-            "恢复映射"
-        } else {
-            "暂停映射"
-        };
-        let _ = state.pause_item.set_text(text);
-    }
+    native_menu::refresh();
 
     let _ = app.emit(
         "engine-state-changed",
@@ -182,8 +164,11 @@ fn bring_hwnd_to_front(w: &tauri::WebviewWindow) {
     let _ = w.unminimize();
     let _ = w.show();
     let _ = w.set_focus();
-    let _ = w.set_always_on_top(true);
-    let _ = w.set_always_on_top(false);
+    #[cfg(target_os = "windows")]
+    {
+        let _ = w.set_always_on_top(true);
+        let _ = w.set_always_on_top(false);
+    }
 
     #[cfg(target_os = "windows")]
     if let Ok(hwnd) = w.hwnd() {
@@ -236,6 +221,8 @@ fn create_main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    { let _ = app.show(); }
     if let Some(w) = app.get_webview_window("main") {
         bring_hwnd_to_front(&w);
         engine::set_window_visible(true);
@@ -265,6 +252,7 @@ pub fn run() {
     let quit_requested = std::env::args().any(|arg| arg == "--quit");
 
     let builder = tauri::Builder::default()
+        .on_menu_event(native_menu::on_menu_event)
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if argv.iter().any(|arg| arg == "--quit") {
                 engine::shutdown();
@@ -346,68 +334,7 @@ pub fn run() {
                 },
             );
 
-            let initial_snap = engine::snapshot();
-            let is_paused = initial_snap.config.paused;
-
-            let show_item = MenuItem::with_id(app, "show", "打开控制面板", true, None::<&str>)?;
-            let pause_item = MenuItem::with_id(
-                app,
-                "toggle_pause",
-                if is_paused {
-                    "恢复映射"
-                } else {
-                    "暂停映射"
-                },
-                true,
-                None::<&str>,
-            )?;
-            let sep = PredefinedMenuItem::separator(app)?;
-            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-
-            let menu = Menu::with_items(app, &[&show_item, &pause_item, &sep, &quit_item])?;
-            app.manage(TrayState {
-                pause_item: pause_item.clone(),
-            });
-
-            let tooltip = if is_paused {
-                "Mouse Insight · 已暂停"
-            } else {
-                "Mouse Insight · 已启用"
-            };
-
-            let _tray = TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().cloned().unwrap())
-                .tooltip(tooltip)
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        show_main_window(app);
-                    }
-                    "toggle_pause" => {
-                        let current_paused = engine::snapshot().config.paused;
-                        let _ = sync_engine_paused_state(app, !current_paused);
-                    }
-                    "quit" => {
-                        engine::shutdown();
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        ..
-                    }
-                    | TrayIconEvent::DoubleClick {
-                        button: MouseButton::Left,
-                        ..
-                    } => {
-                        show_main_window(tray.app_handle());
-                    }
-                    _ => {}
-                })
-                .build(app)?;
+            native_menu::setup(app)?;
 
             if !is_autostart {
                 show_main_window(&app.handle());
@@ -442,6 +369,10 @@ pub fn run() {
         .expect("error while building Mouse Insight");
 
     app.run(|_app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if matches!(event, tauri::RunEvent::Reopen { .. }) {
+            show_main_window(_app_handle);
+        }
         if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
             if code.is_none() {
                 api.prevent_exit();
