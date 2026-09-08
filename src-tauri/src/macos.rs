@@ -15,7 +15,8 @@ use core_graphics::event::{
     CGEventTapOptions, CGEventTapPlacement, CGEventType, CallbackResult, EventField,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -369,8 +370,19 @@ pub fn keycode_to_token(code: u16) -> Option<String> {
 // =========================================================================
 // MacosInjector: injects keyboard events via CoreGraphics
 // =========================================================================
+fn modifier_flag(key: u16) -> CGEventFlags {
+    match key {
+        kVK_Command | kVK_RightCommand => CGEventFlags::CGEventFlagCommand,
+        kVK_Option | kVK_RightOption => CGEventFlags::CGEventFlagAlternate,
+        kVK_Control | kVK_RightControl => CGEventFlags::CGEventFlagControl,
+        kVK_Shift | kVK_RightShift => CGEventFlags::CGEventFlagShift,
+        kVK_CapsLock => CGEventFlags::CGEventFlagAlphaShift,
+        _ => CGEventFlags::empty(),
+    }
+}
+
 pub struct MacosInjector {
-    active_modifiers: CGEventFlags,
+    active_modifiers: HashSet<u16>,
     source: CGEventSource,
 }
 
@@ -379,7 +391,7 @@ unsafe impl Send for MacosInjector {}
 impl Default for MacosInjector {
     fn default() -> Self {
         Self {
-            active_modifiers: CGEventFlags::empty(),
+            active_modifiers: HashSet::new(),
             source: CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
                 .expect("Failed to create CGEventSource"),
         }
@@ -392,30 +404,31 @@ impl InputInjector for MacosInjector {
             return Ok(());
         }
 
-        // Update active modifier flags
-        for spec in specs {
-            let flag = match spec.vk.0 {
-                kVK_Command | kVK_RightCommand => CGEventFlags::CGEventFlagCommand,
-                kVK_Option | kVK_RightOption => CGEventFlags::CGEventFlagAlternate,
-                kVK_Control | kVK_RightControl => CGEventFlags::CGEventFlagControl,
-                kVK_Shift | kVK_RightShift => CGEventFlags::CGEventFlagShift,
-                _ => CGEventFlags::empty(),
-            };
-            if down {
-                self.active_modifiers |= flag;
-            } else {
-                self.active_modifiers &= !flag;
-            }
-        }
-
-        for spec in specs {
-            if let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), spec.vk.0, down) {
-                event.set_flags(self.active_modifiers);
-                event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
-                event.post(CGEventTapLocation::HID);
-            }
+        for (inserted, spec) in specs.iter().enumerate() {
+            let event = CGEvent::new_keyboard_event(self.source.clone(), spec.vk.0, down)
+                .map_err(|_| SendReport {
+                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                    expected: specs.len() as u32, inserted: inserted as u32,
+                    win32_error: 0, is_uipi_blocked: false,
+                })?;
+            if down { self.active_modifiers.insert(spec.vk.0); }
+            else { self.active_modifiers.remove(&spec.vk.0); }
+            // Carry the state at this event, not the final state of the batch.
+            // A sibling modifier (left/right) and physical modifiers remain set.
+            let physical = physical_down_set().read();
+            let flags = self.active_modifiers.iter().copied()
+                .chain(physical.iter().map(|key| *key as u16))
+                .fold(CGEventFlags::empty(), |flags, key| flags | modifier_flag(key));
+            drop(physical);
+            event.set_flags(flags);
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
+            event.post(CGEventTapLocation::HID);
         }
         Ok(())
+    }
+
+    fn relinquish_key(&mut self, spec: &KeySpec) {
+        self.active_modifiers.remove(&spec.vk.0);
     }
 
     fn send_mask(&mut self) -> Result<(), SendReport> {
@@ -431,6 +444,12 @@ impl InputInjector for MacosInjector {
 // =========================================================================
 // CoreGraphics Event Tap Global Listener
 // =========================================================================
+static TAP_PORT: AtomicUsize = AtomicUsize::new(0);
+extern "C" {
+    fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
+    fn CGEventSourceKeyState(state: CGEventSourceStateID, key: u16) -> bool;
+}
+
 static RUN_LOOP_REF: OnceLock<CFRunLoop> = OnceLock::new();
 
 pub fn stop_hook() {
@@ -467,6 +486,9 @@ pub fn hook_loop() {
         Ok(t) => t,
         Err(_) => {
             eprintln!("[MouseInsight] Failed to create CGEventTap. Please ensure Accessibility permissions are granted.");
+            if let Some(e) = ENGINE.get() {
+                *e.hook_status.write() = "无法监听鼠标。请在系统设置 → 隐私与安全性 → 辅助功能中授权 Mouse Insight，然后重新启动应用。".into();
+            }
             return;
         }
     };
@@ -475,19 +497,31 @@ pub fn hook_loop() {
         Ok(s) => s,
         Err(_) => {
             eprintln!("[MouseInsight] Failed to create runloop source for CGEventTap.");
+            if let Some(e) = ENGINE.get() { *e.hook_status.write() = "鼠标监听启动失败，请重启应用。".into(); }
             return;
         }
     };
 
     let current_rl = CFRunLoop::get_current();
     current_rl.add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+    TAP_PORT.store(tap.mach_port().as_concrete_TypeRef() as usize, Ordering::SeqCst);
     tap.enable();
+    if let Some(e) = ENGINE.get() { *e.hook_status.write() = "ready".into(); }
 
     let _ = RUN_LOOP_REF.set(current_rl);
     CFRunLoop::run_current();
+    TAP_PORT.store(0, Ordering::SeqCst);
 }
 
 fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
+    if matches!(etype, CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput) {
+        if let Some(eng) = ENGINE.get() {
+            let _ = eng.cmd_tx.send(InputCmd::EmergencyStop);
+        }
+        let port = TAP_PORT.load(Ordering::SeqCst);
+        if port != 0 { unsafe { CGEventTapEnable(port as *const _, true); } }
+        return CallbackResult::Keep;
+    }
     // 1. Ignore events injected by Mouse Insight
     let user_data = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA);
     if user_data == EXTRA_INFO as i64 {
@@ -506,15 +540,9 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
                 CGEventType::KeyDown => true,
                 CGEventType::KeyUp => false,
                 CGEventType::FlagsChanged => {
-                    let flags = event.get_flags();
-                    match keycode {
-                        kVK_Command | kVK_RightCommand => flags.contains(CGEventFlags::CGEventFlagCommand),
-                        kVK_Option | kVK_RightOption => flags.contains(CGEventFlags::CGEventFlagAlternate),
-                        kVK_Control | kVK_RightControl => flags.contains(CGEventFlags::CGEventFlagControl),
-                        kVK_Shift | kVK_RightShift => flags.contains(CGEventFlags::CGEventFlagShift),
-                        kVK_CapsLock => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
-                        _ => false,
-                    }
+                    // Aggregate flags cannot distinguish releasing one Shift
+                    // while the other Shift remains held.
+                    unsafe { CGEventSourceKeyState(CGEventSourceStateID::HIDSystemState, keycode) }
                 }
                 _ => false,
             };
@@ -531,6 +559,7 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
 
             // Recording mode handling
             if eng.recording.load(Ordering::Relaxed) {
+                if keycode == kVK_Tab { return CallbackResult::Keep; }
                 if down && keycode == kVK_Escape {
                     eng.recording.store(false, Ordering::Relaxed);
                     let _ = eng.cmd_tx.send(InputCmd::RecordCancel);
@@ -586,7 +615,8 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
         _ => return CallbackResult::Keep,
     };
 
-    if down && eng.listening.swap(false, Ordering::Relaxed) {
+    let captured = down && eng.listening.swap(false, Ordering::Relaxed);
+    if captured {
         let _ = eng
             .cmd_tx
             .send(InputCmd::ListenCaptured(button.as_str().to_string()));
@@ -595,23 +625,33 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
     let paused = eng.paused.load(Ordering::Relaxed);
     let compiled = eng.compiled.load_full();
     let action_opt = compiled.get(button).cloned();
-    let is_mapped = action_opt.is_some() && !paused;
-    let swallow = is_mapped && !button.is_primary();
+    let is_mapped = action_opt.is_some() && !paused && !captured && !eng.recording.load(Ordering::Relaxed);
+    let mut swallow = (is_mapped || captured) && !button.is_primary();
 
     if is_mapped {
-        let _ = eng.edge_tx.try_send(InputCmd::MouseEdge {
+        let queued = eng.enqueue_edge(InputCmd::MouseEdge {
             button,
             down,
             action: action_opt,
             generation: compiled.generation,
         });
+        swallow &= queued;
     } else if !down && !button.is_primary() {
-        let _ = eng.edge_tx.try_send(InputCmd::MouseEdge {
+        let _ = eng.enqueue_edge(InputCmd::MouseEdge {
             button,
             down: false,
             action: None,
             generation: compiled.generation,
         });
+    }
+
+    if !button.is_primary() && !button.is_wheel() {
+        let bit = 1u32 << button as u32;
+        if down && swallow {
+            eng.swallowed_buttons.fetch_or(bit, Ordering::Relaxed);
+        } else if !down {
+            swallow = eng.swallowed_buttons.fetch_and(!bit, Ordering::Relaxed) & bit != 0;
+        }
     }
 
     let need_telemetry =
@@ -681,5 +721,22 @@ mod tests {
         assert!(!is_modifier_keycode(kVK_Return));
         assert!(!is_modifier_keycode(kVK_ANSI_A));
     }
+    #[test]
+    fn right_option_round_trips_without_left_alias() {
+        let right = key_spec("RAlt").unwrap();
+        let left = key_spec("LAlt").unwrap();
+        assert_eq!(right.vk.0, kVK_RightOption);
+        assert_ne!(right.vk.0, left.vk.0);
+        assert_eq!(keycode_to_token(right.vk.0).as_deref(), Some("RAlt"));
+    }
+
+    #[test]
+    fn both_option_sides_share_flag_but_have_distinct_ownership() {
+        let mut held = HashSet::from([kVK_Option, kVK_RightOption]);
+        held.remove(&kVK_RightOption);
+        let flags = held.into_iter().fold(CGEventFlags::empty(), |f, key| f | modifier_flag(key));
+        assert!(flags.contains(CGEventFlags::CGEventFlagAlternate));
+    }
+
 }
 

@@ -517,6 +517,55 @@ await suite("7. codeToToken 键盘事件兜底映射", async () => {
 });
 
 // ============================================================================
+await suite("8. 映射编辑回归", async () => {
+  await test("重录右 Alt 后兼容 keys 不再保留旧左 Alt", () => {
+    const mapping = normalizeMapping({ id: "alt", button: "xbutton1", mode: "dual", keys: ["LAlt"], tap_keys: [], hold_keys: ["RAlt"] });
+    assert.deepEqual(mapping.keys, ["RAlt"]);
+    assert.deepEqual(normalizeMapping(mapping), mapping);
+  });
+  await test("清空 dual 两个槽位后不复活历史快捷键", () => {
+    const mapping = normalizeMapping({ id: "empty", button: "middle", mode: "dual", keys: ["Enter"], tap_keys: [], hold_keys: [] });
+    assert.deepEqual(mapping.keys, []);
+    assert.deepEqual(mapping.tap_keys, []);
+  });
+  await test("旧后端序列化的空槽位仍能迁移 hold", () => {
+    const mapping = normalizeMapping({ id: "legacy", button: "middle", mode: "hold", keys: ["RAlt"], tap_keys: [], hold_keys: [] });
+    assert.deepEqual(mapping.hold_keys, ["RAlt"]);
+  });
+  await test("未知鼠标键过滤、键名去空白", () => {
+    assert.deepEqual(sanitizeMappings([{ id: "bad", button: "unknown", mode: "click", keys: ["A"] }]), []);
+    assert.deepEqual(normalizeKeyChord([" RAlt ", "RAlt", " "]), ["RAlt"]);
+  });
+});
+
+await suite("9. 版本与网络回归", async () => {
+  const { isNewer, latestRelease } = await import("../src/updates.ts");
+  await test("稳定版高于同版本 beta、数字预发布标识按数值比较", () => {
+    assert.equal(isNewer("v0.2.0", "0.2.0-beta.3"), true);
+    assert.equal(isNewer("0.2.0-beta.10", "0.2.0-beta.9"), true);
+    assert.equal(isNewer("0.2.0-beta.3", "0.2.0"), false);
+    assert.equal(isNewer("0.2.0+build.2", "0.2.0+build.1"), false);
+    assert.equal(isNewer("invalid", "0.2.0"), false);
+  });
+  await test("失败可重试，并发请求合并且只缓存成功结果", async () => {
+    const original = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = async () => {
+      requests++;
+      if (requests === 1) throw new Error("offline");
+      return new Response(JSON.stringify({ tag_name: "v0.2.0", html_url: "https://untrusted.invalid" }));
+    };
+    try {
+      await assert.rejects(latestRelease(), /offline/);
+      const [a, b] = await Promise.all([latestRelease(), latestRelease()]);
+      assert.deepEqual(a, b);
+      assert.equal(a.url, "https://github.com/lingcang728/MouseInsight/releases/latest");
+      await latestRelease();
+      assert.equal(requests, 2);
+    } finally { globalThis.fetch = original; }
+  });
+});
+
 // 测试执行汇总汇报
 // ============================================================================
 console.log("\n------------------------------------------------------------");

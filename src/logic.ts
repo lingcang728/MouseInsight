@@ -150,8 +150,8 @@ export function normalizeKeyChord(keys: string[]): string[] {
   if (!keys || !Array.isArray(keys)) return [];
   const deduped: string[] = [];
   for (const k of keys) {
-    if (k && typeof k === "string" && k.trim().length > 0 && !deduped.includes(k)) {
-      deduped.push(k);
+    if (k && typeof k === "string" && k.trim().length > 0 && !deduped.includes(k.trim())) {
+      deduped.push(k.trim());
     }
   }
   deduped.sort((a, b) => {
@@ -283,23 +283,25 @@ export function getAllowedModesForButton(button: string): ("dual" | "toggle" | "
 }
 
 export function normalizeMapping(raw: Mapping): Mapping {
-  const keys = Array.isArray(raw.keys) ? [...raw.keys] : [];
-  const tap = Array.isArray(raw.tap_keys) ? [...raw.tap_keys] : [];
-  const hold = Array.isArray(raw.hold_keys) ? [...raw.hold_keys] : [];
+  const keys = normalizeKeyChord(raw.keys);
+  const tap = normalizeKeyChord(raw.tap_keys ?? []);
+  const hold = normalizeKeyChord(raw.hold_keys ?? []);
+  // Explicit slots are authoritative, including an intentionally empty slot.
+  const hasSlots = raw.mode === "dual" || tap.length > 0 || hold.length > 0;
   if (raw.button === "wheelup" || raw.button === "wheeldown") {
-    const t = tap.length ? tap : keys;
+    const t = hasSlots ? tap : keys;
     return { ...raw, mode: "click", keys: t, tap_keys: t, hold_keys: [] };
   }
   if (raw.mode === "toggle") {
     return { ...raw, mode: "toggle", keys, tap_keys: [], hold_keys: [] };
   }
-  if (!tap.length && !hold.length && keys.length) {
+  if (!hasSlots && keys.length) {
     if (raw.mode === "hold") {
       return { ...raw, mode: "dual", keys, tap_keys: [], hold_keys: keys };
     }
     return { ...raw, mode: "dual", keys, tap_keys: keys, hold_keys: [] };
   }
-  const nextKeys = keys.length ? keys : tap.length ? tap : hold;
+  const nextKeys = tap.length ? tap : hold;
   return { ...raw, mode: "dual", keys: nextKeys, tap_keys: tap, hold_keys: hold };
 }
 
@@ -311,7 +313,7 @@ export function sanitizeMappings(rawMappings: Mapping[]): Mapping[] {
   return (rawMappings ?? [])
     .filter((m) => {
       // 严禁映射左键与右键
-      if (m.button === "left" || m.button === "right") return false;
+      if (!m || !MAPPABLE_BUTTONS.some((button) => button === m.button)) return false;
       if (seenButtons.has(m.button)) return false;
       seenButtons.add(m.button);
       return true;

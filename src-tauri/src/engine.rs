@@ -25,7 +25,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
-    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MAPVK_VK_TO_VSC, MOD_NOREPEAT, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
     VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
     VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
@@ -252,7 +252,12 @@ pub fn compile_mappings(mappings: &[Mapping]) -> CompiledMappings {
 }
 
 fn specs_from_names(names: &[String]) -> Vec<KeySpec> {
-    names.iter().filter_map(|k| key_spec(k)).collect()
+    let mut specs = Vec::new();
+    for name in normalize_key_chord(names) {
+        let Some(spec) = key_spec(&name) else { return Vec::new(); };
+        if !specs.contains(&spec) { specs.push(spec); }
+    }
+    specs
 }
 
 pub fn compile_mappings_with_gen(mappings: &[Mapping], generation: u64) -> CompiledMappings {
@@ -297,7 +302,7 @@ pub fn compile_mappings_with_gen(mappings: &[Mapping], generation: u64) -> Compi
             } else {
                 let mut tap = specs_from_names(&tap_names);
                 let mut hold = specs_from_names(&hold_names);
-                if tap.is_empty() && hold.is_empty() {
+                if tap.is_empty() && hold.is_empty() && mode != TriggerMode::Dual {
                     let legacy = specs_from_names(&m.keys);
                     if mode == TriggerMode::Hold {
                         hold = legacy;
@@ -362,14 +367,14 @@ fn default_schema_version() -> u32 {
 }
 
 fn default_theme() -> String {
-    "dark".into()
+    "light".into()
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             schema_version: 1,
-            theme: "dark".into(),
+            theme: "light".into(),
             autostart: false,
             paused: false,
             mappings: Vec::new(),
@@ -443,6 +448,7 @@ pub trait InputInjector: Send + 'static {
     fn send_keys(&mut self, specs: &[KeySpec], down: bool) -> Result<(), SendReport>;
     fn send_mask(&mut self) -> Result<(), SendReport>;
     fn is_physical_down(&self, vk: VIRTUAL_KEY) -> bool;
+    fn relinquish_key(&mut self, _spec: &KeySpec) {}
 }
 
 #[cfg(target_os = "windows")]
@@ -700,6 +706,9 @@ impl<I: InputInjector> InputStateMachine<I> {
             if let Some(count) = self.key_refs.get_mut(s) {
                 if *count > 0 {
                     *count -= 1;
+                    if *count == 0 && self.injector.is_physical_down(s.vk) {
+                        self.injector.relinquish_key(s);
+                    }
                     if *count == 0 && !self.injector.is_physical_down(s.vk) {
                         to_release.push(*s);
                         if is_alt_or_win(s.vk) {
@@ -1014,17 +1023,7 @@ impl RecorderState {
         self.chip_modifiers.remove(token);
         self.physical_held
             .retain(|vk| vk_to_token(*vk).as_deref() != Some(token));
-        let mut current: Vec<String> = self
-            .physical_held
-            .iter()
-            .filter_map(|&code| vk_to_token(code))
-            .collect();
-        for c in &self.chip_modifiers {
-            if !current.contains(c) {
-                current.push(c.clone());
-            }
-        }
-        self.max_chord = normalize_key_chord(&current);
+        self.max_chord.retain(|key| key != token);
         self.last_emitted = self.max_chord.clone();
     }
 }
@@ -1079,9 +1078,11 @@ pub enum InputCmd {
 
 pub(crate) struct Engine {
     pub(crate) cfg: RwLock<AppConfig>,
+    pub(crate) hook_status: RwLock<String>,
     pub(crate) compiled: ArcSwap<CompiledMappings>,
     pub(crate) paused: AtomicBool,
     pub(crate) listening: AtomicBool,
+    pub(crate) swallowed_buttons: AtomicU32,
     pub(crate) recording: AtomicBool,
     pub(crate) window_visible: AtomicBool,
     pub(crate) last: RwLock<Option<Pulse>>,
@@ -1089,6 +1090,18 @@ pub(crate) struct Engine {
     pub(crate) edge_tx: Sender<InputCmd>,
     pub(crate) telem_tx: Sender<Pulse>,
     pub(crate) recorder: RwLock<RecorderState>,
+}
+
+impl Engine {
+    pub(crate) fn enqueue_edge(&self, edge: InputCmd) -> bool {
+        if self.edge_tx.try_send(edge).is_ok() { return true; }
+        // Never block a native hook or silently lose a key-up. Stop and release
+        // on the priority control channel, retaining the bounded edge queue.
+        if !self.paused.swap(true, Ordering::SeqCst) {
+            let _ = self.cmd_tx.send(InputCmd::EmergencyStop);
+        }
+        false
+    }
 }
 
 pub(crate) static ENGINE: OnceLock<Engine> = OnceLock::new();
@@ -1304,6 +1317,8 @@ pub fn xmbc_running() -> bool {
     }
 }
 
+pub fn hook_status() -> String { engine().hook_status.read().clone() }
+
 pub fn snapshot() -> Snapshot {
     let e = engine();
     Snapshot {
@@ -1317,49 +1332,64 @@ pub fn snapshot() -> Snapshot {
 }
 
 pub fn set_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
+    if mappings.len() > 5 { return Err("最多支持 5 个鼠标按键映射".into()); }
+    let mut buttons = HashSet::new();
+    let mut ids = HashSet::new();
+    for mapping in &mappings {
+        let button = MouseButton::from_str_fast(&mapping.button).ok_or("无法识别鼠标按键")?;
+        if button.is_primary() || !buttons.insert(button) || !ids.insert(&mapping.id) {
+            return Err("鼠标按键或映射编号重复，或尝试映射主键".into());
+        }
+        for chord in [&mapping.keys, &mapping.tap_keys, &mapping.hold_keys] {
+            if chord.len() > 16 || chord.iter().any(|key| key_spec(key).is_none()) {
+                return Err("组合键包含当前系统不支持的按键，或超过 16 键".into());
+            }
+        }
+    }
     let e = engine();
-    let gen = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    let compiled = Arc::new(compile_mappings_with_gen(&mappings, gen));
-    e.compiled.store(compiled);
-    let cfg = {
-        let mut w = e.cfg.write();
-        w.mappings = mappings;
-        w.clone()
-    };
-    let _ = e.cmd_tx.send(InputCmd::UpdateMappings { generation: gen });
-    save_config(&cfg)
+    let mut cfg = e.cfg.write();
+    let mut next = cfg.clone();
+    next.mappings = mappings;
+    save_config(&next)?;
+    let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    e.compiled.store(Arc::new(compile_mappings_with_gen(&next.mappings, generation)));
+    *cfg = next;
+    let _ = e.cmd_tx.send(InputCmd::UpdateMappings { generation });
+    Ok(())
 }
 
 pub fn set_theme(theme: String) -> Result<(), String> {
     let e = engine();
-    let cfg = {
-        let mut w = e.cfg.write();
-        w.theme = theme;
-        w.clone()
-    };
-    save_config(&cfg)
+    let mut cfg = e.cfg.write();
+    let mut next = cfg.clone();
+    next.theme = theme;
+    save_config(&next)?;
+    *cfg = next;
+    Ok(())
 }
 
 pub fn set_paused(paused: bool) -> Result<(), String> {
     let e = engine();
+    let mut cfg = e.cfg.write();
+    // Safety takes effect even when storage is unavailable.
     e.paused.store(paused, Ordering::SeqCst);
     let _ = e.cmd_tx.send(InputCmd::SetPaused(paused));
-    let cfg = {
-        let mut w = e.cfg.write();
-        w.paused = paused;
-        w.clone()
-    };
+    cfg.paused = paused;
     save_config(&cfg)
 }
 
 pub fn set_autostart_flag(on: bool) -> Result<(), String> {
     let e = engine();
-    let cfg = {
-        let mut w = e.cfg.write();
-        w.autostart = on;
-        w.clone()
-    };
-    save_config(&cfg)
+    let mut cfg = e.cfg.write();
+    let mut next = cfg.clone();
+    next.autostart = on;
+    save_config(&next)?;
+    *cfg = next;
+    Ok(())
+}
+
+pub fn disarm_listen() {
+    engine().listening.store(false, Ordering::Relaxed);
 }
 
 pub fn arm_listen() {
@@ -1369,7 +1399,9 @@ pub fn arm_listen() {
 pub fn arm_record() {
     let e = engine();
     e.recorder.write().reset();
+    e.listening.store(false, Ordering::Relaxed);
     e.recording.store(true, Ordering::Relaxed);
+    let _ = e.cmd_tx.send(InputCmd::ResetState(ResetReason::UserPause));
 }
 
 pub fn disarm_record() {
@@ -1380,6 +1412,7 @@ pub fn disarm_record() {
 
 pub fn add_record_key(key: String) {
     let e = engine();
+    if !e.recording.load(Ordering::Relaxed) || key_spec(&key).is_none() { return; }
     let chord = e.recorder.write().add_chip(key);
     if !chord.is_empty() {
         let _ = e.cmd_tx.send(InputCmd::Record(chord));
@@ -1459,9 +1492,11 @@ pub fn start(
     if ENGINE
         .set(Engine {
             cfg: RwLock::new(cfg),
+            hook_status: RwLock::new("starting".into()),
             compiled: ArcSwap::from_pointee(compiled),
             paused: AtomicBool::new(paused),
             listening: AtomicBool::new(false),
+            swallowed_buttons: AtomicU32::new(0),
             recording: AtomicBool::new(false),
             window_visible: AtomicBool::new(false),
             last: RwLock::new(None),
@@ -1535,6 +1570,10 @@ fn worker_loop<I: InputInjector>(
     on_binding_state: impl Fn(RuntimeBindingState) + Send + 'static,
 ) {
     let mut state_machine = InputStateMachine::new(injector);
+    if let Some(e) = ENGINE.get() {
+        state_machine.set_paused(e.paused.load(Ordering::SeqCst));
+        state_machine.update_config(e.compiled.load().generation);
+    }
     state_machine.set_callbacks(
         Some(Box::new(on_binding_state)),
         Some(Box::new(on_send_error)),
@@ -1556,7 +1595,7 @@ fn worker_loop<I: InputInjector>(
             None => Duration::MAX,
         };
 
-        let mut sel = crossbeam_channel::Select::new();
+        let mut sel = crossbeam_channel::Select::new_biased();
         let ctrl_idx = sel.recv(&ctrl_rx);
         let edge_idx = sel.recv(&edge_rx);
         let oper = if timeout == Duration::MAX {
@@ -1593,6 +1632,15 @@ fn worker_loop<I: InputInjector>(
                 action,
                 generation,
             } => {
+                if let Some(e) = ENGINE.get() {
+                    let current = e.compiled.load().generation;
+                    if current > state_machine.current_generation {
+                        state_machine.update_config(current);
+                    }
+                    if down && (e.paused.load(Ordering::SeqCst) || e.recording.load(Ordering::Relaxed)) {
+                        continue;
+                    }
+                }
                 state_machine.handle_mouse_edge(button, down, action, generation, now);
             }
             InputCmd::ResetState(reason) => {
@@ -1602,30 +1650,27 @@ fn worker_loop<I: InputInjector>(
                 }
             }
             InputCmd::EmergencyStop => {
-                let already = ENGINE
-                    .get()
-                    .map(|e| e.paused.swap(true, Ordering::SeqCst))
-                    .unwrap_or(false);
-                state_machine.emergency_stop();
-                if !already {
-                    if let Some(e) = ENGINE.get() {
-                        let cfg_clone = {
-                            let mut w = e.cfg.write();
-                            w.paused = true;
-                            w.clone()
-                        };
-                        thread::spawn(move || {
-                            let _ = save_config(&cfg_clone);
-                        });
-                    }
-                    on_emergency_pause(true);
+                if let Some(e) = ENGINE.get() {
+                    e.paused.store(true, Ordering::SeqCst);
                 }
+                state_machine.emergency_stop();
+                // Save the current config under its lock, never an old snapshot.
+                thread::spawn(|| {
+                    if let Some(e) = ENGINE.get() {
+                        let mut cfg = e.cfg.write();
+                        cfg.paused = e.paused.load(Ordering::SeqCst);
+                        let _ = save_config(&cfg);
+                    }
+                });
+                on_emergency_pause(true);
             }
             InputCmd::SetPaused(paused) => {
                 state_machine.set_paused(paused);
             }
             InputCmd::UpdateMappings { generation } => {
-                state_machine.update_config(generation);
+                if generation > state_machine.current_generation {
+                    state_machine.update_config(generation);
+                }
             }
             InputCmd::ListenCaptured(btn) => {
                 on_listen(btn);
@@ -1648,6 +1693,7 @@ fn hook_loop() {
             Ok(h) => h,
             Err(err) => {
                 eprintln!("[MouseInsight] SetWindowsHookEx WH_MOUSE_LL failed: {err}");
+                *engine().hook_status.write() = "鼠标监听启动失败，请退出冲突的鼠标软件后重新启动。".into();
                 return;
             }
         };
@@ -1671,6 +1717,9 @@ fn hook_loop() {
                 eprintln!("[MouseInsight] SetWindowsHookEx WH_KEYBOARD_LL failed: {err}");
                 None
             }
+        };
+        *engine().hook_status.write() = if kbd.is_some() { "ready".into() } else {
+            "键盘监听启动失败，无法可靠录制或保护物理修饰键，请重启应用。".into()
         };
         let mut msg = MSG::default();
         loop {
@@ -1708,6 +1757,16 @@ fn hook_loop() {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn sided_windows_vk(vk: u32, scan: u32, extended: bool) -> u32 {
+    match vk {
+        0x12 => if extended { 0xA5 } else { 0xA4 },
+        0x11 => if extended { 0xA3 } else { 0xA2 },
+        0x10 => if scan == 0x36 { 0xA1 } else { 0xA0 },
+        _ => vk,
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn is_injected_key(kb: &KBDLLHOOKSTRUCT) -> bool {
     kb.flags.0 & (LLKHF_INJECTED_KBD | LLKHF_LOWER_IL_INJECTED_KBD) != 0
@@ -1723,15 +1782,16 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     if is_injected_key(kb) {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
+    let key = sided_windows_vk(kb.vkCode, kb.scanCode, kb.flags.0 & 1 != 0);
     let msg = wparam.0 as u32;
     let down = kb.flags.0 & LLKHF_UP == 0 && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
 
     {
         let mut held = physical_down_set().write();
         if down {
-            held.insert(kb.vkCode);
+            held.insert(key);
         } else {
-            held.remove(&kb.vkCode);
+            held.remove(&key);
         }
     }
 
@@ -1742,7 +1802,11 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    if down && kb.vkCode == VK_ESCAPE.0 as u32 {
+    if key == VK_TAB.0 as u32 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    if down && key == VK_ESCAPE.0 as u32 {
         eng.recording.store(false, Ordering::Relaxed);
         let _ = eng.cmd_tx.send(InputCmd::RecordCancel);
         return LRESULT(1);
@@ -1751,13 +1815,13 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     let is_key_event =
         msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP;
     if is_key_event {
-        if vk_to_token(kb.vkCode).is_none() && !down {
+        if vk_to_token(key).is_none() && !down {
             return unsafe { CallNextHookEx(None, code, wparam, lparam) };
         }
-        if vk_to_token(kb.vkCode).is_none() {
+        if vk_to_token(key).is_none() {
             return unsafe { CallNextHookEx(None, code, wparam, lparam) };
         }
-        let chord = eng.recorder.write().on_key(kb.vkCode, down);
+        let chord = eng.recorder.write().on_key(key, down);
         if !chord.is_empty() {
             let _ = eng.cmd_tx.send(InputCmd::Record(chord));
         }
@@ -1855,7 +1919,8 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     };
 
-    if down && eng.listening.swap(false, Ordering::Relaxed) {
+    let captured = down && eng.listening.swap(false, Ordering::Relaxed);
+    if captured {
         let _ = eng
             .cmd_tx
             .send(InputCmd::ListenCaptured(button.as_str().to_string()));
@@ -1864,23 +1929,33 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     let paused = eng.paused.load(Ordering::Relaxed);
     let compiled = eng.compiled.load_full();
     let action_opt = compiled.get(button).cloned();
-    let is_mapped = action_opt.is_some() && !paused;
-    let swallow = is_mapped && !button.is_primary();
+    let is_mapped = action_opt.is_some() && !paused && !captured && !eng.recording.load(Ordering::Relaxed);
+    let mut swallow = (is_mapped || captured) && !button.is_primary();
 
     if is_mapped {
-        let _ = eng.edge_tx.try_send(InputCmd::MouseEdge {
+        let queued = eng.enqueue_edge(InputCmd::MouseEdge {
             button,
             down,
             action: action_opt,
             generation: compiled.generation,
         });
+        swallow &= queued;
     } else if !down && !button.is_primary() {
-        let _ = eng.edge_tx.try_send(InputCmd::MouseEdge {
+        let _ = eng.enqueue_edge(InputCmd::MouseEdge {
             button,
             down: false,
             action: None,
             generation: compiled.generation,
         });
+    }
+
+    if !button.is_primary() && !button.is_wheel() {
+        let bit = 1u32 << button as u32;
+        if down && swallow {
+            eng.swallowed_buttons.fetch_or(bit, Ordering::Relaxed);
+        } else if !down {
+            swallow = eng.swallowed_buttons.fetch_and(!bit, Ordering::Relaxed) & bit != 0;
+        }
     }
 
     let need_telemetry =
@@ -2058,7 +2133,16 @@ fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
 
 #[cfg(target_os = "windows")]
 fn make_input(spec: &KeySpec, down: bool) -> INPUT {
-    make_raw_input(spec.vk, spec.extended, down)
+    let mut input = make_raw_input(spec.vk, spec.extended, down);
+    // Side-specific modifiers use their physical scan code. Generic VK_MENU
+    // translation in target applications must not turn right Alt into left Alt.
+    if (0xA0..=0xA5).contains(&spec.vk.0) {
+        unsafe {
+            input.Anonymous.ki.dwFlags |= KEYEVENTF_SCANCODE;
+            input.Anonymous.ki.wVk = VIRTUAL_KEY(0);
+        }
+    }
+    input
 }
 
 #[cfg(target_os = "windows")]
@@ -3225,4 +3309,72 @@ mod tests {
             "macOS config dir should end with MouseInsight, got {text}"
         );
     }
+    #[test]
+    fn recorder_remove_retains_released_chord_keys() {
+        let mut recorder = RecorderState::default();
+        recorder.on_key(0xA3, true);
+        recorder.on_key(0xA5, true);
+        recorder.on_key(0xA3, false);
+        recorder.on_key(0xA5, false);
+        recorder.remove_token("RControl");
+        assert_eq!(recorder.max_chord, vec!["RAlt"]);
+    }
+
+    #[test]
+    fn generic_windows_modifiers_resolve_both_sides() {
+        assert_eq!(sided_windows_vk(0x12, 0x38, true), 0xA5);
+        assert_eq!(sided_windows_vk(0x12, 0x38, false), 0xA4);
+        assert_eq!(sided_windows_vk(0x11, 0x1D, true), 0xA3);
+        assert_eq!(sided_windows_vk(0x10, 0x36, false), 0xA1);
+        assert_eq!(sided_windows_vk(0xA5, 0x38, true), 0xA5);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn right_alt_injection_uses_extended_scan_code() {
+        let right = key_spec("RAlt").unwrap();
+        let left = key_spec("LAlt").unwrap();
+        for down in [true, false] {
+            let r = unsafe { make_input(&right, down).Anonymous.ki };
+            let l = unsafe { make_input(&left, down).Anonymous.ki };
+            assert_eq!(r.wVk.0, 0);
+            assert_eq!(r.wScan, 0x38);
+            assert!(r.dwFlags.contains(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY));
+            assert!(!l.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+            assert_eq!(r.dwFlags.contains(KEYEVENTF_KEYUP), !down);
+        }
+    }
+
+    #[test]
+    fn cleared_dual_does_not_compile_legacy_keys() {
+        let mapping = Mapping { id: "clear".into(), button: "middle".into(), mode: "dual".into(), keys: vec!["LAlt".into()], tap_keys: vec![], hold_keys: vec![], label: String::new() };
+        assert!(compile_mappings(&[mapping]).get(MouseButton::Middle).is_none());
+    }
+
+    #[test]
+    fn overflowing_edge_queue_pauses_once_and_schedules_release() {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (edge_tx, _edge_rx) = crossbeam_channel::bounded(1);
+        let (telem_tx, _telem_rx) = crossbeam_channel::bounded(1);
+        let engine = Engine {
+            hook_status: RwLock::new("starting".into()),
+            cfg: RwLock::new(AppConfig::default()), compiled: ArcSwap::from_pointee(compile_mappings(&[])),
+            paused: AtomicBool::new(false), listening: AtomicBool::new(false), swallowed_buttons: AtomicU32::new(0), recording: AtomicBool::new(false),
+            window_visible: AtomicBool::new(false), last: RwLock::new(None), cmd_tx, edge_tx, telem_tx,
+            recorder: RwLock::new(RecorderState::default()),
+        };
+        let edge = || InputCmd::MouseEdge { button: MouseButton::XButton1, down: false, action: None, generation: 1 };
+        assert!(engine.enqueue_edge(edge()));
+        assert!(!engine.enqueue_edge(edge()));
+        assert!(!engine.enqueue_edge(edge()));
+        assert!(engine.paused.load(Ordering::SeqCst));
+        assert!(matches!(cmd_rx.try_recv().unwrap(), InputCmd::EmergencyStop));
+        assert!(cmd_rx.try_recv().is_err());
+        let mut state = InputStateMachine::new(FakeInjector::new());
+        state.handle_mouse_edge(MouseButton::XButton1, true, Some(dummy_action("held", TriggerMode::Hold, &["RAlt"])), 1, Instant::now());
+        state.emergency_stop();
+        assert!(state.key_refs.is_empty());
+        assert!(state.is_paused());
+    }
+
 }
