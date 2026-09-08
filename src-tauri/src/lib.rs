@@ -16,35 +16,41 @@ struct TrayState {
 }
 
 #[tauri::command]
+fn get_hook_status() -> String { engine::hook_status() }
+
+#[tauri::command]
 fn get_snapshot() -> Snapshot {
     engine::snapshot()
 }
 
 #[tauri::command]
-fn save_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
-    engine::set_mappings(mappings)
+async fn save_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || engine::set_mappings(mappings)).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn save_theme(theme: String) -> Result<(), String> {
-    engine::set_theme(theme)
+async fn save_theme(theme: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || engine::set_theme(theme)).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn save_paused(app: tauri::AppHandle, paused: bool) -> Result<(), String> {
-    sync_engine_paused_state(&app, paused);
-    Ok(())
+async fn save_paused(app: tauri::AppHandle, paused: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || sync_engine_paused_state(&app, paused))
+        .await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn save_autostart(on: bool) -> Result<(), String> {
-    engine::set_autostart_flag(on)
+async fn save_autostart(on: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || engine::set_autostart_flag(on)).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 fn arm_listen() {
     engine::arm_listen();
 }
+
+#[tauri::command]
+fn disarm_listen() { engine::disarm_listen(); }
 
 #[tauri::command]
 fn arm_record() {
@@ -73,6 +79,10 @@ fn app_version() -> String {
 
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
+    if url != "https://github.com/lingcang728/MouseInsight/releases/latest"
+        && url != "https://github.com/lingcang728/MouseInsight/releases" {
+        return Err("Only Mouse Insight release pages can be opened".into());
+    }
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
@@ -136,8 +146,13 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-pub fn sync_engine_paused_state(app: &tauri::AppHandle, paused: bool) {
-    let _ = engine::set_paused(paused);
+pub fn sync_engine_paused_state(app: &tauri::AppHandle, paused: bool) -> Result<(), String> {
+    let result = engine::set_paused(paused);
+    sync_paused_ui(app, paused);
+    result
+}
+
+fn sync_paused_ui(app: &tauri::AppHandle, paused: bool) {
 
     if let Some(tray) = app.tray_by_id("main") {
         let tip = if paused {
@@ -259,13 +274,20 @@ pub fn run() {
         .on_window_event(|_window, event| match event {
             WindowEvent::CloseRequested { .. } => {
                 engine::disarm_record();
+                engine::disarm_listen();
                 engine::set_window_visible(false);
                 WINDOW_ACTIVE.store(false, Ordering::Relaxed);
             }
             WindowEvent::Destroyed => {
                 engine::disarm_record();
+                engine::disarm_listen();
                 engine::set_window_visible(false);
                 WINDOW_ACTIVE.store(false, Ordering::Relaxed);
+            }
+            WindowEvent::Focused(false) => {
+                engine::disarm_record();
+                engine::disarm_listen();
+                let _ = _window.emit("record-cancel", ());
             }
             _ => {}
         })
@@ -300,7 +322,7 @@ pub fn run() {
                     }
                 },
                 move |paused: bool| {
-                    sync_engine_paused_state(&handle_pause, paused);
+                    sync_paused_ui(&handle_pause, paused);
                 },
                 move |report: SendReport| {
                     if WINDOW_ACTIVE.load(Ordering::Relaxed) {
@@ -354,7 +376,7 @@ pub fn run() {
                     }
                     "toggle_pause" => {
                         let current_paused = engine::snapshot().config.paused;
-                        sync_engine_paused_state(app, !current_paused);
+                        let _ = sync_engine_paused_state(app, !current_paused);
                     }
                     "quit" => {
                         engine::shutdown();
@@ -385,11 +407,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_hook_status,
             save_mappings,
             save_theme,
             save_paused,
             save_autostart,
             arm_listen,
+            disarm_listen,
             arm_record,
             disarm_record,
             add_record_key,
