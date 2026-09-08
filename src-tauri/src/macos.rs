@@ -370,15 +370,30 @@ pub fn keycode_to_token(code: u16) -> Option<String> {
 // =========================================================================
 // MacosInjector: injects keyboard events via CoreGraphics
 // =========================================================================
+// NX_DEVICE* masks from IOLLEvent.h. Right Control is bit 13, not bit 7
+// (bit 7 is NX_NONCOALSESCEDMASK).
 fn modifier_flag(key: u16) -> CGEventFlags {
-    match key {
-        kVK_Command | kVK_RightCommand => CGEventFlags::CGEventFlagCommand,
-        kVK_Option | kVK_RightOption => CGEventFlags::CGEventFlagAlternate,
-        kVK_Control | kVK_RightControl => CGEventFlags::CGEventFlagControl,
-        kVK_Shift | kVK_RightShift => CGEventFlags::CGEventFlagShift,
-        kVK_CapsLock => CGEventFlags::CGEventFlagAlphaShift,
-        _ => CGEventFlags::empty(),
-    }
+    let (generic, device) = match key {
+        kVK_Command => (CGEventFlags::CGEventFlagCommand, 0x08),
+        kVK_RightCommand => (CGEventFlags::CGEventFlagCommand, 0x10),
+        kVK_Option => (CGEventFlags::CGEventFlagAlternate, 0x20),
+        kVK_RightOption => (CGEventFlags::CGEventFlagAlternate, 0x40),
+        kVK_Control => (CGEventFlags::CGEventFlagControl, 0x01),
+        kVK_RightControl => (CGEventFlags::CGEventFlagControl, 0x2000),
+        kVK_Shift => (CGEventFlags::CGEventFlagShift, 0x02),
+        kVK_RightShift => (CGEventFlags::CGEventFlagShift, 0x04),
+        kVK_CapsLock => (CGEventFlags::CGEventFlagAlphaShift, 0),
+        _ => return CGEventFlags::empty(),
+    };
+    generic | CGEventFlags::from_bits_retain(device)
+}
+
+extern "C" {
+    fn CGEventSourceFlagsState(state: CGEventSourceStateID) -> u64;
+}
+
+fn injected_flags(physical: CGEventFlags, held: &HashSet<u16>) -> CGEventFlags {
+    held.iter().fold(physical, |flags, key| flags | modifier_flag(*key))
 }
 
 pub struct MacosInjector {
@@ -415,12 +430,15 @@ impl InputInjector for MacosInjector {
             else { self.active_modifiers.remove(&spec.vk.0); }
             // Carry the state at this event, not the final state of the batch.
             // A sibling modifier (left/right) and physical modifiers remain set.
-            let physical = physical_down_set().read();
-            let flags = self.active_modifiers.iter().copied()
-                .chain(physical.iter().map(|key| *key as u16))
-                .fold(CGEventFlags::empty(), |flags, key| flags | modifier_flag(key));
-            drop(physical);
-            event.set_flags(flags);
+            // HID state excludes our synthetic keys and includes modifiers already
+            // held before startup, plus the actual Caps Lock state.
+            let physical = CGEventFlags::from_bits_retain(unsafe {
+                CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState)
+            });
+            event.set_flags(injected_flags(physical, &self.active_modifiers));
+            if is_modifier_keycode(spec.vk.0) {
+                event.set_type(CGEventType::FlagsChanged);
+            }
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
             event.post(CGEventTapLocation::HID);
         }
@@ -437,7 +455,8 @@ impl InputInjector for MacosInjector {
     }
 
     fn is_physical_down(&self, vk: VIRTUAL_KEY) -> bool {
-        physical_down_set().read().contains(&(vk.0 as u32))
+        // Include keys held before our event tap was installed.
+        unsafe { CGEventSourceKeyState(CGEventSourceStateID::HIDSystemState, vk.0) }
     }
 }
 
@@ -486,8 +505,8 @@ pub fn hook_loop() {
         Ok(t) => t,
         Err(_) => {
             eprintln!("[MouseInsight] Failed to create CGEventTap. Please ensure Accessibility permissions are granted.");
-            if let Some(e) = ENGINE.get() {
-                *e.hook_status.write() = "无法监听鼠标。请在系统设置 → 隐私与安全性 → 辅助功能中授权 Mouse Insight，然后重新启动应用。".into();
+            if ENGINE.get().is_some() {
+                crate::engine::set_hook_status("无法监听鼠标。请在系统设置 → 隐私与安全性 → 辅助功能中授权 Mouse Insight，然后重新启动应用。");
             }
             return;
         }
@@ -497,7 +516,7 @@ pub fn hook_loop() {
         Ok(s) => s,
         Err(_) => {
             eprintln!("[MouseInsight] Failed to create runloop source for CGEventTap.");
-            if let Some(e) = ENGINE.get() { *e.hook_status.write() = "鼠标监听启动失败，请重启应用。".into(); }
+            crate::engine::set_hook_status("鼠标监听启动失败，请重启应用。");
             return;
         }
     };
@@ -506,7 +525,7 @@ pub fn hook_loop() {
     current_rl.add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
     TAP_PORT.store(tap.mach_port().as_concrete_TypeRef() as usize, Ordering::SeqCst);
     tap.enable();
-    if let Some(e) = ENGINE.get() { *e.hook_status.write() = "ready".into(); }
+    crate::engine::set_hook_status("ready");
 
     let _ = RUN_LOOP_REF.set(current_rl);
     CFRunLoop::run_current();
@@ -736,6 +755,26 @@ mod tests {
         held.remove(&kVK_RightOption);
         let flags = held.into_iter().fold(CGEventFlags::empty(), |f, key| f | modifier_flag(key));
         assert!(flags.contains(CGEventFlags::CGEventFlagAlternate));
+    }
+
+    #[test]
+    fn injected_modifiers_preserve_sides_and_caps_lock() {
+        let pairs = [(kVK_Command, kVK_RightCommand, 0x08, 0x10),
+            (kVK_Option, kVK_RightOption, 0x20, 0x40),
+            (kVK_Control, kVK_RightControl, 0x01, 0x2000),
+            (kVK_Shift, kVK_RightShift, 0x02, 0x04)];
+        for (left, right, left_mask, right_mask) in pairs {
+            let mut held = HashSet::from([left, right]);
+            let both = injected_flags(CGEventFlags::CGEventFlagAlphaShift, &held);
+            assert_ne!(both.bits() & left_mask, 0);
+            assert_ne!(both.bits() & right_mask, 0);
+            held.remove(&right);
+            let released = injected_flags(CGEventFlags::CGEventFlagAlphaShift, &held);
+            assert_ne!(released.bits() & left_mask, 0);
+            assert_eq!(released.bits() & right_mask, 0);
+            assert!(released.contains(CGEventFlags::CGEventFlagAlphaShift));
+            assert_eq!(released.bits() & 0x80, 0);
+        }
     }
 
 }

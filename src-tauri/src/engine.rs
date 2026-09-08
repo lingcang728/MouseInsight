@@ -1328,6 +1328,27 @@ pub fn xmbc_running() -> bool {
 
 pub fn hook_status() -> String { engine().hook_status.read().clone() }
 
+// Menu reads must not enumerate processes or resolve filesystem paths.
+pub fn menu_summary() -> (bool, usize, String) {
+    let e = engine();
+    (e.paused.load(Ordering::SeqCst), e.cfg.read().mappings.len(), hook_status())
+}
+
+pub fn set_hook_status(status: impl Into<String>) {
+    *engine().hook_status.write() = status.into();
+    crate::native_menu::refresh();
+}
+
+pub fn toggle_paused() -> Result<(), String> {
+    let e = engine();
+    let mut cfg = e.cfg.write();
+    let paused = !e.paused.load(Ordering::SeqCst);
+    e.paused.store(paused, Ordering::SeqCst);
+    let _ = e.cmd_tx.send(InputCmd::SetPaused(paused));
+    cfg.paused = paused;
+    save_config(&cfg)
+}
+
 pub fn snapshot() -> Snapshot {
     let e = engine();
     Snapshot {
@@ -1675,6 +1696,7 @@ fn worker_loop<I: InputInjector>(
             }
             InputCmd::SetPaused(paused) => {
                 state_machine.set_paused(paused);
+                on_emergency_pause(paused);
             }
             InputCmd::UpdateMappings { generation } => {
                 if generation > state_machine.current_generation {
@@ -1702,7 +1724,7 @@ fn hook_loop() {
             Ok(h) => h,
             Err(err) => {
                 eprintln!("[MouseInsight] SetWindowsHookEx WH_MOUSE_LL failed: {err}");
-                *engine().hook_status.write() = "鼠标监听启动失败，请退出冲突的鼠标软件后重新启动。".into();
+                set_hook_status("鼠标监听启动失败，请退出冲突的鼠标软件后重新启动。");
                 return;
             }
         };
@@ -1727,9 +1749,9 @@ fn hook_loop() {
                 None
             }
         };
-        *engine().hook_status.write() = if kbd.is_some() { "ready".into() } else {
-            "键盘监听启动失败，无法可靠录制或保护物理修饰键，请重启应用。".into()
-        };
+        set_hook_status(if kbd.is_some() { "ready" } else {
+            "键盘监听启动失败，无法可靠录制或保护物理修饰键，请重启应用。"
+        });
         let mut msg = MSG::default();
         loop {
             let status = GetMessageW(&mut msg, None, 0, 0);
