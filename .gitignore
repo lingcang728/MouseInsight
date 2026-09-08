@@ -7,14 +7,5 @@ src-tauri/gen/
 .vscode/
 .idea/
 
-# Local build / user data next to the exe
-release/*.exe
-release/*.msi
-release/*.dmg
-release/*.app
-release/*.txt
-release/*.ico
-release/.portable
-release/*.bak
-release/*.tmp
-release/config.json
+# Local packages, metadata, portable configuration and WebView user data
+/release/

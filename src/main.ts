@@ -1016,7 +1016,7 @@ boot()
         void checkForUpdate(ver);
       });
     } catch {
-      $("app-version").textContent = "v0.2.0-beta.3";
+      $("app-version").textContent = "版本读取失败";
     }
   })
   .catch((err) => {

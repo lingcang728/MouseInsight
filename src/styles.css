@@ -9,10 +9,10 @@
 }
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: #1f2b2a; --bg-rail: #243330; --surface: #2a3936; --surface-2: #34463f;
-  --fg: #edf2e9; --fg-2: #c5d3c9; --muted: #a8bcb0; --border: #42554a;
-  --accent: #a8d9b9; --accent-on: #18352a; --accent-dot: #689e7c; --key-bg: #25332e;
-  --shadow: 0 8px 28px #10251b16;
+  --bg: #303740; --bg-rail: #353e49; --surface: #3d4753; --surface-2: #4a5665;
+  --fg: #f2f5fa; --fg-2: #d5deea; --muted: #b6c4d6; --border: #59697c;
+  --accent: #b8d6ff; --accent-on: #243449; --accent-dot: #91b8e5; --key-bg: #343e4a;
+  --shadow: 0 8px 28px #18233214;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }

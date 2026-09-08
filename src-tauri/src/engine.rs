@@ -1131,13 +1131,22 @@ pub fn set_window_visible(visible: bool) {
     }
 }
 
-pub fn is_portable_mode() -> bool {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
+fn portable_config_dir(exe_dir: &std::path::Path) -> Option<PathBuf> {
+    let data = exe_dir.join("data");
+    if data.join(".portable").is_file() {
+        Some(data)
+    } else if exe_dir.join(".portable").is_file() || exe_dir.join("portable").is_file() {
+        // Existing portable installations remain readable without moving files.
+        Some(exe_dir.to_path_buf())
+    } else {
+        None
+    }
+}
 
-    exe_dir.join(".portable").is_file() || exe_dir.join("portable").is_file()
+pub fn is_portable_mode() -> bool {
+    std::env::current_exe().ok()
+        .and_then(|exe| exe.parent().and_then(portable_config_dir))
+        .is_some()
 }
 
 pub fn config_dir() -> PathBuf {
@@ -1146,8 +1155,8 @@ pub fn config_dir() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    if is_portable_mode() {
-        return exe_dir;
+    if let Some(data) = portable_config_dir(&exe_dir) {
+        return data;
     }
 
     #[cfg(target_os = "windows")]
@@ -3375,6 +3384,20 @@ mod tests {
         state.emergency_stop();
         assert!(state.key_refs.is_empty());
         assert!(state.is_paused());
+    }
+
+    #[test]
+    fn portable_layout_prefers_data_and_preserves_legacy_support() {
+        let dir = std::env::temp_dir().join(format!("mi-portable-layout-{}-{}", std::process::id(), SAVE_SEQ.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir_all(dir.join("data")).unwrap();
+        assert!(portable_config_dir(&dir).is_none());
+        fs::write(dir.join(".portable"), "").unwrap();
+        assert_eq!(portable_config_dir(&dir), Some(dir.clone()));
+        fs::write(dir.join("data/.portable"), "").unwrap();
+        assert_eq!(portable_config_dir(&dir), Some(dir.join("data")));
+        fs::remove_file(dir.join(".portable")).unwrap();
+        assert_eq!(portable_config_dir(&dir), Some(dir.join("data")));
+        fs::remove_dir_all(dir).unwrap();
     }
 
 }
