@@ -18,6 +18,7 @@ args.output.mkdir(parents=True, exist_ok=True)
 with sync_playwright() as playwright:
     browser = playwright.chromium.connect_over_cdp(args.cdp)
     page = next(page for context in browser.contexts for page in context.pages if 'tauri' in page.url)
+    page.bring_to_front()
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))
     invoke = lambda command: page.evaluate("command => window.__TAURI_INTERNALS__.invoke(command)", command)
@@ -79,6 +80,9 @@ with sync_playwright() as playwright:
     assert page.evaluate("!!document.activeElement.closest('[role=dialog]')")
     page.keyboard.press('Escape')
     expect(page.get_by_role('dialog')).to_be_hidden()
+    if page.locator('html').get_attribute('data-theme') != 'light':
+        page.locator('#btn-theme').click()
+    expect(page.locator('html')).to_have_attribute('data-theme', 'light')
     page.locator('.stage').evaluate('(element) => element.scrollTop = 0')
     page.screenshot(path=str(args.output / 'light.png'))
     page.locator('#btn-theme').click()
