@@ -329,10 +329,23 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            let config_item =
+                MenuItem::with_id(app, "open_config", "打开配置目录", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(app)?;
+            let sep_after_config = PredefinedMenuItem::separator(app)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&show_item, &pause_item, &sep, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &show_item,
+                    &pause_item,
+                    &sep,
+                    &config_item,
+                    &sep_after_config,
+                    &quit_item,
+                ],
+            )?;
             app.manage(TrayState {
                 pause_item: pause_item.clone(),
             });
@@ -343,11 +356,17 @@ pub fn run() {
                 "Mouse Insight · 已启用"
             };
 
+            #[cfg(target_os = "macos")]
+            let show_menu_on_left_click = true;
+            #[cfg(not(target_os = "macos"))]
+            let show_menu_on_left_click = false;
+
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().cloned().unwrap())
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip(tooltip)
                 .menu(&menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(show_menu_on_left_click)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         show_main_window(app);
@@ -356,6 +375,9 @@ pub fn run() {
                         let current_paused = engine::snapshot().config.paused;
                         sync_engine_paused_state(app, !current_paused);
                     }
+                    "open_config" => {
+                        let _ = open_config_dir();
+                    }
                     "quit" => {
                         engine::shutdown();
                         app.exit(0);
@@ -363,11 +385,14 @@ pub fn run() {
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click {
+                    TrayIconEvent::DoubleClick {
                         button: MouseButton::Left,
                         ..
+                    } => {
+                        show_main_window(tray.app_handle());
                     }
-                    | TrayIconEvent::DoubleClick {
+                    #[cfg(not(target_os = "macos"))]
+                    TrayIconEvent::Click {
                         button: MouseButton::Left,
                         ..
                     } => {

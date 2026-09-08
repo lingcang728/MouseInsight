@@ -2,8 +2,8 @@
 #![allow(dead_code)]
 
 use crate::engine::{
-    physical_down_set, InputCmd, InputInjector, KeySpec, MouseButton, Pulse, SendReport,
-    VIRTUAL_KEY, ENGINE,
+    physical_down_set, InputCmd, InputInjector, KeySpec, MouseButton, Pulse, SendReport, ENGINE,
+    VIRTUAL_KEY,
 };
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
@@ -11,10 +11,11 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::CFString;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation,
-    CGEventTapOptions, CGEventTapPlacement, CGEventType, CallbackResult, EventField,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CallbackResult, EventField,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -129,7 +130,8 @@ pub const kVK_F12: u16 = 0x6F; // 111
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> bool;
+    fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef)
+        -> bool;
 }
 
 pub fn check_accessibility_permission() -> bool {
@@ -152,6 +154,69 @@ pub fn is_modifier_keycode(code: u16) -> bool {
             | kVK_RightShift
             | kVK_CapsLock
     )
+}
+
+// macOS carries two kinds of modifier bits in CGEventFlags:
+// - device-independent bits (Command / Shift / Option / Control), and
+// - NX_DEVICE*KEYMASK bits in the low byte, which preserve the left/right key.
+// Keeping only the first group makes a synthetic Right Option/Shift/Command
+// arrive at the target application as the corresponding left modifier.
+const DEVICE_MODIFIER_MASK: u64 = 0xFF;
+const GENERIC_MODIFIER_MASK: u64 = 0x0002_0000 | 0x0004_0000 | 0x0008_0000 | 0x0010_0000;
+
+#[derive(Clone, Copy)]
+struct ModifierInfo {
+    generic: CGEventFlags,
+    device: CGEventFlags,
+}
+
+fn modifier_info(code: u16) -> Option<ModifierInfo> {
+    let (generic, device) = match code {
+        kVK_Command => (CGEventFlags::CGEventFlagCommand, 0x08),
+        kVK_RightCommand => (CGEventFlags::CGEventFlagCommand, 0x10),
+        kVK_Shift => (CGEventFlags::CGEventFlagShift, 0x02),
+        kVK_RightShift => (CGEventFlags::CGEventFlagShift, 0x04),
+        kVK_Option => (CGEventFlags::CGEventFlagAlternate, 0x20),
+        kVK_RightOption => (CGEventFlags::CGEventFlagAlternate, 0x40),
+        kVK_Control => (CGEventFlags::CGEventFlagControl, 0x01),
+        kVK_RightControl => (CGEventFlags::CGEventFlagControl, 0x80),
+        kVK_CapsLock => (CGEventFlags::CGEventFlagAlphaShift, 0x00),
+        _ => return None,
+    };
+
+    Some(ModifierInfo {
+        generic,
+        device: CGEventFlags::from_bits_retain(device),
+    })
+}
+
+/// Determine the side-specific state of a flagsChanged event. The generic
+/// modifier bit is the fallback for synthetic/legacy events that do not carry
+/// NX_DEVICE*KEYMASK bits; physical macOS HID events normally carry them.
+fn modifier_is_down(code: u16, flags: CGEventFlags) -> bool {
+    let Some(info) = modifier_info(code) else {
+        return false;
+    };
+
+    if !info.device.is_empty() && flags.bits() & DEVICE_MODIFIER_MASK != 0 {
+        return flags.contains(info.device);
+    }
+    flags.contains(info.generic)
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceFlagsState(state_id: CGEventSourceStateID) -> CGEventFlags;
+}
+
+fn current_system_flags() -> CGEventFlags {
+    unsafe { CGEventSourceFlagsState(CGEventSourceStateID::CombinedSessionState) }
+}
+
+fn add_modifier_flags(flags: &mut CGEventFlags, code: u16) {
+    if let Some(info) = modifier_info(code) {
+        *flags = flags.union(info.generic).union(info.device);
+    }
 }
 
 // =========================================================================
@@ -370,7 +435,7 @@ pub fn keycode_to_token(code: u16) -> Option<String> {
 // MacosInjector: injects keyboard events via CoreGraphics
 // =========================================================================
 pub struct MacosInjector {
-    active_modifiers: CGEventFlags,
+    active_modifier_keys: HashSet<u16>,
     source: CGEventSource,
 }
 
@@ -379,9 +444,45 @@ unsafe impl Send for MacosInjector {}
 impl Default for MacosInjector {
     fn default() -> Self {
         Self {
-            active_modifiers: CGEventFlags::empty(),
+            active_modifier_keys: HashSet::new(),
             source: CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
                 .expect("Failed to create CGEventSource"),
+        }
+    }
+}
+
+impl MacosInjector {
+    /// Rebuild the known modifier portion from physical HID state and keys
+    /// currently held by Mouse Insight. The remaining system flags (for
+    /// example Caps Lock and keypad state) are preserved from CoreGraphics.
+    fn active_flags(&self) -> CGEventFlags {
+        let system = current_system_flags();
+        let mut flags = CGEventFlags::from_bits_retain(
+            system.bits() & !(GENERIC_MODIFIER_MASK | DEVICE_MODIFIER_MASK),
+        );
+
+        {
+            let physical = physical_down_set().read();
+            for code in physical.iter().copied() {
+                add_modifier_flags(&mut flags, code as u16);
+            }
+        }
+        for code in &self.active_modifier_keys {
+            add_modifier_flags(&mut flags, *code);
+        }
+        flags
+    }
+
+    fn post_key_event(&self, spec: &KeySpec, down: bool, flags: CGEventFlags) {
+        if let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), spec.vk.0, down) {
+            event.set_flags(flags);
+            if modifier_info(spec.vk.0).is_some() {
+                // Modifier keys are state transitions on macOS, not ordinary
+                // character keyDown/keyUp events.
+                event.set_type(CGEventType::FlagsChanged);
+            }
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
+            event.post(CGEventTapLocation::HID);
         }
     }
 }
@@ -392,27 +493,25 @@ impl InputInjector for MacosInjector {
             return Ok(());
         }
 
-        // Update active modifier flags
         for spec in specs {
-            let flag = match spec.vk.0 {
-                kVK_Command | kVK_RightCommand => CGEventFlags::CGEventFlagCommand,
-                kVK_Option | kVK_RightOption => CGEventFlags::CGEventFlagAlternate,
-                kVK_Control | kVK_RightControl => CGEventFlags::CGEventFlagControl,
-                kVK_Shift | kVK_RightShift => CGEventFlags::CGEventFlagShift,
-                _ => CGEventFlags::empty(),
-            };
+            let is_modifier = modifier_info(spec.vk.0).is_some();
             if down {
-                self.active_modifiers |= flag;
+                if is_modifier && !physical_down_set().read().contains(&(spec.vk.0 as u32)) {
+                    self.active_modifier_keys.insert(spec.vk.0);
+                }
+                // Process each key in order so a multi-modifier chord carries
+                // the correct state on every subsequent key event.
+                let flags = self.active_flags();
+                self.post_key_event(spec, true, flags);
             } else {
-                self.active_modifiers &= !flag;
-            }
-        }
-
-        for spec in specs {
-            if let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), spec.vk.0, down) {
-                event.set_flags(self.active_modifiers);
-                event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
-                event.post(CGEventTapLocation::HID);
+                // InputStateMachine supplies release keys in reverse order.
+                // Remove a modifier before its flagsChanged up event, while
+                // keeping modifiers held by the main key's keyUp event.
+                if is_modifier {
+                    self.active_modifier_keys.remove(&spec.vk.0);
+                }
+                let flags = self.active_flags();
+                self.post_key_event(spec, false, flags);
             }
         }
         Ok(())
@@ -460,9 +559,7 @@ pub fn hook_loop() {
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         events_of_interest,
-        |_proxy, etype, event| {
-            handle_cgevent(etype, event)
-        },
+        |_proxy, etype, event| handle_cgevent(etype, event),
     ) {
         Ok(t) => t,
         Err(_) => {
@@ -505,17 +602,7 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
             let down = match etype {
                 CGEventType::KeyDown => true,
                 CGEventType::KeyUp => false,
-                CGEventType::FlagsChanged => {
-                    let flags = event.get_flags();
-                    match keycode {
-                        kVK_Command | kVK_RightCommand => flags.contains(CGEventFlags::CGEventFlagCommand),
-                        kVK_Option | kVK_RightOption => flags.contains(CGEventFlags::CGEventFlagAlternate),
-                        kVK_Control | kVK_RightControl => flags.contains(CGEventFlags::CGEventFlagControl),
-                        kVK_Shift | kVK_RightShift => flags.contains(CGEventFlags::CGEventFlagShift),
-                        kVK_CapsLock => flags.contains(CGEventFlags::CGEventFlagAlphaShift),
-                        _ => false,
-                    }
-                }
+                CGEventType::FlagsChanged => modifier_is_down(keycode, event.get_flags()),
                 _ => false,
             };
 
@@ -574,7 +661,8 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
         CGEventType::RightMouseDown => (MouseButton::Right, true),
         CGEventType::RightMouseUp => (MouseButton::Right, false),
         CGEventType::ScrollWheel => {
-            let delta = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+            let delta =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
             if delta > 0 {
                 (MouseButton::WheelUp, true)
             } else if delta < 0 {
@@ -664,12 +752,44 @@ mod tests {
     #[test]
     fn test_macos_keycode_to_token() {
         assert_eq!(keycode_to_token(kVK_Command).as_deref(), Some("LWin"));
+        assert_eq!(keycode_to_token(kVK_RightCommand).as_deref(), Some("RWin"));
         assert_eq!(keycode_to_token(kVK_Option).as_deref(), Some("LAlt"));
+        assert_eq!(keycode_to_token(kVK_RightOption).as_deref(), Some("RAlt"));
         assert_eq!(keycode_to_token(kVK_Control).as_deref(), Some("LControl"));
+        assert_eq!(
+            keycode_to_token(kVK_RightControl).as_deref(),
+            Some("RControl")
+        );
         assert_eq!(keycode_to_token(kVK_Shift).as_deref(), Some("LShift"));
+        assert_eq!(keycode_to_token(kVK_RightShift).as_deref(), Some("RShift"));
         assert_eq!(keycode_to_token(kVK_Return).as_deref(), Some("Enter"));
         assert_eq!(keycode_to_token(kVK_Space).as_deref(), Some("Space"));
         assert_eq!(keycode_to_token(kVK_ANSI_A).as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn test_macos_modifier_device_bits_keep_left_and_right_distinct() {
+        let pairs = [
+            (kVK_Option, kVK_RightOption, 0x20, 0x40),
+            (kVK_Shift, kVK_RightShift, 0x02, 0x04),
+            (kVK_Command, kVK_RightCommand, 0x08, 0x10),
+        ];
+
+        for (left, right, left_device, right_device) in pairs {
+            assert_eq!(modifier_info(left).unwrap().device.bits(), left_device);
+            assert_eq!(modifier_info(right).unwrap().device.bits(), right_device);
+
+            let right_flags = modifier_info(right)
+                .unwrap()
+                .generic
+                .union(modifier_info(right).unwrap().device);
+            assert!(modifier_is_down(right, right_flags));
+            assert!(!modifier_is_down(left, right_flags));
+
+            let both_flags = right_flags.union(modifier_info(left).unwrap().device);
+            assert!(modifier_is_down(left, both_flags));
+            assert!(modifier_is_down(right, both_flags));
+        }
     }
 
     #[test]
@@ -682,4 +802,3 @@ mod tests {
         assert!(!is_modifier_keycode(kVK_ANSI_A));
     }
 }
-
