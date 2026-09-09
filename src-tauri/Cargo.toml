@@ -1,6 +1,6 @@
 [package]
 name = "mouse_insight"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 description = "Mouse Insight"
 authors = ["Linc"]
 edition = "2021"

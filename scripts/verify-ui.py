@@ -159,10 +159,14 @@ with sync_playwright() as playwright:
     page.wait_for_timeout(250)
     # CDP emulates the content viewport; native window dimensions are unchanged.
     cdp = page.context.new_cdp_session(page)
-    for width, height in [(1180, 760), (920, 620)]:
+    for width, height in [(1180, 760), (920, 620), (760, 700), (480, 760)]:
         cdp.send('Emulation.setDeviceMetricsOverride', {'width': width, 'height': height, 'deviceScaleFactor': 1, 'mobile': False})
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), f'Horizontal overflow at {width}'
         assert page.locator('.stage').evaluate('(element) => element.scrollWidth <= element.clientWidth'), f'Stage overflow at {width}'
+        nav = page.locator('.rail').bounding_box()
+        assert nav['x'] >= 0 and nav['x'] + nav['width'] <= width
+        expect(page.locator('#btn-theme')).to_be_visible()
+        expect(page.locator('#btn-pause')).to_be_visible()
     page.screenshot(path=str(args.output / 'compact.png'))
     cdp.send('Emulation.clearDeviceMetricsOverride')
     cdp.send('Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-reduced-motion', 'value': 'reduce'}]})
@@ -191,10 +195,51 @@ with sync_playwright() as playwright:
     assert_reset()
     page.locator('#deck-next').click()
     expect(page.locator('.map:visible')).not_to_have_attribute('data-id', start_id)
+    # Four-direction gestures cycle the same deck without changing saved mappings.
+    saved_before_gestures = invoke('get_snapshot')['config']['mappings']
+    for dx, dy in [(160, 0), (-160, 0), (0, 130), (0, -130)]:
+        grip = page.locator('.map:visible .card-grip')
+        grip.scroll_into_view_if_needed()
+        box = grip.bounding_box()
+        x, y = box['x'] + box['width'] / 2, box['y'] + 16
+        old_id = page.locator('.map:visible').get_attribute('data-id')
+        height = page.locator('#maps').bounding_box()['height']
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x + dx, y + dy, steps=10)
+        page.wait_for_timeout(40)
+        assert page.locator('.deck-preview').count() == 1
+        page.mouse.up()
+        expect(page.locator('.map:visible')).not_to_have_attribute('data-id', old_id)
+        assert_reset()
+        assert abs(page.locator('#maps').bounding_box()['height'] - height) < 1
+    assert invoke('get_snapshot')['config']['mappings'] == saved_before_gestures
+
+    # Compare the exact final preview frame with the real card: no select shrink.
+    page.locator('#deck-next').click()
+    geometry = page.evaluate('''() => {
+      const preview = document.querySelector('.deck-preview');
+      for (const a of document.getAnimations()) {
+        if (a.effect.target.closest('#maps')) {
+          a.pause(); a.currentTime = a.effect.getTiming().duration;
+        }
+      }
+      const geometry = [...preview.querySelectorAll('.map-primary-row > *')].map(el => {
+        const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height];
+      });
+      for (const a of document.getAnimations()) if (a.effect.target.closest('#maps')) a.finish();
+      return geometry;
+    }''')
+    page.wait_for_function('!document.querySelector(".deck-preview")')
+    settled = page.locator('.map:visible .map-primary-row > *').evaluate_all('(els) => els.map(el => { const r = el.getBoundingClientRect(); return [r.x,r.y,r.width,r.height]; })')
+    assert all(abs(a-b) < 1 for old, new in zip(geometry, settled) for a,b in zip(old,new)), (geometry, settled)
+    page.wait_for_timeout(500)
+    later = page.locator('.map:visible .map-primary-row > *').evaluate_all('(els) => els.map(el => { const r = el.getBoundingClientRect(); return [r.x,r.y,r.width,r.height]; })')
+    assert later == settled, (settled, later)
     page.locator('.stage').evaluate('(el) => el.scrollTop = 0')
     assert errors == [], errors
     after = invoke('get_snapshot')
     config = Path(after['config_dir']) / 'config.json'
     assert json.loads(config.read_text(encoding='utf-8'))['mappings'] == after['config']['mappings']
-    print(json.dumps({'result': 'passed', 'checks': ['native IPC recording/presets', 'right Alt roundtrip', 'cancel transaction', 'clear last key/reload', 'select identity', 'listen cancellation', 'dialog focus', 'light/dark', '1180/920 overflow', 'reduced motion', 'disk persistence', 'card collapse/navigation/swipe', 'double-click does not select or save', 'front/rear indicator order', 'mid-drag containment/blur', 'focus/capture/screenshot cancellation', 'short-drag return', 'three-card wraparound both directions', 'settle interruption recovery'], 'page_errors': errors}, ensure_ascii=False))
+    print(json.dumps({'result': 'passed', 'checks': ['native IPC recording/presets', 'right Alt roundtrip', 'cancel transaction', 'clear last key/reload', 'select identity', 'listen cancellation', 'dialog focus', 'light/dark', '1180/920/760/480 overflow and floating navigation', 'reduced motion', 'disk persistence', 'card collapse/navigation/swipe', 'double-click does not select or save', 'front/rear indicator order', 'mid-drag containment/blur', 'focus/capture/screenshot cancellation', 'short-drag return', 'three-card wraparound both directions', 'settle interruption recovery', 'four-direction swipe and stable deck height', 'preview/settled/delayed control geometry'], 'page_errors': errors}, ensure_ascii=False))
     browser.close()

@@ -11,21 +11,15 @@
   </head>
   <body>
     <div class="app">
-      <aside class="rail">
+      <header class="rail">
+        <a class="app-brand" href="#workspace" aria-label="Mouse Insight 首页"><img src="/favicon.png" alt="" /> <span>Mouse Insight</span></a>
         <nav aria-label="主导航">
           <a class="rail-link active" href="#workspace">鼠标映射</a>
           <a class="rail-link" href="#settings">偏好设置</a>
         </nav>
-        <div class="rail-spacer"></div>
         <button type="button" class="ghost" id="btn-pause">暂停映射</button>
         <button type="button" class="ghost" id="btn-theme">换成深色</button>
-        <button type="button" class="ghost danger-exit" id="btn-quit">退出</button>
-        <div class="rail-foot">
-          <span id="app-version" class="ver">v—</span>
-          <button type="button" class="ghost" id="btn-check-update">检查更新</button>
-          <p id="update-status" class="meta"></p>
-        </div>
-      </aside>
+      </header>
 
       <main class="stage" id="workspace">
         <header class="hero">
@@ -86,7 +80,7 @@
             <button data-add-button="wheelup">＋ 滚轮上</button>
             <button data-add-button="wheeldown">＋ 滚轮下</button>
           </div>
-          <div class="deck-controls"><span class="meta">拖动卡片顶部切换按键</span><button class="ghost" id="deck-prev" aria-label="上一个按键">上一张</button><button class="ghost" id="deck-next" aria-label="下一个按键">下一张</button></div>
+          <div class="deck-controls"><span class="meta">按住卡片顶部，向任意方向翻一张</span><button class="ghost" id="deck-prev" aria-label="上一个按键">上一张</button><button class="ghost" id="deck-next" aria-label="下一个按键">下一张</button></div>
           <div id="maps" class="maps"></div>
         </section>
       <aside class="dock" id="settings">
@@ -106,6 +100,12 @@
           </label>
           <p class="meta" id="cfg-mode-desc">配置保存在本机，点击下方路径打开</p>
           <button type="button" class="meta path" id="cfg-path"></button>
+          <div class="rail-foot">
+            <span id="app-version" class="ver">v—</span>
+            <button type="button" class="ghost" id="btn-check-update">检查更新</button>
+            <button type="button" class="ghost danger-exit" id="btn-quit">退出应用</button>
+            <p id="update-status" class="meta" role="status"></p>
+          </div>
         </div>
       </aside>
       </main>

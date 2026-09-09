@@ -1067,7 +1067,7 @@ boot()
     showAlert(`无法连接映射引擎，请重新打开控制面板：${String(err)}`);
   });
 
-type CardDrag = { x: number; lastX: number; lastTime: number; velocity: number; dx: number; id: number; grip: HTMLElement; card: HTMLElement };
+type CardDrag = { x: number; y: number; lastX: number; lastY: number; lastTime: number; velocity: number; dx: number; dy: number; id: number; grip: HTMLElement; card: HTMLElement };
 let drag: CardDrag | null = null;
 let deckBusy = false;
 let deckEpoch = 0;
@@ -1106,7 +1106,7 @@ function preparePreview(direction: number) {
   preview?.remove();
   previewTarget = target;
   preview = target.cloneNode(true) as HTMLElement;
-  preview.className = `deck-preview${target.classList.contains("collapsed") ? " collapsed" : ""}`;
+  preview.className = `deck-preview selected${target.classList.contains("collapsed") ? " collapsed" : ""}`;
   preview.removeAttribute("data-id");
   preview.removeAttribute("data-button");
   preview.inert = true;
@@ -1116,15 +1116,17 @@ function preparePreview(direction: number) {
 function paintDrag() {
   dragFrame = 0;
   if (!drag) return;
-  preparePreview(drag.dx >= 0 ? 1 : -1);
+  const vertical = Math.abs(drag.dy) > Math.abs(drag.dx);
+  preparePreview((vertical ? drag.dy : drag.dx) >= 0 ? 1 : -1);
   const width = $("maps").clientWidth;
-  const dx = Math.max(-width, Math.min(width, drag.dx));
-  const progress = Math.min(1, Math.abs(dx) / width);
-  drag.card.style.transform = `translateX(${dx}px) rotate(${dx / width * 3}deg)`;
-  drag.card.style.filter = reducedMotion.matches ? "none" : `blur(${progress * 2}px)`;
+  const dx = Math.max(-width * .45, Math.min(width * .45, drag.dx * .65));
+  const dy = Math.max(-130, Math.min(130, drag.dy * .65));
+  const progress = Math.min(1, Math.hypot(drag.dx, drag.dy) / 240);
+  drag.card.style.transform = `perspective(1000px) translate3d(${dx}px, ${dy}px, ${progress * 36}px) rotateX(${-dy / 26}deg) rotateY(${dx / 65}deg) rotate(${dx / width * 4}deg) scale(${1 + progress * .025})`;
+  drag.card.style.filter = reducedMotion.matches ? "none" : `blur(${progress * 3}px)`;
   if (preview) {
-    preview.style.transform = `translateY(${12 * (1 - progress)}px) scale(${.96 + .04 * progress})`;
-    preview.style.filter = reducedMotion.matches ? "none" : `blur(${4 * (1 - progress)}px)`;
+    preview.style.transform = `translate3d(${-dx * .08}px, ${18 * (1 - progress) - dy * .08}px, 0) scale(${.94 + .06 * progress})`;
+    preview.style.filter = reducedMotion.matches ? "none" : `blur(${5 * (1 - progress)}px)`;
     preview.style.opacity = String(.5 + .5 * progress);
   }
 }
@@ -1134,7 +1136,7 @@ async function animateDeck(el: HTMLElement, frames: Keyframe[], duration: number
   deckAnimations.add(animation);
   try { await animation.finished; } catch { /* Cancelled by blur, capture loss or a rerender. */ }
 }
-async function cycleCard(direction: number, fromDrag = false) {
+async function cycleCard(direction: number, fromDrag = false, vertical = false) {
   if (deckBusy || currentDraft) return;
   const host = $("maps");
   const first = host.querySelector<HTMLElement>(":scope > .map");
@@ -1149,12 +1151,14 @@ async function cycleCard(direction: number, fromDrag = false) {
   await Promise.all([
     animateDeck(first, [
       { transform, filter: first.style.filter || "blur(0px)", opacity: 1 },
-      { transform: `translateX(${direction * (host.clientWidth + 40)}px) rotate(${direction * 3}deg)`, filter: "blur(4px)", opacity: 0 }
-    ], 260),
+      { transform: `translate3d(${vertical ? 0 : direction * Math.min(260, host.clientWidth * .32)}px, ${vertical ? direction * 150 : -12}px, 0) rotate(${direction * 5}deg) scale(1.045)`, filter: "blur(6px)", opacity: .25, offset: .55 },
+      { transform: `translate3d(${vertical ? 0 : direction * 60}px, ${vertical ? direction * 45 : 20}px, 0) scale(.92)`, filter: "blur(9px)", opacity: 0 }
+    ], 420),
     ...(preview ? [animateDeck(preview, [
-      { transform: preview.style.transform || "translateY(12px) scale(.96)", filter: preview.style.filter || "blur(4px)", opacity: preview.style.opacity || .5 },
+      { transform: preview.style.transform || "translateY(18px) scale(.94)", filter: preview.style.filter || "blur(5px)", opacity: preview.style.opacity || .5 },
+      { transform: `translateY(-3px) scale(1.012)`, filter: "blur(0px)", opacity: 1, offset: .72 },
       { transform: "none", filter: "blur(0px)", opacity: 1 }
-    ], 260)] : [])
+    ], 420)] : [])
   ]);
   if (epoch !== deckEpoch) return;
   resetDeck();
@@ -1168,7 +1172,7 @@ $("maps").addEventListener("pointerdown", e => {
   if (!grip || e.button !== 0 || !e.isPrimary || deckBusy || mappings.length < 2) return;
   resetDeck();
   const card = grip.closest<HTMLElement>(".map")!;
-  drag = { x: e.clientX, lastX: e.clientX, lastTime: e.timeStamp, velocity: 0, dx: 0, id: e.pointerId, grip, card };
+  drag = { x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, lastTime: e.timeStamp, velocity: 0, dx: 0, dy: 0, id: e.pointerId, grip, card };
   grip.setPointerCapture(e.pointerId);
   $("maps").classList.add("deck-moving");
 });
@@ -1176,31 +1180,38 @@ $("maps").addEventListener("pointermove", e => {
   if (!drag || e.pointerId !== drag.id) return;
   if (!(e.buttons & 1)) { resetDeck(); return; }
   const elapsed = e.timeStamp - drag.lastTime;
-  if (elapsed > 0) drag.velocity = (e.clientX - drag.lastX) / elapsed;
+  if (elapsed > 0) drag.velocity = Math.hypot(e.clientX - drag.lastX, e.clientY - drag.lastY) / elapsed;
   drag.lastX = e.clientX;
+  drag.lastY = e.clientY;
   drag.lastTime = e.timeStamp;
   drag.dx = e.clientX - drag.x;
+  drag.dy = e.clientY - drag.y;
   if (!dragFrame) dragFrame = requestAnimationFrame(paintDrag);
 });
 $("maps").addEventListener("pointerup", e => {
   if (!drag || e.pointerId !== drag.id) return;
   cancelAnimationFrame(dragFrame);
   drag.dx = e.clientX - drag.x;
+  drag.dy = e.clientY - drag.y;
   paintDrag();
   const finished = drag;
   drag = null; // Clear before releasing capture: lostpointercapture must not cancel the settle.
   if (finished.grip.hasPointerCapture(e.pointerId)) finished.grip.releasePointerCapture(e.pointerId);
-  const distance = Math.abs(finished.dx);
+  const vertical = Math.abs(finished.dy) > Math.abs(finished.dx);
+  const distance = Math.hypot(finished.dx, finished.dy);
   const flick = e.timeStamp - finished.lastTime < 100 && Math.abs(finished.velocity) > .5 && distance > 25;
   if (distance >= Math.min(110, $("maps").clientWidth * .18) || flick) {
-    void cycleCard(finished.dx >= 0 ? 1 : -1, true);
+    void cycleCard((vertical ? finished.dy : finished.dx) >= 0 ? 1 : -1, true, vertical);
   } else {
     const epoch = deckEpoch;
     deckBusy = true;
-    void animateDeck(finished.card, [
+    void Promise.all([animateDeck(finished.card, [
       { transform: finished.card.style.transform, filter: finished.card.style.filter },
       { transform: "none", filter: "blur(0px)" }
-    ], 180).then(() => { if (epoch === deckEpoch) resetDeck(); });
+    ], 180), ...(preview ? [animateDeck(preview, [
+      { transform: preview.style.transform, filter: preview.style.filter, opacity: preview.style.opacity },
+      { transform: "translateY(18px) scale(.94)", filter: "blur(5px)", opacity: .5 }
+    ], 180)] : [])]).then(() => { if (epoch === deckEpoch) resetDeck(); });
   }
 });
 $("maps").addEventListener("pointercancel", resetDeck);
