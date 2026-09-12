@@ -83,6 +83,10 @@ const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const runtimeStates: Map<string, RuntimeState> = new Map();
 const pendingPulses = new Map<string, Pulse>();
 let pendingDown: Pulse | null = null;
+// Wheel pulses behave like a held button: same-direction ticks only refresh
+// wheelHoldTimer; the zone/ring UI is not re-triggered until it expires.
+let wheelHoldButton: string | null = null;
+let wheelHoldTimer = 0;
 let scrollSpyStarted = false;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -808,22 +812,39 @@ async function boot() {
 
   let feedbackTimer = 0;
   let pulseRaf = 0;
+  const isWheelButton = (button: string) => button === "wheelup" || button === "wheeldown";
+  const setPulseText = (id: string, text: string) => {
+    const el = $(id);
+    if (el.textContent !== text) el.textContent = text;
+  };
+  const releasePulseUi = () => {
+    highlightMouse("");
+    document.querySelectorAll(".map.live").forEach((el) => el.classList.remove("live"));
+  };
+  const clearWheelHold = () => {
+    wheelHoldButton = null;
+    clearTimeout(wheelHoldTimer);
+  };
   const applyPulse = (p: Pulse) => {
     if (listenGen && p.down && (p.button === "left" || p.button === "right")) {
       $("listen-copy").textContent = "左/右键仅用于识别，不支持映射。请按侧键、中键或滚轮。";
     }
-    $("pulse-name").textContent = BUTTON_LABEL[p.button] ?? p.button;
-    $("pulse-state").textContent = p.down
+    const wheel = isWheelButton(p.button);
+    const wheelHeld = wheel && wheelHoldButton === p.button;
+    setPulseText("pulse-name", BUTTON_LABEL[p.button] ?? p.button);
+    setPulseText("pulse-state", p.down
       ? p.swallowed
         ? "已拦截，改发快捷键"
         : "保留系统原操作"
-      : "松开";
-    $("pulse-ago").textContent = p.down ? "按下" : "松开";
-    highlightMouse(p.down ? p.button : "");
+      : "松开");
+    setPulseText("pulse-ago", p.down ? "按下" : "松开");
+    // While a same-direction wheel hold is active the zone is already lit —
+    // skipping this keeps .zone.on (and its CSS animation) from re-triggering.
+    if (!wheelHeld) highlightMouse(wheel || p.down ? p.button : "");
     paintDots(p.button);
 
     document.querySelectorAll(".map").forEach((el) => {
-      el.classList.toggle("live", (el as HTMLElement).dataset.button === p.button && p.down);
+      el.classList.toggle("live", (el as HTMLElement).dataset.button === p.button && (wheel || p.down));
     });
 
     if (p.down) {
@@ -850,21 +871,37 @@ async function boot() {
         pendingPulses.clear();
         if (pendingDown) {
           const pulse = pendingDown;
-          const host = document.querySelector<HTMLElement>(".pulse-sheet")!;
-          if (!reducedMotion.matches) {
-            host.getAnimations().forEach((animation) => animation.cancel());
-            const ring = document.querySelector<HTMLElement>(".signal-ring")!;
-            ring.getAnimations().forEach((animation) => animation.cancel());
-            ring.animate([{ transform: "scale(.7)", opacity: "var(--impact-opacity)" }, { transform: "scale(1.55)", opacity: 0 }], { duration: 480, easing: "cubic-bezier(.16,1,.3,1)" });
-            host.animate([{ transform: "scale(1)" }, { transform: "scale(1.012)" }, { transform: "scale(1)" }], { duration: 320, easing: "cubic-bezier(.2,.8,.2,1)" });
-          }
-          highlightMouse(pulse.button);
-          clearTimeout(feedbackTimer);
-          feedbackTimer = window.setTimeout(() => {
-            highlightMouse("");
-            document.querySelectorAll(".map.live").forEach((el) => el.classList.remove("live"));
-          }, 240);
           pendingDown = null;
+          const wheel = isWheelButton(pulse.button);
+          const continuingWheel = wheel && wheelHoldButton === pulse.button;
+          if (wheel) {
+            wheelHoldButton = pulse.button;
+            clearTimeout(feedbackTimer); // a pending release must not hide the held zone
+            clearTimeout(wheelHoldTimer);
+            wheelHoldTimer = window.setTimeout(() => {
+              wheelHoldButton = null;
+              releasePulseUi();
+            }, 250);
+          } else {
+            // A real button took over the highlight; cancel the wheel hold so
+            // its expiry can't wipe this button's zone a few frames later.
+            clearWheelHold();
+          }
+          if (!continuingWheel) {
+            const host = document.querySelector<HTMLElement>(".pulse-sheet")!;
+            if (!reducedMotion.matches) {
+              host.getAnimations().forEach((animation) => animation.cancel());
+              const ring = document.querySelector<HTMLElement>(".signal-ring")!;
+              ring.getAnimations().forEach((animation) => animation.cancel());
+              ring.animate([{ transform: "scale(.7)", opacity: "var(--impact-opacity)" }, { transform: "scale(1.55)", opacity: 0 }], { duration: 480, easing: "cubic-bezier(.16,1,.3,1)" });
+              host.animate([{ transform: "scale(1)" }, { transform: "scale(1.012)" }, { transform: "scale(1)" }], { duration: 320, easing: "cubic-bezier(.2,.8,.2,1)" });
+            }
+            highlightMouse(pulse.button);
+          }
+          if (!wheel) {
+            clearTimeout(feedbackTimer);
+            feedbackTimer = window.setTimeout(releasePulseUi, 240);
+          }
         }
       });
     })
@@ -1066,6 +1103,7 @@ async function boot() {
         document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach((el) => {
           el.classList.toggle("active", el.getAttribute("href") === hash);
         });
+        syncRailThumb();
       };
       const spy = new IntersectionObserver(
         (entries) => {
@@ -1089,7 +1127,28 @@ $("btn-theme").addEventListener("click", async () => {
   const previous = document.documentElement.dataset.theme || "light";
   const next = previous === "dark" ? "light" : "dark";
   button.disabled = true;
-  applyTheme(next);
+  const doApply = () => { applyTheme(next); };
+  if (reducedMotion.matches || !("startViewTransition" in document)) {
+    doApply();
+  } else {
+    // Shrink the old theme into a circle centered on the button, revealing the
+    // new one — reads as the new look radiating out of the toggle.
+    const r = button.getBoundingClientRect();
+    const x = r.left + r.width / 2;
+    const y = r.top + r.height / 2;
+    const radius = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
+    try {
+      const vt = (document as any).startViewTransition(doApply);
+      vt.ready.then(() => {
+        document.documentElement.animate(
+          { clipPath: [`circle(${radius}px at ${x}px ${y}px)`, `circle(0px at ${x}px ${y}px)`] },
+          { duration: 420, easing: "ease-in", pseudoElement: "::view-transition-old(root)" }
+        );
+      }).catch(() => {});
+    } catch {
+      doApply();
+    }
+  }
   try { await invokeT("save_theme", { theme: next }); }
   catch (err) { applyTheme(previous); showAlert(`主题保存失败：${String(err)}`, { kind: "save" }); }
   finally { button.disabled = false; }
@@ -1680,26 +1739,142 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     pendingPulses.clear();
     pendingDown = null;
+    wheelHoldButton = null;
+    clearTimeout(wheelHoldTimer);
     resetDeck();
   }
 });
 reducedMotion.addEventListener("change", resetDeck);
-document.querySelectorAll<HTMLAnchorElement>(".rail-link, .app-brand").forEach(link => {
+// --- Draggable liquid-glass rail thumb -------------------------------------
+// .rail-thumb is created in JS and positioned absolutely by CSS; it never
+// participates in the rail's flex layout and doesn't depend on .app-brand.
+const railEl = document.querySelector<HTMLElement>(".rail");
+let railThumb: HTMLElement | null = null;
+let railDrag: { id: number; startX: number; startLeft: number; min: number; max: number } | null = null;
+
+function railLinks(): HTMLElement[] {
+  return railEl ? [...railEl.querySelectorAll<HTMLElement>(".rail-link")] : [];
+}
+
+/** Link's left edge relative to .rail, walking offsetParents (nav may sit between). */
+function railLinkLeft(link: HTMLElement): number {
+  let left = link.offsetLeft;
+  let parent = link.offsetParent as HTMLElement | null;
+  while (parent && railEl && parent !== railEl) {
+    left += parent.offsetLeft;
+    parent = parent.offsetParent as HTMLElement | null;
+  }
+  return left;
+}
+
+function positionRailThumb() {
+  if (!railEl) return;
+  if (!railThumb) {
+    railThumb = document.createElement("div");
+    railThumb.className = "rail-thumb";
+    railThumb.setAttribute("aria-hidden", "true");
+    railThumb.style.opacity = "0"; // hidden until the first successful measure
+    railEl.prepend(railThumb);
+    bindRailThumbDrag(railThumb);
+  }
+  if (railDrag) return; // don't fight an in-progress drag
+  const link =
+    railEl.querySelector<HTMLElement>(".rail-link.active") ?? railLinks()[0];
+  if (!link) return;
+  railThumb.style.width = `${link.offsetWidth}px`;
+  railThumb.style.transform = `translateX(${railLinkLeft(link)}px)`;
+  railThumb.style.opacity = "1";
+}
+
+/** Single call site to keep the thumb under .rail-link.active. */
+function syncRailThumb() {
+  positionRailThumb();
+}
+
+function bindRailThumbDrag(thumb: HTMLElement) {
+  thumb.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || !e.isPrimary || !railEl) return;
+    const links = railLinks();
+    if (!links.length) return;
+    const minLeft = Math.min(...links.map(railLinkLeft));
+    const maxRight = Math.max(...links.map((l) => railLinkLeft(l) + l.offsetWidth));
+    const width = thumb.offsetWidth || links[0].offsetWidth;
+    const railRect = railEl.getBoundingClientRect();
+    railDrag = {
+      id: e.pointerId,
+      startX: e.clientX,
+      startLeft: thumb.getBoundingClientRect().left - railRect.left,
+      min: minLeft,
+      max: Math.max(minLeft, maxRight - width),
+    };
+    thumb.setPointerCapture(e.pointerId);
+    thumb.classList.add("dragging");
+    e.preventDefault();
+  });
+  thumb.addEventListener("pointermove", (e) => {
+    if (!railDrag || e.pointerId !== railDrag.id) return;
+    const left = Math.min(
+      railDrag.max,
+      Math.max(railDrag.min, railDrag.startLeft + e.clientX - railDrag.startX)
+    );
+    thumb.style.transform = `translateX(${left}px)`;
+  });
+  const endDrag = (e: PointerEvent, cancelled: boolean) => {
+    if (!railDrag || e.pointerId !== railDrag.id) return;
+    railDrag = null;
+    thumb.classList.remove("dragging");
+    if (cancelled || !railEl) {
+      positionRailThumb(); // snap back under the active link
+      return;
+    }
+    const links = railLinks();
+    if (!links.length) return;
+    const railRect = railEl.getBoundingClientRect();
+    const rect = thumb.getBoundingClientRect();
+    const center = rect.left - railRect.left + rect.width / 2;
+    const target =
+      links.find((l) => center >= railLinkLeft(l) && center <= railLinkLeft(l) + l.offsetWidth) ??
+      links.reduce((best, l) =>
+        Math.abs(railLinkLeft(l) + l.offsetWidth / 2 - center) <
+        Math.abs(railLinkLeft(best) + best.offsetWidth / 2 - center)
+          ? l
+          : best
+      );
+    // Reuse the link's click handler: smooth scroll + active + thumb sync.
+    target.click();
+    if (thumb.hasPointerCapture(e.pointerId)) thumb.releasePointerCapture(e.pointerId);
+  };
+  thumb.addEventListener("pointerup", (e) => endDrag(e, false));
+  thumb.addEventListener("pointercancel", (e) => endDrag(e, true));
+}
+
+if (railEl) {
+  positionRailThumb();
+  // Re-measure once fonts/layout settle so the first position is exact.
+  requestAnimationFrame(() => requestAnimationFrame(positionRailThumb));
+  document.fonts?.ready.then(positionRailThumb).catch(() => {});
+  window.addEventListener("resize", positionRailThumb);
+}
+
+document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach(link => {
   link.addEventListener("click", e => {
-    const toWorkspace = link.getAttribute("href") === "#workspace";
-    if (toWorkspace) {
+    const href = link.getAttribute("href");
+    if (href === "#workspace") {
       // #workspace is the .stage scroll container itself — the default anchor jump is a no-op.
       e.preventDefault();
       document.querySelector<HTMLElement>(".stage")?.scrollTo({
         top: 0,
         behavior: reducedMotion.matches ? "auto" : "smooth",
       });
+    } else if (href === "#settings") {
+      // scroll-margin on the dock supplies the breathing room.
+      e.preventDefault();
+      document.getElementById("settings")?.scrollIntoView({
+        behavior: reducedMotion.matches ? "auto" : "smooth",
+        block: "start",
+      });
     }
-    if (link.classList.contains("rail-link")) {
-      document.querySelectorAll(".rail-link").forEach(el => el.classList.toggle("active", el === link));
-    } else if (toWorkspace) {
-      document.querySelectorAll(".rail-link").forEach(el =>
-        el.classList.toggle("active", el.getAttribute("href") === "#workspace"));
-    }
+    document.querySelectorAll(".rail-link").forEach(el => el.classList.toggle("active", el === link));
+    syncRailThumb();
   });
 });
