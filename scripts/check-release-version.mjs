@@ -37,7 +37,11 @@ export function readVersions() {
   return { packageVersion, files };
 }
 
-export function main(rawArg = process.argv[2] || process.env.GITHUB_REF_NAME || "") {
+const ciTag = process.env.GITHUB_REF?.startsWith("refs/tags/")
+  ? process.env.GITHUB_REF_NAME
+  : "";
+
+export function main(rawArg = process.argv[2] || ciTag) {
   const { packageVersion, files } = readVersions();
   const mismatched = Object.entries(files).filter(([, version]) => version !== packageVersion);
   if (mismatched.length) {
