@@ -38,9 +38,13 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      # Lockfile lives in src-tauri/; rustsec/audit-check only scans ./Cargo.lock.
+      - name: Dependency audit
+        run: cargo audit --file src-tauri/Cargo.lock
 
       - name: Install frontend dependencies
         run: npm ci

@@ -660,14 +660,14 @@ pub fn hook_loop() {
 }
 
 fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
-    if etype == CGEventType::TapDisabledByUserInput {
+    if matches!(etype, CGEventType::TapDisabledByUserInput) {
         // The system or the user revoked the tap; re-enabling it would just be
         // disabled again. Surface it and let the user re-authorize + retry.
         crate::engine::set_hook_status("macOS 已禁用事件监听（权限被撤销或系统策略），请重新授权后点击「重试监听」");
         crate::engine::request_emergency_stop(false);
         return CallbackResult::Keep;
     }
-    if etype == CGEventType::TapDisabledByTimeout {
+    if matches!(etype, CGEventType::TapDisabledByTimeout) {
         crate::engine::request_emergency_stop(false);
         let port = TAP_PORT.load(Ordering::SeqCst);
         if port != 0 { unsafe { CGEventTapEnable(port as *const _, true); } }
