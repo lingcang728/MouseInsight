@@ -1140,9 +1140,10 @@ $("btn-theme").addEventListener("click", async () => {
     try {
       const vt = (document as any).startViewTransition(doApply);
       vt.ready.then(() => {
+        // The new theme grows outward as a circle centered on the button.
         document.documentElement.animate(
-          { clipPath: [`circle(${radius}px at ${x}px ${y}px)`, `circle(0px at ${x}px ${y}px)`] },
-          { duration: 420, easing: "ease-in", pseudoElement: "::view-transition-old(root)" }
+          { clipPath: [`circle(0px at ${x}px ${y}px)`, `circle(${radius}px at ${x}px ${y}px)`] },
+          { duration: 450, easing: "ease-out", pseudoElement: "::view-transition-new(root)" }
         );
       }).catch(() => {});
     } catch {
@@ -1791,9 +1792,17 @@ function syncRailThumb() {
   positionRailThumb();
 }
 
+// The thumb sits behind the links (z-index), so pointer events always land on
+// a .rail-link. Dragging therefore starts on the links themselves: beyond a 6px
+// threshold it becomes a thumb drag, otherwise the press stays a plain click.
+let railSuppressClick = false;
+
 function bindRailThumbDrag(thumb: HTMLElement) {
-  thumb.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0 || !e.isPrimary || !railEl) return;
+  if (!railEl) return;
+  let pending: { id: number; startX: number; link: HTMLElement } | null = null;
+
+  const startDrag = (e: PointerEvent) => {
+    if (!pending || !railEl) return;
     const links = railLinks();
     if (!links.length) return;
     const minLeft = Math.min(...links.map(railLinkLeft));
@@ -1801,17 +1810,27 @@ function bindRailThumbDrag(thumb: HTMLElement) {
     const width = thumb.offsetWidth || links[0].offsetWidth;
     const railRect = railEl.getBoundingClientRect();
     railDrag = {
-      id: e.pointerId,
-      startX: e.clientX,
+      id: pending.id,
+      startX: pending.startX,
       startLeft: thumb.getBoundingClientRect().left - railRect.left,
       min: minLeft,
       max: Math.max(minLeft, maxRight - width),
     };
-    thumb.setPointerCapture(e.pointerId);
+    pending = null;
     thumb.classList.add("dragging");
-    e.preventDefault();
+    railSuppressClick = true;
+  };
+
+  railEl.addEventListener("pointerdown", (e) => {
+    const link = (e.target as HTMLElement).closest<HTMLElement>(".rail-link");
+    if (!link || e.button !== 0 || !e.isPrimary) return;
+    pending = { id: e.pointerId, startX: e.clientX, link };
+    link.setPointerCapture(e.pointerId);
   });
-  thumb.addEventListener("pointermove", (e) => {
+  railEl.addEventListener("pointermove", (e) => {
+    if (pending && e.pointerId === pending.id && Math.abs(e.clientX - pending.startX) > 6) {
+      startDrag(e);
+    }
     if (!railDrag || e.pointerId !== railDrag.id) return;
     const left = Math.min(
       railDrag.max,
@@ -1820,6 +1839,7 @@ function bindRailThumbDrag(thumb: HTMLElement) {
     thumb.style.transform = `translateX(${left}px)`;
   });
   const endDrag = (e: PointerEvent, cancelled: boolean) => {
+    if (pending && e.pointerId === pending.id) pending = null;
     if (!railDrag || e.pointerId !== railDrag.id) return;
     railDrag = null;
     thumb.classList.remove("dragging");
@@ -1842,10 +1862,9 @@ function bindRailThumbDrag(thumb: HTMLElement) {
       );
     // Reuse the link's click handler: smooth scroll + active + thumb sync.
     target.click();
-    if (thumb.hasPointerCapture(e.pointerId)) thumb.releasePointerCapture(e.pointerId);
   };
-  thumb.addEventListener("pointerup", (e) => endDrag(e, false));
-  thumb.addEventListener("pointercancel", (e) => endDrag(e, true));
+  railEl.addEventListener("pointerup", (e) => endDrag(e, false));
+  railEl.addEventListener("pointercancel", (e) => endDrag(e, true));
 }
 
 if (railEl) {
@@ -1858,6 +1877,14 @@ if (railEl) {
 
 document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach(link => {
   link.addEventListener("click", e => {
+    // A finished thumb drag produces a synthetic-looking release click on the
+    // pressed link — swallow it; only programmatic target.click() (untrusted)
+    // is allowed through.
+    if (railSuppressClick && e.isTrusted) {
+      railSuppressClick = false;
+      e.preventDefault();
+      return;
+    }
     const href = link.getAttribute("href");
     if (href === "#workspace") {
       // #workspace is the .stage scroll container itself — the default anchor jump is a no-op.
