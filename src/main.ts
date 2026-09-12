@@ -83,6 +83,7 @@ const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const runtimeStates: Map<string, RuntimeState> = new Map();
 const pendingPulses = new Map<string, Pulse>();
 let pendingDown: Pulse | null = null;
+let scrollSpyStarted = false;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -212,19 +213,28 @@ function applyTheme(theme: string) {
 
 function flashPauseGlyph(paused: boolean) {
   if (reducedMotion.matches || document.hidden) return;
+  const btnRect = $("btn-pause").getBoundingClientRect();
+  const anchorX = `${btnRect.left + btnRect.width / 2}px`;
+  const anchorY = `${btnRect.top + btnRect.height / 2}px`;
   for (let i = 0; i < 2; i++) {
     const el = document.createElement("div");
     el.className = `pause-flash ${paused ? "is-pause" : "is-resume"}`;
     el.setAttribute("aria-hidden", "true");
+    // Anchor to #btn-pause center; kill the old inset:0 + margin:auto centering.
+    el.style.inset = "auto";
+    el.style.left = anchorX;
+    el.style.top = anchorY;
+    el.style.margin = "0";
+    el.style.transform = "translate(-50%,-50%)";
     el.innerHTML = paused
       ? '<svg viewBox="0 0 64 64" fill="currentColor"><rect x="18" y="12" width="10" height="40" rx="4"/><rect x="36" y="12" width="10" height="40" rx="4"/></svg>'
       : '<svg viewBox="0 0 64 64" fill="currentColor" stroke="currentColor" stroke-width="7" stroke-linejoin="round"><path d="M20 12 L50 32 L20 52 Z"/></svg>';
     document.body.appendChild(el);
     const animation = el.animate(
       [
-        { opacity: 0, transform: "scale(.85)", filter: "blur(0px)" },
-        { opacity: 1, transform: "scale(1)", filter: "blur(0px)", offset: 0.12 },
-        { opacity: 0, transform: "scale(1.9)", filter: "blur(18px)" },
+        { opacity: 0, transform: "translate(-50%,-50%) scale(.85)", filter: "blur(0px)" },
+        { opacity: 1, transform: "translate(-50%,-50%) scale(1)", filter: "blur(0px)", offset: 0.12 },
+        { opacity: 0, transform: "translate(-50%,-50%) scale(1.9)", filter: "blur(18px)" },
       ],
       { duration: 660, delay: i * 60, easing: "cubic-bezier(.22,.8,.3,1)", fill: "backwards" }
     );
@@ -991,7 +1001,7 @@ async function boot() {
 
   const modeTag = snap.is_portable ? "[便携模式] " : "[标准安装] ";
   const pathEl = $("cfg-path");
-  pathEl.textContent = `${modeTag}${snap.config_dir}`;
+  $("cfg-path-text").textContent = `${modeTag}${snap.config_dir}`;
   pathEl.title = isMac
     ? "点击在访达中定位配置目录"
     : "点击在文件资源管理器中定位配置目录";
@@ -1042,6 +1052,35 @@ async function boot() {
         },
       },
     });
+  }
+
+  // Scrollspy: light 偏好设置 while the settings dock is in view, 鼠标映射 otherwise.
+  // Threshold (not a rootMargin band) is used because the dock is the last child of
+  // .stage — it can never reach a mid-viewport band at max scroll.
+  if (!scrollSpyStarted) {
+    scrollSpyStarted = true;
+    const stageEl = document.querySelector<HTMLElement>(".stage");
+    const dockEl = document.getElementById("settings");
+    if (stageEl && dockEl) {
+      const setActiveRailLink = (hash: string) => {
+        document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach((el) => {
+          el.classList.toggle("active", el.getAttribute("href") === hash);
+        });
+      };
+      const spy = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (entry.target !== dockEl) continue;
+            // scrollTop guard: when everything fits without scrolling, keep 鼠标映射.
+            const inSettings =
+              entry.intersectionRatio >= 0.15 && stageEl.scrollTop > 8;
+            setActiveRailLink(inSettings ? "#settings" : "#workspace");
+          }
+        },
+        { root: stageEl, threshold: [0, 0.15] }
+      );
+      spy.observe(dockEl);
+    }
   }
 }
 
@@ -1441,6 +1480,7 @@ type CardDrag = { x: number; y: number; lastX: number; lastY: number; lastTime: 
 let drag: CardDrag | null = null;
 let deckBusy = false;
 let deckEpoch = 0;
+let queuedDir = 0;
 let dragFrame = 0;
 const deckAnimations = new Set<Animation>();
 let preview: HTMLElement | null = null;
@@ -1469,6 +1509,7 @@ function resetDeck() {
   mapsHost.style.removeProperty("--deck-p");
   mapsHost.classList.remove("deck-moving");
   deckBusy = false;
+  queuedDir = 0;
 }
 function nextCard(direction: number): HTMLElement | null {
   const cards = [...$("maps").querySelectorAll<HTMLElement>(":scope > .map")];
@@ -1515,7 +1556,11 @@ async function animateDeck(el: HTMLElement, frames: Keyframe[], duration: number
   try { await animation.finished; } catch { /* Cancelled by blur, capture loss or a rerender. */ }
 }
 async function cycleCard(direction: number, fromDrag = false, vertical = false) {
-  if (deckBusy || currentDraft) return;
+  if (currentDraft) return; // Recording keeps the old early-return; nothing is queued.
+  if (deckBusy) {
+    queuedDir = Math.sign(queuedDir + direction);
+    return;
+  }
   const host = $("maps");
   const first = host.querySelector<HTMLElement>(":scope > .map");
   const next = nextCard(direction);
@@ -1539,9 +1584,13 @@ async function cycleCard(direction: number, fromDrag = false, vertical = false) 
     ], 420)] : [])
   ]);
   if (epoch !== deckEpoch) return;
+  // Capture the queued direction before resetDeck wipes it, fire after the reorder.
+  const followUp = queuedDir;
+  queuedDir = 0;
   resetDeck();
   if (direction > 0) host.append(first); else host.prepend(next);
   selectMapping(next.dataset.id!);
+  if (followUp) void cycleCard(followUp);
 }
 function bindDeckButton(btn: HTMLElement, direction: number) {
   let delayTimer = 0;
@@ -1556,7 +1605,7 @@ function bindDeckButton(btn: HTMLElement, direction: number) {
     stopRepeat();
     void cycleCard(direction); // deckBusy inside cycleCard self-locks repeats
     delayTimer = window.setTimeout(() => {
-      repeatTimer = window.setInterval(() => { void cycleCard(direction); }, 300);
+      repeatTimer = window.setInterval(() => { void cycleCard(direction); }, 260);
     }, 450);
   });
   btn.addEventListener("pointerup", stopRepeat);
@@ -1610,10 +1659,16 @@ $("maps").addEventListener("pointerup", e => {
     void Promise.all([animateDeck(finished.card, [
       { transform: finished.card.style.transform, filter: finished.card.style.filter },
       { transform: "none", filter: "blur(0px)" }
-    ], 180), ...(preview ? [animateDeck(preview, [
+    ], 140), ...(preview ? [animateDeck(preview, [
       { transform: preview.style.transform, filter: preview.style.filter, opacity: preview.style.opacity },
       { transform: "translateY(18px) scale(.94)", filter: "blur(5px)", opacity: .5 }
-    ], 180)] : [])]).then(() => { if (epoch === deckEpoch) resetDeck(); });
+    ], 140)] : [])]).then(() => {
+      if (epoch !== deckEpoch) return;
+      const followUp = queuedDir;
+      queuedDir = 0;
+      resetDeck();
+      if (followUp) void cycleCard(followUp);
+    });
   }
 });
 $("maps").addEventListener("pointercancel", resetDeck);
