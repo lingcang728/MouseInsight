@@ -51,9 +51,38 @@ async fn save_autostart(on: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || engine::set_autostart_flag(on)).await.map_err(|e| e.to_string())?
 }
 
+/// "In foreground" means the foreground window shares our root ancestor.
+/// `Window::is_focused()` is unusable here: under WebView2 the keyboard focus
+/// lives on the webview child HWND, so the top-level window reports false even
+/// while it is visibly frontmost.
+fn window_in_foreground(window: &tauri::Window) -> bool {
+    if !window.is_visible().unwrap_or(false) {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetAncestor, GetForegroundWindow, GA_ROOT,
+        };
+        let Ok(hwnd) = window.hwnd() else { return false };
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground.0.is_null() {
+                return false;
+            }
+            GetAncestor(foreground, GA_ROOT) == GetAncestor(HWND(hwnd.0 as _), GA_ROOT)
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        window.is_focused().unwrap_or(false)
+    }
+}
+
 #[tauri::command]
 fn arm_listen(window: tauri::Window) -> Result<u64, String> {
-    if !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false) {
+    if !window_in_foreground(&window) {
         return Err("窗口不在前台，已取消".into());
     }
     Ok(engine::arm_listen())
@@ -64,7 +93,7 @@ fn disarm_listen() { engine::disarm_listen(); }
 
 #[tauri::command]
 fn arm_record(window: tauri::Window) -> Result<u64, String> {
-    if !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false) {
+    if !window_in_foreground(&window) {
         return Err("窗口不在前台，已取消".into());
     }
     Ok(engine::arm_record())
