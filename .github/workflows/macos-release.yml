@@ -213,6 +213,8 @@ jobs:
           echo "== stapler staple dmg =="
           xcrun stapler staple "$dmg"
           xcrun stapler validate "$dmg"
+          echo "== stapler staple app =="
+          xcrun stapler staple "${{ steps.bundle.outputs.APP_PATH }}"
           mkdir -p dist-macos
           cp "$dmg" "dist-macos/${{ steps.bundle.outputs.DMG_NAME }}"
           (

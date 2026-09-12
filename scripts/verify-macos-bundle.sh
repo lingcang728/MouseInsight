@@ -26,8 +26,9 @@ echo "== codesign --verify =="
 codesign --verify --strict --verbose=2 "$APP"
 
 echo "== public signing metadata =="
-codesign -dv --verbose=4 "$APP" 2>&1 | awk '/Authority|TeamIdentifier|^Identifier=|^Format=|^Runtime=|^Signature=|^Flags=/'
-codesign -dv "$APP" 2>&1 | grep -q "Developer ID Application" || {
+metadata=$(codesign -dv --verbose=4 "$APP" 2>&1)
+echo "$metadata" | awk '/Authority|TeamIdentifier|^Identifier=|^Format=|^Runtime=|^Signature=|^Flags=/'
+echo "$metadata" | grep -q "Authority=Developer ID Application:" || {
   echo "app is not signed with a Developer ID Application identity" >&2
   exit 1
 }
