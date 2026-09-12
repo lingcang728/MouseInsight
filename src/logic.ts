@@ -49,10 +49,10 @@ export const MODE_LABEL: Record<string, string> = {
 };
 
 export const MODE_DESC: Record<string, string> = {
-  hold: "按下立刻注入，松开立刻释放。",
-  click: "每按一下，完整触发一次快捷键",
-  dual: "短按与长按可以各绑一套键。只填长按 = 按住期间持续生效；只填短按 = 每按一下触发一次；两套都填 = 短按点触、按住超过 0.4 秒切换为长按。",
-  toggle: "按一次保持，再按一次释放",
+  hold: "按住生效 · 松开释放",
+  click: "每按一次触发一次",
+  dual: "短按触发一套 · 按住 0.4s 切换长按",
+  toggle: "按下开 · 再按关",
 };
 
 /** Modifier aliases → canonical token (left side for bare names). */

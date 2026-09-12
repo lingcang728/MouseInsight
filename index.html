@@ -58,7 +58,7 @@
                   </div>
                 </div>
               </div>
-              <div>
+              <div class="pulse-text">
                 <div id="pulse-name" class="pulse-name" aria-live="polite">等你按一下</div>
                 <div id="pulse-state" class="meta" aria-live="polite">按下鼠标按键，查看按键与映射状态</div>
                 <div class="dots" id="dots"></div>
@@ -85,7 +85,7 @@
             <button data-add-button="wheelup">＋ 滚轮上</button>
             <button data-add-button="wheeldown">＋ 滚轮下</button>
           </div>
-          <div class="deck-controls"><span class="meta">按住卡片顶部，向任意方向翻一张</span><span id="deck-index" class="meta"></span><button class="ghost" id="deck-prev" aria-label="上一张">上一张</button><button class="ghost" id="deck-next" aria-label="下一张">下一张</button></div>
+          <div class="deck-controls"><span class="meta">拖动卡片切换</span><span id="deck-index" class="meta"></span><button class="ghost" id="deck-prev" aria-label="上一张">上一张</button><button class="ghost" id="deck-next" aria-label="下一张">下一张</button></div>
           <div id="maps" class="maps"></div>
         </section>
       <aside class="dock" id="settings">
@@ -95,15 +95,13 @@
           <div class="keys" id="dock-keys">
             <span class="key dim">空</span>
           </div>
-          <p class="meta" id="dock-hint">键盘任意键都能录。Typeless 听写可录 Left Ctrl + Left Alt。</p>
         </div>
         <div class="sheet dock-card">
-          <div class="sheet-top"><span>偏好设置</span></div><p class="meta" id="safety-copy">左键与右键保留原操作。Pause 或 Scroll Lock 可紧急暂停映射。</p>
+          <div class="sheet-top"><span>偏好设置</span></div><p class="meta" id="safety-copy">左右键保留原操作 · Pause/Scroll Lock 急停</p>
           <label class="check">
             <input type="checkbox" id="chk-autostart" />
             开机自启
           </label>
-          <p class="meta" id="cfg-mode-desc">配置保存在本机，点击下方路径打开</p>
           <button type="button" class="meta path" id="cfg-path"></button>
           <div class="rail-foot">
             <span id="app-version" class="ver">读取中…</span>

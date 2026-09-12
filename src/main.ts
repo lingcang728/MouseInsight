@@ -210,7 +210,30 @@ function applyTheme(theme: string) {
   $("btn-theme").textContent = theme === "dark" ? "浅色外观" : "深色外观";
 }
 
+function flashPauseGlyph(paused: boolean) {
+  if (reducedMotion.matches || document.hidden) return;
+  for (let i = 0; i < 2; i++) {
+    const el = document.createElement("div");
+    el.className = `pause-flash ${paused ? "is-pause" : "is-resume"}`;
+    el.setAttribute("aria-hidden", "true");
+    el.innerHTML = paused
+      ? '<svg viewBox="0 0 64 64" fill="currentColor"><rect x="18" y="12" width="10" height="40" rx="4"/><rect x="36" y="12" width="10" height="40" rx="4"/></svg>'
+      : '<svg viewBox="0 0 64 64" fill="currentColor" stroke="currentColor" stroke-width="7" stroke-linejoin="round"><path d="M20 12 L50 32 L20 52 Z"/></svg>';
+    document.body.appendChild(el);
+    const animation = el.animate(
+      [
+        { opacity: 0, transform: "scale(.85)", filter: "blur(0px)" },
+        { opacity: 1, transform: "scale(1)", filter: "blur(0px)", offset: 0.12 },
+        { opacity: 0, transform: "scale(1.9)", filter: "blur(18px)" },
+      ],
+      { duration: 660, delay: i * 60, easing: "cubic-bezier(.22,.8,.3,1)", fill: "backwards" }
+    );
+    animation.finished.catch(() => {}).finally(() => el.remove());
+  }
+}
+
 function setPausedUi(paused: boolean) {
+  const changed = paused !== isPaused;
   isPaused = paused;
   if (hookReady) {
     $("engine-status").textContent = mappings.length === 0
@@ -223,6 +246,19 @@ function setPausedUi(paused: boolean) {
   if (paused) {
     runtimeStates.clear();
     updateAllRuntimePills();
+  }
+  if (changed) flashPauseGlyph(paused);
+}
+
+/** Write text into a meta element; play a small bump animation only when the value changed. */
+function bumpText(el: HTMLElement, text: string) {
+  if (el.textContent === text) return;
+  el.textContent = text;
+  if (!reducedMotion.matches) {
+    el.animate(
+      [{ transform: "translateY(4px)", opacity: 0.4 }, { transform: "none", opacity: 1 }],
+      { duration: 180, easing: "ease-out" }
+    );
   }
 }
 
@@ -307,10 +343,6 @@ function renderDock() {
   if (!selected) {
     $("dock-lead").textContent = "还没有绑定";
     renderKeys($("dock-keys"), []);
-    const hintEl = $("dock-hint");
-    if (hintEl) {
-      hintEl.textContent = "键盘任意键都能录。Typeless 听写可录 Left Ctrl + Left Alt。";
-    }
     return;
   }
   const mode = selected.button.startsWith("wheel") ? "click" : selected.mode === "toggle" ? "toggle" : "dual";
@@ -320,10 +352,6 @@ function renderDock() {
       ? selected.keys
       : (selected.tap_keys?.length ? selected.tap_keys : selected.hold_keys) ?? selected.keys;
   renderKeys($("dock-keys"), shown ?? []);
-  const hintEl = $("dock-hint");
-  if (hintEl) {
-    hintEl.textContent = MODE_DESC[mode] ?? MODE_DESC[selected.mode] ?? "";
-  }
 }
 
 function makeComboRow(
@@ -354,7 +382,7 @@ function renderMaps(liveButton?: string) {
   setPausedUi(isPaused);
   resetDeck();
   const host = $("maps");
-  $("mapping-count").textContent = `${mappings.length} / 5 已配置`;
+  bumpText($("mapping-count"), `${mappings.length} / 5 已配置`);
   document.querySelectorAll<HTMLButtonElement>("[data-add-button]").forEach((button) => {
     const existing = mappings.find((m) => m.button === button.dataset.addButton);
     button.textContent = `${existing ? "" : "＋ "}${BUTTON_LABEL[button.dataset.addButton!]}`;
@@ -439,7 +467,13 @@ function renderMaps(liveButton?: string) {
     article.classList.toggle("collapsed", collapsedMappings.has(m.id));
     const grip = document.createElement("div");
     grip.className = "card-grip";
-    grip.textContent = BUTTON_LABEL[m.button] + " · 拖动切换";
+    const gripText = document.createElement("span");
+    gripText.textContent = `${BUTTON_LABEL[m.button] ?? m.button} `;
+    const gripHint = document.createElement("span");
+    gripHint.className = "grip-hint";
+    gripHint.textContent = "· 拖动切换";
+    gripText.appendChild(gripHint);
+    grip.appendChild(gripText);
     article.append(grip);
     row.append(selButton, selMode, pill, collapse, btnDel);
     article.append(row);
@@ -472,7 +506,7 @@ function updateDeckIndex() {
   const el = $("deck-index");
   if (!el) return;
   const idx = mappings.findIndex((m) => m.id === selectedMappingId);
-  el.textContent = mappings.length && idx >= 0 ? `第 ${idx + 1} / ${mappings.length} 张` : "";
+  bumpText(el, mappings.length && idx >= 0 ? `第 ${idx + 1} / ${mappings.length} 张` : "");
 }
 
 function applyRemoteMappings(remote: Mapping[]) {
@@ -967,13 +1001,13 @@ async function boot() {
 
   const hotkeys = snap.emergency_hotkeys ?? 0;
   if (isMac) {
-    $("safety-copy").textContent = "左键与右键始终保留原操作。紧急暂停：F13 或 ⌃⌥⌘P；也可从菜单栏暂停。";
+    $("safety-copy").textContent = "左右键保留原操作 · 急停 F13 或 ⌃⌥⌘P";
     document.querySelector<HTMLButtonElement>('[data-key="LWin"]')!.textContent = "⌘ Command";
   } else if ((hotkeys & 1) === 0 && (hotkeys & 2) === 0) {
-    $("safety-copy").textContent = "左键与右键始终保留原操作。⚠ Pause/Scroll Lock 急停热键被其他程序占用，请从托盘暂停。";
+    $("safety-copy").textContent = "左右键保留原操作 · ⚠ 急停热键被占用，请从托盘暂停";
   } else if ((hotkeys & 1) === 0 || (hotkeys & 2) === 0) {
     const usable = (hotkeys & 1) !== 0 ? "Pause" : "Scroll Lock";
-    $("safety-copy").textContent = `左键与右键始终保留原操作。紧急暂停：${usable}；也可从托盘暂停。`;
+    $("safety-copy").textContent = `左右键保留原操作 · 急停 ${usable}`;
   }
   paintDots("");
   renderMaps();
@@ -1403,7 +1437,7 @@ function bootFailed(err: unknown) {
 
 void boot().catch(bootFailed);
 
-type CardDrag = { x: number; y: number; lastX: number; lastY: number; lastTime: number; velocity: number; dx: number; dy: number; id: number; grip: HTMLElement; card: HTMLElement };
+type CardDrag = { x: number; y: number; lastX: number; lastY: number; lastTime: number; velocity: number; dx: number; dy: number; id: number; captureEl: HTMLElement; card: HTMLElement };
 let drag: CardDrag | null = null;
 let deckBusy = false;
 let deckEpoch = 0;
@@ -1416,7 +1450,7 @@ function resetDeck() {
   ++deckEpoch;
   const previous = drag;
   drag = null;
-  if (previous?.grip.hasPointerCapture(previous.id)) previous.grip.releasePointerCapture(previous.id);
+  if (previous?.captureEl.hasPointerCapture(previous.id)) previous.captureEl.releasePointerCapture(previous.id);
   cancelAnimationFrame(dragFrame);
   dragFrame = 0;
   for (const animation of deckAnimations) animation.cancel();
@@ -1428,8 +1462,12 @@ function resetDeck() {
   });
   preview?.remove();
   preview = previewTarget = null;
-  $("maps").style.removeProperty("min-height");
-  $("maps").classList.remove("deck-moving");
+  const mapsHost = $("maps");
+  mapsHost.style.removeProperty("min-height");
+  mapsHost.style.removeProperty("--deck-dx");
+  mapsHost.style.removeProperty("--deck-dy");
+  mapsHost.style.removeProperty("--deck-p");
+  mapsHost.classList.remove("deck-moving");
   deckBusy = false;
 }
 function nextCard(direction: number): HTMLElement | null {
@@ -1454,10 +1492,14 @@ function paintDrag() {
   if (!drag) return;
   const vertical = Math.abs(drag.dy) > Math.abs(drag.dx);
   preparePreview((vertical ? drag.dy : drag.dx) >= 0 ? 1 : -1);
-  const width = $("maps").clientWidth;
+  const mapsHost = $("maps");
+  const width = mapsHost.clientWidth;
   const dx = Math.max(-width * .45, Math.min(width * .45, drag.dx * .65));
   const dy = Math.max(-130, Math.min(130, drag.dy * .65));
   const progress = Math.min(1, Math.hypot(drag.dx, drag.dy) / 240);
+  mapsHost.style.setProperty("--deck-dx", `${dx.toFixed(1)}px`);
+  mapsHost.style.setProperty("--deck-dy", `${dy.toFixed(1)}px`);
+  mapsHost.style.setProperty("--deck-p", progress.toFixed(3));
   drag.card.style.transform = `perspective(1000px) translate3d(${dx}px, ${dy}px, ${progress * 36}px) rotateX(${-dy / 26}deg) rotateY(${dx / 65}deg) rotate(${dx / width * 4}deg) scale(${1 + progress * .025})`;
   drag.card.style.filter = reducedMotion.matches ? "none" : `blur(${progress * 3}px)`;
   if (preview) {
@@ -1501,15 +1543,39 @@ async function cycleCard(direction: number, fromDrag = false, vertical = false) 
   if (direction > 0) host.append(first); else host.prepend(next);
   selectMapping(next.dataset.id!);
 }
-$("deck-prev").onclick = () => { void cycleCard(-1); };
-$("deck-next").onclick = () => { void cycleCard(1); };
+function bindDeckButton(btn: HTMLElement, direction: number) {
+  let delayTimer = 0;
+  let repeatTimer = 0;
+  const stopRepeat = () => {
+    window.clearTimeout(delayTimer);
+    window.clearInterval(repeatTimer);
+    delayTimer = repeatTimer = 0;
+  };
+  btn.addEventListener("pointerdown", e => {
+    if (e.button !== 0 || !e.isPrimary) return;
+    stopRepeat();
+    void cycleCard(direction); // deckBusy inside cycleCard self-locks repeats
+    delayTimer = window.setTimeout(() => {
+      repeatTimer = window.setInterval(() => { void cycleCard(direction); }, 300);
+    }, 450);
+  });
+  btn.addEventListener("pointerup", stopRepeat);
+  btn.addEventListener("pointerleave", stopRepeat);
+  btn.addEventListener("pointercancel", stopRepeat);
+  // Keyboard activation produces a click with detail === 0; pointerdown already handled mouse input.
+  btn.addEventListener("click", e => { if (e.detail === 0) void cycleCard(direction); });
+}
+bindDeckButton($("deck-prev"), -1);
+bindDeckButton($("deck-next"), 1);
 $("maps").addEventListener("pointerdown", e => {
-  const grip = (e.target as HTMLElement).closest<HTMLElement>(".card-grip");
-  if (!grip || e.button !== 0 || !e.isPrimary || deckBusy || mappings.length < 2) return;
+  if (e.button !== 0 || !e.isPrimary || deckBusy || mappings.length < 2) return;
+  const t = e.target as HTMLElement;
+  if (t.closest("button, select, input, a, .key, .chip, [contenteditable]")) return;
+  const card = t.closest<HTMLElement>(".map");
+  if (!card || card.parentElement !== $("maps")) return;
   resetDeck();
-  const card = grip.closest<HTMLElement>(".map")!;
-  drag = { x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, lastTime: e.timeStamp, velocity: 0, dx: 0, dy: 0, id: e.pointerId, grip, card };
-  grip.setPointerCapture(e.pointerId);
+  drag = { x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, lastTime: e.timeStamp, velocity: 0, dx: 0, dy: 0, id: e.pointerId, captureEl: card, card };
+  card.setPointerCapture(e.pointerId);
   $("maps").classList.add("deck-moving");
 });
 $("maps").addEventListener("pointermove", e => {
@@ -1532,7 +1598,7 @@ $("maps").addEventListener("pointerup", e => {
   paintDrag();
   const finished = drag;
   drag = null; // Clear before releasing capture: lostpointercapture must not cancel the settle.
-  if (finished.grip.hasPointerCapture(e.pointerId)) finished.grip.releasePointerCapture(e.pointerId);
+  if (finished.captureEl.hasPointerCapture(e.pointerId)) finished.captureEl.releasePointerCapture(e.pointerId);
   const vertical = Math.abs(finished.dy) > Math.abs(finished.dx);
   const distance = Math.hypot(finished.dx, finished.dy);
   const flick = e.timeStamp - finished.lastTime < 100 && Math.abs(finished.velocity) > .5 && distance > 25;
@@ -1563,8 +1629,22 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 reducedMotion.addEventListener("change", resetDeck);
-document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach(link => {
-  link.addEventListener("click", () => {
-    document.querySelectorAll(".rail-link").forEach(el => el.classList.toggle("active", el === link));
+document.querySelectorAll<HTMLAnchorElement>(".rail-link, .app-brand").forEach(link => {
+  link.addEventListener("click", e => {
+    const toWorkspace = link.getAttribute("href") === "#workspace";
+    if (toWorkspace) {
+      // #workspace is the .stage scroll container itself — the default anchor jump is a no-op.
+      e.preventDefault();
+      document.querySelector<HTMLElement>(".stage")?.scrollTo({
+        top: 0,
+        behavior: reducedMotion.matches ? "auto" : "smooth",
+      });
+    }
+    if (link.classList.contains("rail-link")) {
+      document.querySelectorAll(".rail-link").forEach(el => el.classList.toggle("active", el === link));
+    } else if (toWorkspace) {
+      document.querySelectorAll(".rail-link").forEach(el =>
+        el.classList.toggle("active", el.getAttribute("href") === "#workspace"));
+    }
   });
 });
