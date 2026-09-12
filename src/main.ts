@@ -1127,28 +1127,34 @@ $("btn-theme").addEventListener("click", async () => {
   const previous = document.documentElement.dataset.theme || "light";
   const next = previous === "dark" ? "light" : "dark";
   button.disabled = true;
-  const doApply = () => { applyTheme(next); };
-  if (reducedMotion.matches || !("startViewTransition" in document)) {
-    doApply();
-  } else {
-    // Shrink the old theme into a circle centered on the button, revealing the
-    // new one — reads as the new look radiating out of the toggle.
-    const r = button.getBoundingClientRect();
-    const x = r.left + r.width / 2;
-    const y = r.top + r.height / 2;
-    const radius = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
-    try {
-      const vt = (document as any).startViewTransition(doApply);
-      vt.ready.then(() => {
-        // The new theme grows outward as a circle centered on the button.
-        document.documentElement.animate(
-          { clipPath: [`circle(0px at ${x}px ${y}px)`, `circle(${radius}px at ${x}px ${y}px)`] },
-          { duration: 450, easing: "ease-out", pseudoElement: "::view-transition-new(root)" }
-        );
-      }).catch(() => {});
-    } catch {
-      doApply();
-    }
+  const oldBg = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#000";
+  const r = button.getBoundingClientRect();
+  const x = r.left + r.width / 2;
+  const y = r.top + r.height / 2;
+  const radius = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
+  applyTheme(next);
+  // New theme radiates outward from the button: an opaque overlay in the OLD
+  // background color gets a circular hole (mask) growing from the click point.
+  // Deliberately avoids View Transitions — WebView2 snapshots are janky here.
+  if (!reducedMotion.matches) {
+    const cover = document.createElement("div");
+    cover.setAttribute("aria-hidden", "true");
+    cover.style.cssText = `position:fixed;inset:0;z-index:2147483000;pointer-events:none;background:${oldBg};`;
+    document.body.appendChild(cover);
+    const DURATION = 420;
+    const t0 = performance.now();
+    const maskFor = (rad: number) =>
+      `radial-gradient(circle ${rad.toFixed(1)}px at ${x.toFixed(1)}px ${y.toFixed(1)}px, transparent ${rad.toFixed(1)}px, black ${(rad + 0.75).toFixed(1)}px)`;
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - t0) / DURATION);
+      const eased = 1 - Math.pow(1 - t, 3);
+      const mask = maskFor(radius * eased);
+      cover.style.maskImage = mask;
+      (cover.style as unknown as { webkitMaskImage: string }).webkitMaskImage = mask;
+      if (t < 1) requestAnimationFrame(tick);
+      else cover.remove();
+    };
+    requestAnimationFrame(tick);
   }
   try { await invokeT("save_theme", { theme: next }); }
   catch (err) { applyTheme(previous); showAlert(`主题保存失败：${String(err)}`, { kind: "save" }); }
@@ -1875,7 +1881,11 @@ if (railEl) {
   window.addEventListener("resize", positionRailThumb);
 }
 
+// Anchors are natively draggable — the browser's HTML5 drag shows the
+// not-allowed cursor and steals our pointer flow. Kill it.
+railEl?.addEventListener("dragstart", e => e.preventDefault());
 document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach(link => {
+  link.draggable = false;
   link.addEventListener("click", e => {
     // A finished thumb drag produces a synthetic-looking release click on the
     // pressed link — swallow it; only programmatic target.click() (untrusted)
