@@ -37,6 +37,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install frontend dependencies
         run: npm ci
 
@@ -47,7 +51,7 @@ jobs:
         run: node tests/frontend_logic.test.mjs
 
       - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Frontend production build
         run: npm run build
@@ -79,6 +83,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
 
       - name: Install frontend dependencies
         run: npm ci
@@ -252,16 +260,17 @@ jobs:
 
       - name: Scrub signing material
         if: always()
+        continue-on-error: true
         shell: bash
         run: |
-          set +e
+          set -u
           if [[ -n ${KEYCHAIN_PATH:-} ]]; then
-            password=$(cat "$RUNNER_TEMP/keychain.password" 2>/dev/null)
+            password=$(cat "$RUNNER_TEMP/keychain.password" 2>/dev/null || true)
             if [[ -n $password ]]; then
-              security lock-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1
-              security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1
+              security lock-keychain "$KEYCHAIN_PATH" || true
+              security delete-keychain "$KEYCHAIN_PATH" || true
             else
-              security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1
+              security delete-keychain "$KEYCHAIN_PATH" || true
             fi
           fi
           rm -f "$RUNNER_TEMP/certificate.p12"
@@ -270,4 +279,3 @@ jobs:
           if [[ -n ${APPLE_API_KEY_PATH:-} ]]; then
             rm -f "$APPLE_API_KEY_PATH"
           fi
-          exit 0

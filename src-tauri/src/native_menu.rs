@@ -1,11 +1,15 @@
 //! Native menus only: no extra window, WebView, polling timer or UI thread I/O.
 use crate::{engine, show_main_window};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Emitter};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
+// The paused state the menu displayed at last refresh; menu clicks act on
+// this, never on a possibly-newer engine state.
+static MENU_SHOWN_PAUSED: AtomicBool = AtomicBool::new(false);
 
 struct MenuState {
     status: MenuItem<tauri::Wry>,
@@ -39,11 +43,24 @@ pub fn refresh() {
             return;
         };
         let (paused, count, hook) = engine::menu_summary();
+        MENU_SHOWN_PAUSED.store(paused, Ordering::Relaxed);
         let text = status_text(paused, count, &hook);
         let mappings = engine::menu_mappings();
         for (button, slot, submenu) in &state.slots {
             let mapping = mappings.iter().find(|m| &m.button == button);
-            let keys = mapping.map(|m| if slot == "hold" { &m.hold_keys } else { &m.tap_keys });
+            // Legacy configs only filled `keys`; fall back to it for the
+            // slot it represented so the menu never shows a stale "未设置".
+            let keys: Option<&[String]> = mapping.map(|m| {
+                if slot == "hold" {
+                    if !m.hold_keys.is_empty() { m.hold_keys.as_slice() }
+                    else if m.mode == "hold" { m.keys.as_slice() }
+                    else { &[] }
+                } else {
+                    if !m.tap_keys.is_empty() { m.tap_keys.as_slice() }
+                    else if m.mode != "hold" { m.keys.as_slice() }
+                    else { &[] }
+                }
+            });
             let chord = keys.filter(|keys| !keys.is_empty()).map(|keys| keys.join(" + ")).unwrap_or_else(|| "未设置".into());
             let label = if button.starts_with("wheel") { "滚动" } else if slot == "hold" { "长按" } else { "短按" };
             let _ = submenu.set_text(format!("{label} · {chord}"));
@@ -63,14 +80,16 @@ pub fn refresh() {
 
 fn report_error(app: &AppHandle, result: Result<(), String>) {
     if let Some(state) = app.try_state::<MenuState>() {
-        let _ = state.error.set_text(if result.is_err() {
-            "操作失败 · 请在工作台检查设置"
-        } else {
-            "所有配置仅保存在本机"
+        let _ = state.error.set_text(match &result {
+            Err(err) => {
+                let short: String = err.chars().take(40).collect();
+                format!("操作失败 · {short}")
+            }
+            Ok(()) => "所有配置仅保存在本机".to_string(),
         });
     }
     if let Err(err) = result {
-        eprintln!("[MouseInsight] menu action: {err}");
+        log::warn!("menu action failed: {err}");
     }
 }
 
@@ -81,7 +100,7 @@ pub fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let result = engine::set_quick_mapping(&parts[0], &parts[1], &parts[2]);
-                if result.is_ok() { let _ = app.emit("mappings-changed", ()); }
+                if result.is_ok() { let _ = app.emit("mappings-changed", engine::menu_mappings()); }
                 refresh();
                 let handle = app.clone();
                 let _ = app.run_on_main_thread(move || report_error(&handle, result));
@@ -93,22 +112,21 @@ pub fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         "show" => show_main_window(app),
         "quit" => {
             let handle = app.clone();
-            tauri::async_runtime::spawn_blocking(move || crate::quit_app(handle));
+            tauri::async_runtime::spawn(async move { crate::quit_app(handle).await });
         }
-        "toggle_pause" | "open_config" | "accessibility" | "releases" => {
+        "toggle_pause" | "open_config" | "open_logs" | "accessibility" | "releases" => {
             let app = app.clone();
             // Persistence and launching Finder/Explorer must never stall menu tracking.
             tauri::async_runtime::spawn_blocking(move || {
                 let result = match event.id.as_ref() {
-                    "toggle_pause" => engine::toggle_paused(),
+                    "toggle_pause" => {
+                        engine::toggle_paused_from(MENU_SHOWN_PAUSED.load(Ordering::Relaxed))
+                    }
                     "open_config" => crate::open_config_dir(),
+                    "open_logs" => crate::open_logs_dir(),
                     "releases" => crate::open_url("https://github.com/lingcang728/MouseInsight/releases/latest".into()),
                     #[cfg(target_os = "macos")]
-                    "accessibility" => std::process::Command::new("/usr/bin/open")
-                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                        .status().map_err(|e| e.to_string()).and_then(|s| {
-                            if s.success() { Ok(()) } else { Err("无法打开辅助功能设置".into()) }
-                        }),
+                    "accessibility" => crate::open_accessibility_settings(),
                     _ => Ok(()),
                 };
                 refresh();
@@ -121,18 +139,24 @@ pub fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
 }
 
 pub fn setup(app: &tauri::App) -> tauri::Result<()> {
+    // Accelerators only make sense in the macOS app menu; on the Windows tray they
+    // would imply global shortcuts that do not exist.
+    let shortcut = |s: &'static str| -> Option<&'static str> {
+        if cfg!(target_os = "macos") { Some(s) } else { None }
+    };
     let item = |id, text, shortcut: Option<&str>| MenuItem::with_id(app, id, text, true, shortcut);
     let sep = || PredefinedMenuItem::separator(app);
     let status = MenuItem::with_id(app, "status", "正在启动监听…", false, None::<&str>)?;
-    let show = item("show", "打开按键工作台…", Some("CmdOrCtrl+Comma"))?;
+    let show = item("show", "打开按键工作台…", shortcut("CmdOrCtrl+Comma"))?;
     let pause = item(
         "toggle_pause",
         "暂停映射并释放按键",
-        Some("CmdOrCtrl+Shift+P"),
+        shortcut("CmdOrCtrl+Shift+P"),
     )?;
     let config = item("open_config", "打开配置目录…", None)?;
+    let logs = item("open_logs", "打开日志目录…", None)?;
     let releases = item("releases", "查看最新版本…", None)?;
-    let quit = item("quit", "退出 Mouse Insight", Some("CmdOrCtrl+Q"))?;
+    let quit = item("quit", "退出 Mouse Insight", shortcut("CmdOrCtrl+Q"))?;
     let error = MenuItem::with_id(
         app,
         "operation_status",
@@ -155,13 +179,12 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         }
         menu.append(&button_menu)?;
     }
-    menu.append_items(&[&sep()?, &show, &config])?;
+    menu.append_items(&[&sep()?, &show, &config, &logs])?;
     #[cfg(target_os = "macos")]
     {
         menu.append(&item("accessibility", "辅助功能设置…", None)?)?;
         // Keep standard editing, hiding and window shortcuts in the app menu.
         // Use our quit action so Cmd+Q releases injected keys before exiting.
-        use tauri::menu::Submenu;
         let app_menu = Submenu::with_items(
             app,
             "Mouse Insight",
@@ -220,8 +243,13 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     let tray = tray.icon(template_icon()).icon_as_template(true);
     #[cfg(not(target_os = "macos"))]
+    let app_icon = match app.default_window_icon() {
+        Some(icon) => icon.clone(),
+        None => template_icon(),
+    };
+    #[cfg(not(target_os = "macos"))]
     let tray = tray
-        .icon(app.default_window_icon().cloned().expect("app icon"))
+        .icon(app_icon)
         .on_tray_icon_event(|tray, event| {
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
             if matches!(
@@ -243,7 +271,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
 
 // A transparent 2x mouse silhouette. App icons have an opaque square background
 // and cannot be used as NSImage templates (they turn into solid menu-bar blocks).
-#[cfg(any(target_os = "macos", test))]
+// Also serves as the tray fallback when no default window icon is embedded.
 fn template_icon() -> tauri::image::Image<'static> {
     let mut rgba = vec![0; 36 * 36 * 4];
     for y in 0..36 {

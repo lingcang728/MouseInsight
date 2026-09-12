@@ -28,9 +28,14 @@
           <p>选择鼠标按键，为短按和长按分别设置快捷键。</p>
         </header>
 
-        <div id="alert-banner" class="banner hidden" role="alert"></div>
+        <div id="alert-banner" class="banner hidden" role="alert">
+          <span id="alert-text"></span>
+          <button type="button" class="ghost" id="alert-action" hidden></button>
+          <button type="button" class="ghost alert-close" aria-label="关闭提示">×</button>
+        </div>
         <div id="xmbc-banner" class="banner hidden">
           检测到 X-Mouse Button Control 还在跑。两套钩子会抢事件，先退出它。
+          <button type="button" class="ghost" id="xmbc-recheck">重新检测</button>
         </div>
 
         <section class="insight">
@@ -54,8 +59,8 @@
                 </div>
               </div>
               <div>
-                <div id="pulse-name" class="pulse-name">等你按一下</div>
-                <div id="pulse-state" class="meta">按下鼠标，查看按键与映射状态</div>
+                <div id="pulse-name" class="pulse-name" aria-live="polite">等你按一下</div>
+                <div id="pulse-state" class="meta" aria-live="polite">按下鼠标按键，查看按键与映射状态</div>
                 <div class="dots" id="dots"></div>
               </div>
             </div>
@@ -74,13 +79,13 @@
             <span class="meta" id="save-status" role="status">已保存</span>
           </div>
           <div class="quick-add" id="quick-add" aria-label="直接添加鼠标映射">
-            <button data-add-button="xbutton1">＋ 侧键 · 后</button>
-            <button data-add-button="xbutton2">＋ 侧键 · 前</button>
+            <button data-add-button="xbutton1">＋ 后侧键</button>
+            <button data-add-button="xbutton2">＋ 前侧键</button>
             <button data-add-button="middle">＋ 中键</button>
             <button data-add-button="wheelup">＋ 滚轮上</button>
             <button data-add-button="wheeldown">＋ 滚轮下</button>
           </div>
-          <div class="deck-controls"><span class="meta">按住卡片顶部，向任意方向翻一张</span><button class="ghost" id="deck-prev" aria-label="上一个按键">上一张</button><button class="ghost" id="deck-next" aria-label="下一个按键">下一张</button></div>
+          <div class="deck-controls"><span class="meta">按住卡片顶部，向任意方向翻一张</span><span id="deck-index" class="meta"></span><button class="ghost" id="deck-prev" aria-label="上一张">上一张</button><button class="ghost" id="deck-next" aria-label="下一张">下一张</button></div>
           <div id="maps" class="maps"></div>
         </section>
       <aside class="dock" id="settings">
@@ -101,7 +106,7 @@
           <p class="meta" id="cfg-mode-desc">配置保存在本机，点击下方路径打开</p>
           <button type="button" class="meta path" id="cfg-path"></button>
           <div class="rail-foot">
-            <span id="app-version" class="ver">v—</span>
+            <span id="app-version" class="ver">读取中…</span>
             <button type="button" class="ghost" id="btn-check-update">检查更新</button>
             <button type="button" class="ghost danger-exit" id="btn-quit">退出应用</button>
             <p id="update-status" class="meta" role="status"></p>
@@ -116,14 +121,14 @@
         <span class="eyebrow">定义你的快捷操作</span><h2 id="record-title">同时按下组合键</h2>
         <div class="keys" id="record-keys" aria-live="polite"><span class="key dim">在听</span></div>
         <div class="presets" id="record-presets" aria-label="常用快捷键">
-          <button data-preset="copy">复制</button><button data-preset="paste">粘贴</button>
-          <button data-preset="undo">撤销</button><button data-preset="enter">回车</button>
+          <button type="button" data-preset="copy">复制</button><button type="button" data-preset="paste">粘贴</button>
+          <button type="button" data-preset="undo">撤销</button><button type="button" data-preset="enter">回车</button>
         </div>
         <div class="chips" id="record-chips">
           <button type="button" data-key="LControl">Left Ctrl</button>
           <button type="button" data-key="LAlt">Left Alt</button>
           <button type="button" data-key="RAlt">Right Alt</button>
-          <button type="button" data-key="LShift">Shift</button>
+          <button type="button" data-key="LShift">Left Shift</button>
           <button type="button" data-key="LWin">Win</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Escape">Esc</button>
         </div>
         <p class="meta" id="record-help">按下键盘组合，或选择上方预设。Esc 取消，Tab 切换焦点；如需映射它们，请点击对应按键。录制期间暂停触发鼠标映射。</p>

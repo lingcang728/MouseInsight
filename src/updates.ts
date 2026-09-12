@@ -38,12 +38,17 @@ export function latestRelease(): Promise<Release> {
     const timer = setTimeout(() => controller.abort(), 8000);
     try {
       const response = await fetch(API_URL, { signal: controller.signal, headers: { Accept: "application/vnd.github+json" } });
+      if (response.status === 404) throw new Error("NO_RELEASE");
+      if (response.status === 403) throw new Error("RATE_LIMITED");
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       if (typeof data.tag_name !== "string" || !parseVersion(data.tag_name)) throw new Error("无效版本信息");
       const release = { version: data.tag_name, url: `${RELEASES_URL}/latest` };
       cached = { release, expires: Date.now() + 5 * 60_000 };
       return release;
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") throw new Error("TIMEOUT");
+      throw err;
     } finally {
       clearTimeout(timer);
     }

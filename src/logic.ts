@@ -19,9 +19,8 @@ export type DraftMapping = {
   button: string;
   isNew: boolean;
   existingId?: string;
-  initialKeys: string[];
-  suggestedMode?: "hold" | "click";
   slot?: "tap" | "hold" | "toggle";
+  gen?: number;
 };
 
 export const MAPPABLE_BUTTONS = [
@@ -36,8 +35,8 @@ export const BUTTON_LABEL: Record<string, string> = {
   left: "左键",
   right: "右键",
   middle: "中键",
-  xbutton1: "侧键 · 后",
-  xbutton2: "侧键 · 前",
+  xbutton1: "后侧键",
+  xbutton2: "前侧键",
   wheelup: "滚轮上",
   wheeldown: "滚轮下",
 };
@@ -45,44 +44,75 @@ export const BUTTON_LABEL: Record<string, string> = {
 export const MODE_LABEL: Record<string, string> = {
   hold: "跟随按住",
   click: "单次触发",
-  dual: "点按 / 长按",
+  dual: "短按 / 长按",
   toggle: "切换保持",
 };
 
 export const MODE_DESC: Record<string, string> = {
   hold: "按下立刻注入，松开立刻释放。",
   click: "每按一下，完整触发一次快捷键",
-  dual: "短按与长按可以绑两套键。只填长按则按下立刻跟随；两套都填时短按点触、长按超过阈值才跟随。",
+  dual: "短按与长按可以各绑一套键。只填长按 = 按住期间持续生效；只填短按 = 每按一下触发一次；两套都填 = 短按点触、按住超过 0.4 秒切换为长按。",
   toggle: "按一次保持，再按一次释放",
 };
 
-const MODIFIER_KEY_SET = new Set([
-  "ctrl",
-  "control",
-  "lcontrol",
-  "rcontrol",
-  "leftctrl",
-  "rightctrl",
-  "alt",
-  "lalt",
-  "ralt",
-  "leftalt",
-  "rightalt",
-  "shift",
-  "lshift",
-  "rshift",
-  "leftshift",
-  "rightshift",
-  "win",
-  "lwin",
-  "rwin",
-  "leftwin",
-  "rightwin",
-  "meta",
-  "lmeta",
-  "rmeta",
-  "cmd",
-  "command",
+/** Modifier aliases → canonical token (left side for bare names). */
+export const CANONICAL_TOKENS: Record<string, string> = {
+  ctrl: "LControl",
+  control: "LControl",
+  lcontrol: "LControl",
+  leftctrl: "LControl",
+  leftcontrol: "LControl",
+  rctrl: "RControl",
+  rcontrol: "RControl",
+  rightctrl: "RControl",
+  rightcontrol: "RControl",
+  shift: "LShift",
+  lshift: "LShift",
+  leftshift: "LShift",
+  rshift: "RShift",
+  rightshift: "RShift",
+  alt: "LAlt",
+  lalt: "LAlt",
+  leftalt: "LAlt",
+  option: "LAlt",
+  loption: "LAlt",
+  leftoption: "LAlt",
+  ralt: "RAlt",
+  rightalt: "RAlt",
+  roption: "RAlt",
+  rightoption: "RAlt",
+  win: "LWin",
+  lwin: "LWin",
+  leftwin: "LWin",
+  meta: "LWin",
+  lmeta: "LWin",
+  cmd: "LWin",
+  command: "LWin",
+  lcommand: "LWin",
+  leftcommand: "LWin",
+  rwin: "RWin",
+  rightwin: "RWin",
+  rmeta: "RWin",
+  rcmd: "RWin",
+  rcommand: "RWin",
+  rightcommand: "RWin",
+};
+
+export function canonicalizeToken(token: string): string {
+  if (!token) return token;
+  const t = token.trim();
+  return CANONICAL_TOKENS[t.toLowerCase()] ?? t;
+}
+
+const CANONICAL_MODIFIERS = new Set([
+  "LControl",
+  "RControl",
+  "LShift",
+  "RShift",
+  "LAlt",
+  "RAlt",
+  "LWin",
+  "RWin",
 ]);
 
 /**
@@ -90,69 +120,31 @@ const MODIFIER_KEY_SET = new Set([
  */
 export function isModifierKey(key: string): boolean {
   if (!key) return false;
-  return MODIFIER_KEY_SET.has(key.trim().toLowerCase());
+  return CANONICAL_MODIFIERS.has(canonicalizeToken(key));
 }
 
 /**
  * 获取修饰键权重，用于按 Ctrl -> Shift -> Alt -> Win -> 普通键 排序
  */
 export function modifierWeight(key: string): number {
-  const lower = key.trim().toLowerCase();
-  if (
-    lower === "ctrl" ||
-    lower === "control" ||
-    lower === "lcontrol" ||
-    lower === "rcontrol" ||
-    lower === "leftctrl" ||
-    lower === "rightctrl"
-  ) {
-    return 10;
-  }
-  if (
-    lower === "shift" ||
-    lower === "lshift" ||
-    lower === "rshift" ||
-    lower === "leftshift" ||
-    lower === "rightshift"
-  ) {
-    return 20;
-  }
-  if (
-    lower === "alt" ||
-    lower === "lalt" ||
-    lower === "ralt" ||
-    lower === "leftalt" ||
-    lower === "rightalt"
-  ) {
-    return 30;
-  }
-  if (
-    lower === "win" ||
-    lower === "lwin" ||
-    lower === "rwin" ||
-    lower === "leftwin" ||
-    lower === "rightwin" ||
-    lower === "meta" ||
-    lower === "lmeta" ||
-    lower === "rmeta" ||
-    lower === "cmd" ||
-    lower === "command"
-  ) {
-    return 40;
-  }
+  const c = canonicalizeToken(key);
+  if (c === "LControl" || c === "RControl") return 10;
+  if (c === "LShift" || c === "RShift") return 20;
+  if (c === "LAlt" || c === "RAlt") return 30;
+  if (c === "LWin" || c === "RWin") return 40;
   return 100;
 }
 
 /**
- * 规范化按键 Chord：去重、过滤空项，并按标准修饰键次序排序
+ * 规范化按键 Chord：别名归一、去重、过滤空项，并按标准修饰键次序排序
  */
 export function normalizeKeyChord(keys: string[]): string[] {
   if (!keys || !Array.isArray(keys)) return [];
   const deduped: string[] = [];
   for (const k of keys) {
-    if (k && typeof k === "string" && k.trim().length > 0 && !deduped.includes(k.trim())) {
-      deduped.push(k.trim());
-    }
+    if (!k || typeof k !== "string" || k.trim().length === 0) continue;
+    const c = canonicalizeToken(k);
+    if (!deduped.includes(c)) deduped.push(c);
   }
   deduped.sort((a, b) => {
     const wa = modifierWeight(a);
@@ -160,7 +152,7 @@ export function normalizeKeyChord(keys: string[]): string[] {
     if (wa !== wb) {
       return wa - wb;
     }
-    return a.localeCompare(b);
+    return a < b ? -1 : a > b ? 1 : 0;
   });
   return deduped;
 }
@@ -174,7 +166,7 @@ export function normalizeKeyChord(keys: string[]): string[] {
  * 4. 包含任何非修饰键（如 Enter, Space, F5 等）推断为 "click"（单次触发）
  * 5. "toggle" 绝不自动推荐
  */
-export function inferDefaultMode(keys: string[], button?: string): "hold" | "click" {
+export function inferTriggerMode(button: string, keys: string[]): "hold" | "click" {
   if (button === "wheelup" || button === "wheeldown") {
     return "click";
   }
@@ -185,11 +177,9 @@ export function inferDefaultMode(keys: string[], button?: string): "hold" | "cli
   return allModifiers ? "hold" : "click";
 }
 
-/**
- * 与现有 main.ts 兼容的推断别名函数
- */
-export function inferTriggerMode(button: string, keys: string[]): "hold" | "click" {
-  return inferDefaultMode(keys, button);
+/** 兼容别名：语义同 inferTriggerMode，参数顺序为历史遗留。 */
+export function inferDefaultMode(keys: string[], button?: string): "hold" | "click" {
+  return inferTriggerMode(button ?? "", keys);
 }
 
 /**
@@ -254,16 +244,7 @@ export function codeToToken(code: string): string | null {
  * - middle, xbutton1, xbutton2：允许 "hold", "click", "toggle"
  */
 export function isButtonAllowedForMode(button: string, mode: string): boolean {
-  if (button === "left" || button === "right") {
-    return false;
-  }
-  if (button === "wheelup" || button === "wheeldown") {
-    return mode === "click";
-  }
-  if (button === "middle" || button === "xbutton1" || button === "xbutton2") {
-    return mode === "hold" || mode === "click" || mode === "toggle" || mode === "dual";
-  }
-  return false;
+  return (getAllowedModesForButton(button) as string[]).includes(mode);
 }
 
 /**
@@ -287,22 +268,23 @@ export function normalizeMapping(raw: Mapping): Mapping {
   const tap = normalizeKeyChord(raw.tap_keys ?? []);
   const hold = normalizeKeyChord(raw.hold_keys ?? []);
   // Explicit slots are authoritative, including an intentionally empty slot.
-  const hasSlots = raw.mode === "dual" || tap.length > 0 || hold.length > 0;
+  // Legacy "dual"+"keys" rows have no slots and migrate into tap_keys.
+  const hasSlots = tap.length > 0 || hold.length > 0;
   if (raw.button === "wheelup" || raw.button === "wheeldown") {
     const t = hasSlots ? tap : keys;
-    return { ...raw, mode: "click", keys: t, tap_keys: t, hold_keys: [] };
+    return { ...raw, mode: "click", keys: [...t], tap_keys: [...t], hold_keys: [...hold] };
   }
   if (raw.mode === "toggle") {
-    return { ...raw, mode: "toggle", keys, tap_keys: [], hold_keys: [] };
+    return { ...raw, mode: "toggle", keys: [...keys], tap_keys: [...tap], hold_keys: [...hold] };
   }
   if (!hasSlots && keys.length) {
     if (raw.mode === "hold") {
-      return { ...raw, mode: "dual", keys, tap_keys: [], hold_keys: keys };
+      return { ...raw, mode: "dual", keys: [...keys], tap_keys: [], hold_keys: [...keys] };
     }
-    return { ...raw, mode: "dual", keys, tap_keys: keys, hold_keys: [] };
+    return { ...raw, mode: "dual", keys: [...keys], tap_keys: [...keys], hold_keys: [] };
   }
   const nextKeys = tap.length ? tap : hold;
-  return { ...raw, mode: "dual", keys: nextKeys, tap_keys: tap, hold_keys: hold };
+  return { ...raw, mode: "dual", keys: [...nextKeys], tap_keys: [...tap], hold_keys: [...hold] };
 }
 
 /**
@@ -322,129 +304,86 @@ export function sanitizeMappings(rawMappings: Mapping[]): Mapping[] {
 }
 
 /**
- * 事务化录制状态机管理器 (Draft Mapping Session)
+ * 读取某模式槽位当前录制的按键组合
+ * - "tap"：优先 tap_keys；历史 click 映射回退 keys
+ * - "hold"：hold_keys
+ * - "toggle"：keys
  */
-export class DraftSession {
-  private mappings: Mapping[];
-  private currentDraft: DraftMapping | null = null;
-  private idGenerator: () => string;
+export function keysForSlot(m: Mapping, slot: "tap" | "hold" | "toggle"): string[] {
+  if (slot === "hold") return [...(m.hold_keys ?? [])];
+  if (slot === "tap") return [...(m.tap_keys ?? (m.mode === "click" ? m.keys : []))];
+  return [...(m.keys ?? [])];
+}
 
-  constructor(
-    initialMappings: Mapping[] = [],
-    idGenerator: () => string = () => `map-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-  ) {
-    this.mappings = initialMappings.map((m) => ({ ...m, keys: [...m.keys] }));
-    this.idGenerator = idGenerator;
+/** 目标按键是否已被另一条映射占用 */
+export function hasButtonConflict(all: Mapping[], id: string, button: string): boolean {
+  return all.some((other) => other.id !== id && other.button === button);
+}
+
+/**
+ * 切换映射的目标按键；冲突返回 null。
+ * 改到滚轮时强制 click 并把 keys 回填进 tap_keys（hold_keys 数据保留）。
+ */
+export function applyButtonChange(
+  m: Mapping,
+  nextButton: string,
+  all: Mapping[]
+): Mapping | null {
+  if (hasButtonConflict(all, m.id, nextButton)) return null;
+  const next: Mapping = { ...m, button: nextButton };
+  if (nextButton === "wheelup" || nextButton === "wheeldown") {
+    next.mode = "click";
+    next.tap_keys = next.tap_keys?.length ? next.tap_keys : [...next.keys];
   }
+  return normalizeMapping(next);
+}
 
-  /** 获取当前活跃的 mappings 副本 */
-  getMappings(): readonly Mapping[] {
-    return this.mappings;
-  }
-
-  /** 获取当前录制草稿副本 */
-  getCurrentDraft(): DraftMapping | null {
-    return this.currentDraft
-      ? { ...this.currentDraft, initialKeys: [...this.currentDraft.initialKeys] }
-      : null;
-  }
-
-  /**
-   * 开启新按键的录制草稿
-   * - 严禁为 left / right 开启录制
-   * - 创建草稿阶段绝不污染现有 mappings
-   */
-  startNewDraft(button: string): DraftMapping {
-    if (button === "left" || button === "right") {
-      throw new Error(`左/右键 (${button}) 仅用于识别，为防止误锁系统，不支持映射。`);
-    }
-    const draft: DraftMapping = {
-      button,
-      isNew: true,
-      initialKeys: [],
-    };
-    this.currentDraft = draft;
-    return { ...draft };
-  }
-
-  /**
-   * 为已有映射开启重新录制草稿
-   * - 保存已有按键状态的快照，以便取消时完整保留
-   */
-  startEditDraft(mappingId: string): DraftMapping {
-    const existing = this.mappings.find((m) => m.id === mappingId);
-    if (!existing) {
-      throw new Error(`Mapping not found: ${mappingId}`);
-    }
-    const draft: DraftMapping = {
-      button: existing.button,
-      isNew: false,
-      existingId: existing.id,
-      initialKeys: [...existing.keys],
-    };
-    this.currentDraft = draft;
-    return { ...draft };
-  }
-
-  /**
-   * 取消录制（Cancel / Esc / Blur）
-   * - 直接抛弃草稿，mappings 保持原状，绝不遗留空 mapping
-   */
-  cancelDraft(): boolean {
-    if (!this.currentDraft) return false;
-    this.currentDraft = null;
-    return true;
-  }
-
-  /**
-   * 确认录制（Confirm）
-   * - 若录制键为空，直接废弃草稿并不写入 mappings
-   * - 若是新建映射：推断默认模式，生成新 Mapping 并原子追加进 mappings
-   * - 若是编辑已有映射：原子替换 keys，滚轮自动防御修正为 click
-   */
-  confirmDraft(recordedKeys: string[]): {
-    success: boolean;
-    mapping?: Mapping;
-    reason?: string;
-  } {
-    if (!this.currentDraft) {
-      return { success: false, reason: "NO_ACTIVE_DRAFT" };
-    }
-
-    const normalizedKeys = normalizeKeyChord(recordedKeys);
-    if (normalizedKeys.length === 0) {
-      this.cancelDraft();
-      return { success: false, reason: "EMPTY_KEYS" };
-    }
-
-    if (this.currentDraft.isNew) {
-      const mode = inferDefaultMode(normalizedKeys, this.currentDraft.button);
-      const newMapping: Mapping = {
-        id: this.idGenerator(),
-        button: this.currentDraft.button,
-        mode,
-        keys: normalizedKeys,
-      };
-      this.mappings.push(newMapping);
-      this.currentDraft = null;
-      return { success: true, mapping: newMapping };
-    } else {
-      const existing = this.mappings.find((m) => m.id === this.currentDraft?.existingId);
-      if (!existing) {
-        this.currentDraft = null;
-        return { success: false, reason: "EXISTING_MAPPING_NOT_FOUND" };
-      }
-      // 原子替换按键
-      existing.keys = normalizedKeys;
-      // 滚轮防御修正
-      if (
-        (existing.button === "wheelup" || existing.button === "wheeldown") &&
-        existing.mode !== "click"
-      ) {
-        existing.mode = "click";
-      }
-      this.currentDraft = null;
-      return { success: true, mapping: existing };
+/**
+ * 切换触发模式，不清空另一槽位（P1-25 保槽语义）：
+ * - toggle：keys 回填自 tap/hold/keys，tap_keys 与 hold_keys 原样保留
+ * - click：tap_keys 回填自 tap/keys
+ * - dual：两槽皆空时按 keys 推断进 tap 或 hold
+ */
+export function applyModeChange(m: Mapping, mode: "toggle" | "click" | "dual"): Mapping {
+  const next: Mapping = { ...m };
+  if (mode === "toggle") {
+    next.mode = "toggle";
+    next.keys = next.tap_keys?.length
+      ? [...next.tap_keys]
+      : next.hold_keys?.length
+        ? [...next.hold_keys]
+        : [...next.keys];
+  } else if (mode === "click") {
+    next.mode = "click";
+    next.tap_keys = next.tap_keys?.length ? [...next.tap_keys] : [...next.keys];
+  } else {
+    next.mode = "dual";
+    if (!next.tap_keys?.length && !next.hold_keys?.length && next.keys.length) {
+      next.hold_keys = inferTriggerMode(next.button, next.keys) === "hold" ? [...next.keys] : [];
+      next.tap_keys = next.hold_keys.length ? [] : [...next.keys];
     }
   }
+  return normalizeMapping(next);
+}
+
+/**
+ * 从指定槽位删除一个键；非 toggle 槽删除后 keys 回填 tap 或 hold。
+ */
+export function removeKeyFromSlot(
+  m: Mapping,
+  slot: "tap" | "hold" | "toggle",
+  key: string
+): Mapping {
+  const next: Mapping = { ...m };
+  if (slot === "hold") {
+    next.hold_keys = (m.hold_keys ?? []).filter((k) => k !== key);
+  } else if (slot === "tap") {
+    next.tap_keys = (m.tap_keys ?? []).filter((k) => k !== key);
+  } else {
+    next.keys = m.keys.filter((k) => k !== key);
+  }
+  if (slot !== "toggle") {
+    next.keys = next.tap_keys?.length ? [...next.tap_keys] : [...(next.hold_keys ?? [])];
+  }
+  return next;
 }

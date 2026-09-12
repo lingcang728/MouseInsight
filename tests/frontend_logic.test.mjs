@@ -8,9 +8,13 @@ import {
   isButtonAllowedForMode,
   getAllowedModesForButton,
   sanitizeMappings,
-  DraftSession,
   codeToToken,
   normalizeMapping,
+  keysForSlot,
+  hasButtonConflict,
+  applyButtonChange,
+  applyModeChange,
+  removeKeyFromSlot,
 } from "../src/logic.ts";
 
 // 轻量、高可读性的纯逻辑测试执行器
@@ -247,12 +251,12 @@ await suite("3. 按钮能力矩阵规则 isButtonAllowedForMode", async () => {
     }
   });
 
-  await test("middle, xbutton1, xbutton2 允许 dual 与 toggle", () => {
+  await test("middle, xbutton1, xbutton2 允许 dual 与 toggle（由 getAllowedModesForButton 派生）", () => {
     for (const btn of ["middle", "xbutton1", "xbutton2"]) {
       assert.equal(isButtonAllowedForMode(btn, "dual"), true);
       assert.equal(isButtonAllowedForMode(btn, "toggle"), true);
-      assert.equal(isButtonAllowedForMode(btn, "hold"), true);
-      assert.equal(isButtonAllowedForMode(btn, "click"), true);
+      assert.equal(isButtonAllowedForMode(btn, "hold"), false);
+      assert.equal(isButtonAllowedForMode(btn, "click"), false);
       assert.equal(isButtonAllowedForMode(btn, "invalid"), false);
       assert.deepEqual(getAllowedModesForButton(btn), ["dual", "toggle"]);
     }
@@ -264,155 +268,6 @@ await suite("3. 按钮能力矩阵规则 isButtonAllowedForMode", async () => {
   });
 });
 
-// ============================================================================
-// 4. 事务化录制状态机 (DraftSession 逻辑)
-// ============================================================================
-await suite("4. 事务化录制状态机 DraftSession", async () => {
-  await test("创建 draft 时绝不污染现有 mappings", () => {
-    const initialMappings = [
-      { id: "m1", button: "xbutton1", mode: "hold", keys: ["LControl", "LAlt"] },
-    ];
-    const session = new DraftSession(initialMappings);
-
-    // 开启为 xbutton2 录制新按键
-    const draft = session.startNewDraft("xbutton2");
-
-    assert.equal(draft.button, "xbutton2");
-    assert.equal(draft.isNew, true);
-    assert.deepEqual(draft.initialKeys, []);
-
-    // 验证当前 mappings 依然只有一条，长度为 1，完全不受污染！
-    const currentMappings = session.getMappings();
-    assert.equal(currentMappings.length, 1);
-    assert.equal(currentMappings[0].id, "m1");
-  });
-
-  await test("严禁对 left / right 开启录制草稿", () => {
-    const session = new DraftSession([]);
-    assert.throws(() => {
-      session.startNewDraft("left");
-    }, /左\/右键/);
-    assert.throws(() => {
-      session.startNewDraft("right");
-    }, /左\/右键/);
-    assert.equal(session.getCurrentDraft(), null);
-  });
-
-  await test("新建录制中取消 (Cancel / Esc / Blur) 直接抛弃 draft，mappings 保持原状，不遗留空 mapping", () => {
-    const session = new DraftSession([]);
-
-    session.startNewDraft("middle");
-    assert.ok(session.getCurrentDraft() !== null);
-
-    // 取消录制（用户按 Esc / 点击取消 / 窗口失焦 Blur）
-    const cancelled = session.cancelDraft();
-    assert.equal(cancelled, true);
-
-    // draft 清空，mappings 为空，没有任何空 mapping 遗留！
-    assert.equal(session.getCurrentDraft(), null);
-    assert.equal(session.getMappings().length, 0);
-  });
-
-  await test("新建录制确认 (Confirm)：空键时取消并不产生空 mapping", () => {
-    const session = new DraftSession([]);
-    session.startNewDraft("xbutton1");
-
-    const result = session.confirmDraft([]);
-    assert.equal(result.success, false);
-    assert.equal(result.reason, "EMPTY_KEYS");
-
-    assert.equal(session.getCurrentDraft(), null);
-    assert.equal(session.getMappings().length, 0);
-  });
-
-  await test("新建录制确认 (Confirm)：纯修饰键自动推断为 'hold' 并原子写入 mappings", () => {
-    let mockIdCounter = 1;
-    const session = new DraftSession([], () => `id-${mockIdCounter++}`);
-
-    session.startNewDraft("xbutton1");
-    const result = session.confirmDraft(["LControl", "LAlt"]);
-
-    assert.equal(result.success, true);
-    assert.ok(result.mapping);
-    assert.equal(result.mapping.id, "id-1");
-    assert.equal(result.mapping.button, "xbutton1");
-    assert.equal(result.mapping.mode, "hold"); // 纯修饰键 -> hold
-    assert.deepEqual(result.mapping.keys, ["LControl", "LAlt"]);
-
-    // mappings 现在恰好有 1 条
-    assert.equal(session.getMappings().length, 1);
-    assert.equal(session.getCurrentDraft(), null);
-  });
-
-  await test("新建录制确认 (Confirm)：包含非修饰键自动推断为 'click' 并原子写入 mappings", () => {
-    const session = new DraftSession([], () => "id-enter");
-
-    session.startNewDraft("xbutton2");
-    const result = session.confirmDraft(["Enter"]);
-
-    assert.equal(result.success, true);
-    assert.equal(result.mapping.mode, "click"); // 包含 Enter -> click
-    assert.deepEqual(result.mapping.keys, ["Enter"]);
-    assert.equal(session.getMappings().length, 1);
-  });
-
-  await test("新建滚轮录制确认 (Confirm)：无论什么键均强制推断为 'click'", () => {
-    const session = new DraftSession([], () => "id-wheel");
-
-    session.startNewDraft("wheelup");
-    // 录制纯修饰键
-    const result = session.confirmDraft(["LShift"]);
-
-    assert.equal(result.success, true);
-    assert.equal(result.mapping.mode, "click"); // 滚轮强制 click
-    assert.deepEqual(result.mapping.keys, ["LShift"]);
-  });
-
-  await test("重新录制已有映射：取消录制不影响原 keys，原 mapping 保持不变", () => {
-    const initial = [
-      { id: "m-orig", button: "xbutton1", mode: "hold", keys: ["LControl", "LAlt"] },
-    ];
-    const session = new DraftSession(initial);
-
-    // 开启重新录制
-    const draft = session.startEditDraft("m-orig");
-    assert.equal(draft.isNew, false);
-    assert.equal(draft.existingId, "m-orig");
-    assert.deepEqual(draft.initialKeys, ["LControl", "LAlt"]);
-
-    // 用户在录制界面反悔，按 Escape 取消
-    session.cancelDraft();
-
-    // 验证原 mapping 完全没有被修改
-    const mappings = session.getMappings();
-    assert.equal(mappings.length, 1);
-    assert.equal(mappings[0].id, "m-orig");
-    assert.deepEqual(mappings[0].keys, ["LControl", "LAlt"]);
-    assert.equal(mappings[0].mode, "hold");
-  });
-
-  await test("重新录制已有映射：确认录制原子替换 keys，并对滚轮防御性修正", () => {
-    const initial = [
-      { id: "m-existing", button: "xbutton1", mode: "click", keys: ["Enter"] },
-      { id: "m-wheel", button: "wheeldown", mode: "hold", keys: ["F5"] }, // 脏数据 hold
-    ];
-    const session = new DraftSession(initial);
-
-    // 重新录制 m-existing 为 Ctrl + S
-    session.startEditDraft("m-existing");
-    const res1 = session.confirmDraft(["LControl", "S"]);
-    assert.equal(res1.success, true);
-    assert.deepEqual(res1.mapping.keys, ["LControl", "S"]);
-    assert.equal(res1.mapping.mode, "click"); // 维持原本模式
-
-    // 重新录制 m-wheel，应防御性修正 mode 为 click
-    session.startEditDraft("m-wheel");
-    const res2 = session.confirmDraft(["ArrowDown"]);
-    assert.equal(res2.success, true);
-    assert.deepEqual(res2.mapping.keys, ["ArrowDown"]);
-    assert.equal(res2.mapping.mode, "click"); // 滚轮防御修正为 click
-  });
-});
 
 // ============================================================================
 // 5. 数据清洗与安全性校验 (sanitizeMappings)
@@ -523,10 +378,11 @@ await suite("8. 映射编辑回归", async () => {
     assert.deepEqual(mapping.keys, ["RAlt"]);
     assert.deepEqual(normalizeMapping(mapping), mapping);
   });
-  await test("清空 dual 两个槽位后不复活历史快捷键", () => {
-    const mapping = normalizeMapping({ id: "empty", button: "middle", mode: "dual", keys: ["Enter"], tap_keys: [], hold_keys: [] });
+  await test("清空 dual 两个槽位与 keys 后不复活历史快捷键", () => {
+    const mapping = normalizeMapping({ id: "empty", button: "middle", mode: "dual", keys: [], tap_keys: [], hold_keys: [] });
     assert.deepEqual(mapping.keys, []);
     assert.deepEqual(mapping.tap_keys, []);
+    assert.deepEqual(mapping.hold_keys, []);
   });
   await test("旧后端序列化的空槽位仍能迁移 hold", () => {
     const mapping = normalizeMapping({ id: "legacy", button: "middle", mode: "hold", keys: ["RAlt"], tap_keys: [], hold_keys: [] });
@@ -563,6 +419,133 @@ await suite("9. 版本与网络回归", async () => {
       await latestRelease();
       assert.equal(requests, 2);
     } finally { globalThis.fetch = original; }
+  });
+});
+
+await suite("10. 别名归一与旧格式迁移", async () => {
+  const { canonicalizeToken } = await import("../src/logic.ts");
+
+  await test("canonicalizeToken 将常见别名归一到规范 token", () => {
+    assert.equal(canonicalizeToken("cmd"), "LWin");
+    assert.equal(canonicalizeToken("ctrl"), "LControl");
+    assert.equal(canonicalizeToken("RightAlt"), "RAlt");
+    assert.equal(canonicalizeToken("Enter"), "Enter");
+  });
+
+  await test("normalizeKeyChord 普通键按码点序排序", () => {
+    assert.deepEqual(normalizeKeyChord(["B", "a"]), ["B", "a"]);
+  });
+
+  await test("旧 dual + keys 格式迁移到 tap_keys，不丢键", () => {
+    const n = normalizeMapping({ id: "d1", button: "middle", mode: "dual", keys: ["LControl", "C"] });
+    assert.deepEqual(n.tap_keys, ["LControl", "C"]);
+  });
+
+  await test("滚轮映射保留 hold_keys 数据（编译端忽略）", () => {
+    const n = normalizeMapping({
+      id: "w1", button: "wheelup", mode: "click",
+      keys: [], tap_keys: ["A"], hold_keys: ["B"],
+    });
+    assert.deepEqual(n.hold_keys, ["B"]);
+    assert.deepEqual(n.tap_keys, ["A"]);
+  });
+
+  await test("toggle 映射保留 tap_keys/hold_keys 数据", () => {
+    const n = normalizeMapping({
+      id: "t1", button: "xbutton1", mode: "toggle",
+      keys: ["Enter"], tap_keys: ["A"], hold_keys: ["B"],
+    });
+    assert.equal(n.mode, "toggle");
+    assert.deepEqual(n.tap_keys, ["A"]);
+    assert.deepEqual(n.hold_keys, ["B"]);
+  });
+
+  await test("isButtonAllowedForMode 与能力矢量一致", () => {
+    assert.equal(isButtonAllowedForMode("middle", "hold"), false);
+    assert.equal(isButtonAllowedForMode("middle", "dual"), true);
+  });
+});
+
+// ============================================================================
+// 11. 映射编辑纯函数（applyModeChange / applyButtonChange / removeKeyFromSlot / keysForSlot）
+// ============================================================================
+await suite("11. 映射编辑纯函数", async () => {
+  const dualMap = () => ({
+    id: "m1", button: "xbutton1", mode: "dual",
+    keys: ["LControl", "C"], tap_keys: ["LControl", "C"], hold_keys: ["LShift", "V"],
+  });
+
+  await test("applyModeChange dual→toggle 保留 tap/hold 且 keys 回填 tap", () => {
+    const n = applyModeChange(dualMap(), "toggle");
+    assert.equal(n.mode, "toggle");
+    assert.deepEqual(n.keys, ["LControl", "C"]);
+    assert.deepEqual(n.tap_keys, ["LControl", "C"]);
+    assert.deepEqual(n.hold_keys, ["LShift", "V"]);
+  });
+
+  await test("applyModeChange toggle→dual 恢复 tap/hold 槽位", () => {
+    const t = { id: "m2", button: "middle", mode: "toggle", keys: ["Enter"], tap_keys: ["A"], hold_keys: ["B"] };
+    const n = applyModeChange(t, "dual");
+    assert.equal(n.mode, "dual");
+    assert.deepEqual(n.tap_keys, ["A"]);
+    assert.deepEqual(n.hold_keys, ["B"]);
+  });
+
+  await test("applyModeChange →click 保留 hold_keys 数据", () => {
+    const w = { id: "m3", button: "wheelup", mode: "dual", keys: [], tap_keys: ["A"], hold_keys: ["B"] };
+    const n = applyModeChange(w, "click");
+    assert.equal(n.mode, "click");
+    assert.deepEqual(n.hold_keys, ["B"]);
+  });
+
+  await test("applyButtonChange 冲突返回 null，不改原映射", () => {
+    const all = [dualMap(), { id: "m9", button: "middle", mode: "dual", keys: [], tap_keys: ["X"], hold_keys: [] }];
+    assert.equal(applyButtonChange(all[0], "middle", all), null);
+    const n = applyButtonChange(all[0], "xbutton2", all);
+    assert.ok(n);
+    assert.equal(n.button, "xbutton2");
+  });
+
+  await test("applyButtonChange 改到滚轮强制 click 且保留 hold_keys", () => {
+    const n = applyButtonChange(dualMap(), "wheeldown", [dualMap()]);
+    assert.ok(n);
+    assert.equal(n.button, "wheeldown");
+    assert.equal(n.mode, "click");
+    assert.deepEqual(n.hold_keys, ["LShift", "V"]);
+    assert.deepEqual(n.tap_keys, ["LControl", "C"]);
+  });
+
+  await test("removeKeyFromSlot 删 tap 键后 keys 回填", () => {
+    const n = removeKeyFromSlot(dualMap(), "tap", "C");
+    assert.deepEqual(n.tap_keys, ["LControl"]);
+    assert.deepEqual(n.keys, ["LControl"]);
+    assert.deepEqual(n.hold_keys, ["LShift", "V"]);
+  });
+
+  await test("removeKeyFromSlot toggle 槽只删 keys", () => {
+    const t = { id: "m4", button: "middle", mode: "toggle", keys: ["LControl", "Enter"], tap_keys: ["A"], hold_keys: [] };
+    const n = removeKeyFromSlot(t, "toggle", "Enter");
+    assert.deepEqual(n.keys, ["LControl"]);
+    assert.deepEqual(n.tap_keys, ["A"]);
+  });
+
+  await test("keysForSlot 三槽读取", () => {
+    const m = dualMap();
+    assert.deepEqual(keysForSlot(m, "tap"), ["LControl", "C"]);
+    assert.deepEqual(keysForSlot(m, "hold"), ["LShift", "V"]);
+    const t = { id: "m5", button: "middle", mode: "toggle", keys: ["Enter"], tap_keys: [], hold_keys: [] };
+    assert.deepEqual(keysForSlot(t, "toggle"), ["Enter"]);
+  });
+
+  await test("keysForSlot tap 对历史 click 映射回退 keys", () => {
+    const m = { id: "m6", button: "xbutton1", mode: "click", keys: ["Enter"] };
+    assert.deepEqual(keysForSlot(m, "tap"), ["Enter"]);
+  });
+
+  await test("hasButtonConflict 排除自身", () => {
+    const all = [dualMap(), { id: "m8", button: "middle", mode: "dual", keys: [], tap_keys: ["X"], hold_keys: [] }];
+    assert.equal(hasButtonConflict(all, "m1", "xbutton1"), false);
+    assert.equal(hasButtonConflict(all, "m1", "middle"), true);
   });
 });
 

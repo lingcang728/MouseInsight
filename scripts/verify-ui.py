@@ -1,7 +1,11 @@
 """Smoke the real Tauri WebView2 via an explicitly enabled local CDP port.
 
-Requires an isolated portable review build with empty, paused config. Uses the
-machine's existing Python Playwright; does not install a browser or mock Tauri.
+Requirements:
+  * Python Playwright already installed (`pip show playwright`); this script does
+    not install a browser or mock Tauri.
+  * An isolated portable review build with an empty, paused config, launched with
+    WebView2 remote debugging enabled, e.g. environment variable
+    `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223`.
 Usage: python scripts/verify-ui.py --cdp http://127.0.0.1:9223 --output <directory>
 """
 import argparse
@@ -17,7 +21,12 @@ args.output.mkdir(parents=True, exist_ok=True)
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.connect_over_cdp(args.cdp)
-    page = next(page for context in browser.contexts for page in context.pages if 'tauri' in page.url)
+    page = next((page for context in browser.contexts for page in context.pages if 'tauri' in page.url), None)
+    if page is None:
+        raise SystemExit(
+            'no Tauri webview page found over CDP; launch the review build with '
+            'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>'
+        )
     page.bring_to_front()
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))

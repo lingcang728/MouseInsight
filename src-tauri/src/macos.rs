@@ -3,7 +3,7 @@
 
 use crate::engine::{
     physical_down_set, InputCmd, InputInjector, KeySpec, MouseButton, Pulse, SendReport,
-    VIRTUAL_KEY, ENGINE,
+    VIRTUAL_KEY, ENGINE, EXTRA_INFO,
 };
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
@@ -15,12 +15,9 @@ use core_graphics::event::{
     CGEventTapOptions, CGEventTapPlacement, CGEventType, CallbackResult, EventField,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::collections::HashSet;
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-const EXTRA_INFO: usize = 0x4D49_484B;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // =========================================================================
 // macOS Virtual Keycodes (from Carbon HIToolbox / Events.h)
@@ -127,6 +124,15 @@ pub const kVK_F9: u16 = 0x65; // 101
 pub const kVK_F10: u16 = 0x6D; // 109
 pub const kVK_F11: u16 = 0x67; // 103
 pub const kVK_F12: u16 = 0x6F; // 111
+pub const kVK_F13: u16 = 0x69; // 105
+pub const kVK_F14: u16 = 0x6B; // 107
+pub const kVK_F15: u16 = 0x71; // 113
+pub const kVK_F16: u16 = 0x6A; // 106
+pub const kVK_F17: u16 = 0x40; // 64
+pub const kVK_F18: u16 = 0x4F; // 79
+pub const kVK_F19: u16 = 0x50; // 80
+pub const kVK_F20: u16 = 0x5A; // 90
+pub const kVK_Help: u16 = 0x72; // 114 (Insert on PC keyboards)
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -175,6 +181,7 @@ pub fn key_spec(name: &str) -> Option<KeySpec> {
         "Escape" | "Esc" => kVK_Escape,
         "Backspace" => kVK_Delete,
         "Delete" => kVK_ForwardDelete,
+        "Insert" => kVK_Help,
         "Home" => kVK_Home,
         "End" => kVK_End,
         "PageUp" => kVK_PageUp,
@@ -190,7 +197,7 @@ pub fn key_spec(name: &str) -> Option<KeySpec> {
         "Slash" | "/" => kVK_ANSI_Slash,
         "Backquote" | "`" => kVK_ANSI_Grave,
         "BracketLeft" | "[" => kVK_ANSI_LeftBracket,
-        "Backslash" | "\\\\" => kVK_ANSI_Backslash,
+        "Backslash" | "\\" => kVK_ANSI_Backslash,
         "BracketRight" | "]" => kVK_ANSI_RightBracket,
         "Quote" | "'" => kVK_ANSI_Quote,
         "Semicolon" | ";" => kVK_ANSI_Semicolon,
@@ -206,6 +213,14 @@ pub fn key_spec(name: &str) -> Option<KeySpec> {
         "F10" => kVK_F10,
         "F11" => kVK_F11,
         "F12" => kVK_F12,
+        "F13" => kVK_F13,
+        "F14" => kVK_F14,
+        "F15" => kVK_F15,
+        "F16" => kVK_F16,
+        "F17" => kVK_F17,
+        "F18" => kVK_F18,
+        "F19" => kVK_F19,
+        "F20" => kVK_F20,
         "A" | "a" => kVK_ANSI_A,
         "B" | "b" => kVK_ANSI_B,
         "C" | "c" => kVK_ANSI_C,
@@ -257,7 +272,36 @@ pub fn key_spec(name: &str) -> Option<KeySpec> {
         "NumpadSubtract" => kVK_ANSI_KeypadMinus,
         "NumpadDecimal" => kVK_ANSI_KeypadDecimal,
         "NumpadDivide" => kVK_ANSI_KeypadDivide,
-        _ => return None,
+        "NumpadEnter" => kVK_ANSI_KeypadEnter,
+        _ => {
+            let digits = match n.strip_prefix('F') {
+                Some(d) if d.len() <= 2 => d,
+                _ => return None,
+            };
+            match digits.parse::<u16>() {
+                Ok(1) => kVK_F1,
+                Ok(2) => kVK_F2,
+                Ok(3) => kVK_F3,
+                Ok(4) => kVK_F4,
+                Ok(5) => kVK_F5,
+                Ok(6) => kVK_F6,
+                Ok(7) => kVK_F7,
+                Ok(8) => kVK_F8,
+                Ok(9) => kVK_F9,
+                Ok(10) => kVK_F10,
+                Ok(11) => kVK_F11,
+                Ok(12) => kVK_F12,
+                Ok(13) => kVK_F13,
+                Ok(14) => kVK_F14,
+                Ok(15) => kVK_F15,
+                Ok(16) => kVK_F16,
+                Ok(17) => kVK_F17,
+                Ok(18) => kVK_F18,
+                Ok(19) => kVK_F19,
+                Ok(20) => kVK_F20,
+                _ => return None,
+            }
+        }
     };
     Some(KeySpec {
         vk: VIRTUAL_KEY(code),
@@ -312,6 +356,15 @@ pub fn keycode_to_token(code: u16) -> Option<String> {
         kVK_F10 => "F10".into(),
         kVK_F11 => "F11".into(),
         kVK_F12 => "F12".into(),
+        kVK_F13 => "F13".into(),
+        kVK_F14 => "F14".into(),
+        kVK_F15 => "F15".into(),
+        kVK_F16 => "F16".into(),
+        kVK_F17 => "F17".into(),
+        kVK_F18 => "F18".into(),
+        kVK_F19 => "F19".into(),
+        kVK_F20 => "F20".into(),
+        kVK_Help => "Insert".into(),
         kVK_ANSI_A => "A".into(),
         kVK_ANSI_B => "B".into(),
         kVK_ANSI_C => "C".into(),
@@ -363,6 +416,7 @@ pub fn keycode_to_token(code: u16) -> Option<String> {
         kVK_ANSI_KeypadMinus => "NumpadSubtract".into(),
         kVK_ANSI_KeypadDecimal => "NumpadDecimal".into(),
         kVK_ANSI_KeypadDivide => "NumpadDivide".into(),
+        kVK_ANSI_KeypadEnter => "Enter".into(),
         _ => return None,
     })
 }
@@ -403,12 +457,30 @@ pub struct MacosInjector {
 
 unsafe impl Send for MacosInjector {}
 
-impl Default for MacosInjector {
-    fn default() -> Self {
-        Self {
+impl MacosInjector {
+    pub fn new() -> Option<Self> {
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+        Some(Self {
             active_modifiers: HashSet::new(),
-            source: CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
-                .expect("Failed to create CGEventSource"),
+            source,
+        })
+    }
+}
+
+/// Release keys the worker still believes are held, without touching the
+/// worker thread. Used by the failsafe emergency path.
+pub fn post_key_ups(specs: &[KeySpec]) {
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        log::error!("failsafe release: failed to create CGEventSource");
+        return;
+    };
+    for spec in specs {
+        if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), spec.vk.0, false) {
+            if is_modifier_keycode(spec.vk.0) {
+                event.set_type(CGEventType::FlagsChanged);
+            }
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
+            event.post(CGEventTapLocation::HID);
         }
     }
 }
@@ -426,8 +498,12 @@ impl InputInjector for MacosInjector {
                     expected: specs.len() as u32, inserted: inserted as u32,
                     win32_error: 0, is_uipi_blocked: false,
                 })?;
-            if down { self.active_modifiers.insert(spec.vk.0); }
-            else { self.active_modifiers.remove(&spec.vk.0); }
+            // Only modifier keycodes carry flags; tracking anything else would
+            // fold a bogus flag into every subsequent event.
+            if is_modifier_keycode(spec.vk.0) {
+                if down { self.active_modifiers.insert(spec.vk.0); }
+                else { self.active_modifiers.remove(&spec.vk.0); }
+            }
             // Carry the state at this event, not the final state of the batch.
             // A sibling modifier (left/right) and physical modifiers remain set.
             // HID state excludes our synthetic keys and includes modifiers already
@@ -441,6 +517,13 @@ impl InputInjector for MacosInjector {
             }
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
             event.post(CGEventTapLocation::HID);
+            // Ledger for the failsafe release path.
+            let mut held = crate::engine::injected_held().lock();
+            if down {
+                held.insert(*spec);
+            } else {
+                held.remove(spec);
+            }
         }
         Ok(())
     }
@@ -458,6 +541,18 @@ impl InputInjector for MacosInjector {
         // Include keys held before our event tap was installed.
         unsafe { CGEventSourceKeyState(CGEventSourceStateID::HIDSystemState, vk.0) }
     }
+
+    fn is_button_physically_down(&self, btn: MouseButton) -> bool {
+        let num = match btn {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            MouseButton::Middle => 2,
+            MouseButton::XButton1 => 3,
+            MouseButton::XButton2 => 4,
+            _ => return false,
+        };
+        unsafe { CGEventSourceButtonState(CGEventSourceStateID::HIDSystemState, num) }
+    }
 }
 
 // =========================================================================
@@ -467,19 +562,41 @@ static TAP_PORT: AtomicUsize = AtomicUsize::new(0);
 extern "C" {
     fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
     fn CGEventSourceKeyState(state: CGEventSourceStateID, key: u16) -> bool;
+    fn CGEventSourceButtonState(state: CGEventSourceStateID, button: u32) -> bool;
 }
 
-static RUN_LOOP_REF: OnceLock<CFRunLoop> = OnceLock::new();
+extern "C" {
+    // core-foundation 0.10 exposes CFRunLoopStop but not CFRunLoopWakeUp.
+    fn CFRunLoopWakeUp(rl: core_foundation::runloop::CFRunLoopRef);
+}
+
+static RUN_LOOP_REF: parking_lot::Mutex<Option<CFRunLoop>> = parking_lot::Mutex::new(None);
+// Set when stop_hook() runs before the loop has published its runloop.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn stop_hook() {
-    if let Some(rl) = RUN_LOOP_REF.get() {
+    let rl = RUN_LOOP_REF.lock().take();
+    if let Some(rl) = rl {
         rl.stop();
+        unsafe { CFRunLoopWakeUp(rl.as_concrete_TypeRef()) };
+    } else {
+        STOP_REQUESTED.store(true, Ordering::SeqCst);
     }
+}
+
+/// Respawn the event tap after a recoverable failure (e.g. Accessibility
+/// permission was just granted). No-op while a loop is already live.
+pub fn retry_hook() {
+    if crate::engine::hook_status() == "ready" || RUN_LOOP_REF.lock().is_some() {
+        return;
+    }
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+    std::thread::spawn(hook_loop);
 }
 
 pub fn hook_loop() {
     if !check_accessibility_permission() {
-        crate::engine::set_hook_status("macOS 尚未授予辅助功能权限。请在系统设置 → 隐私与安全性 → 辅助功能中添加当前安装的 Mouse Insight。若旧版本已勾选，请移除旧条目并重新添加，再启动应用。");
+        crate::engine::set_hook_status("macOS 尚未授予辅助功能权限。请在系统设置 → 隐私与安全性 → 辅助功能中添加当前安装的 Mouse Insight。若旧版本已勾选，请移除旧条目并重新添加，再启动应用。授权后点击「重试监听」即可，无需重启。");
         return;
     }
 
@@ -507,7 +624,7 @@ pub fn hook_loop() {
     ) {
         Ok(t) => t,
         Err(_) => {
-            eprintln!("[MouseInsight] Failed to create CGEventTap. Please ensure Accessibility permissions are granted.");
+            log::error!("Failed to create CGEventTap. Please ensure Accessibility permissions are granted.");
             if ENGINE.get().is_some() {
                 crate::engine::set_hook_status("macOS 辅助功能已授权，但监听创建失败。请检查输入监控权限及其他鼠标工具；若刚替换应用，请重新添加当前应用的权限条目。");
             }
@@ -518,7 +635,7 @@ pub fn hook_loop() {
     let loop_source = match tap.mach_port().create_runloop_source(0) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("[MouseInsight] Failed to create runloop source for CGEventTap.");
+            log::error!("Failed to create runloop source for CGEventTap.");
             crate::engine::set_hook_status("鼠标监听启动失败，请重启应用。");
             return;
         }
@@ -530,16 +647,28 @@ pub fn hook_loop() {
     tap.enable();
     crate::engine::set_hook_status("ready");
 
-    let _ = RUN_LOOP_REF.set(current_rl);
+    *RUN_LOOP_REF.lock() = Some(current_rl);
+    if STOP_REQUESTED.swap(false, Ordering::SeqCst) {
+        // stop_hook() ran before the runloop was published.
+        *RUN_LOOP_REF.lock() = None;
+        TAP_PORT.store(0, Ordering::SeqCst);
+        return;
+    }
     CFRunLoop::run_current();
+    *RUN_LOOP_REF.lock() = None;
     TAP_PORT.store(0, Ordering::SeqCst);
 }
 
 fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
-    if matches!(etype, CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput) {
-        if let Some(eng) = ENGINE.get() {
-            let _ = eng.cmd_tx.send(InputCmd::EmergencyStop);
-        }
+    if etype == CGEventType::TapDisabledByUserInput {
+        // The system or the user revoked the tap; re-enabling it would just be
+        // disabled again. Surface it and let the user re-authorize + retry.
+        crate::engine::set_hook_status("macOS 已禁用事件监听（权限被撤销或系统策略），请重新授权后点击「重试监听」");
+        crate::engine::request_emergency_stop(false);
+        return CallbackResult::Keep;
+    }
+    if etype == CGEventType::TapDisabledByTimeout {
+        crate::engine::request_emergency_stop(false);
         let port = TAP_PORT.load(Ordering::SeqCst);
         if port != 0 { unsafe { CGEventTapEnable(port as *const _, true); } }
         return CallbackResult::Keep;
@@ -579,15 +708,48 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
                 }
             }
 
+            // Emergency stop: F13, or Ctrl+Option+Cmd+P. Not swallowed — the
+            // event keeps flowing so the chord also reaches other apps.
+            if down
+                && (keycode == kVK_F13
+                    || (keycode == kVK_ANSI_P
+                        && event.get_flags().contains(
+                            CGEventFlags::CGEventFlagControl
+                                | CGEventFlags::CGEventFlagAlternate
+                                | CGEventFlags::CGEventFlagCommand,
+                        )))
+            {
+                crate::engine::request_emergency_stop(true);
+            }
+
+            // A key-up whose down was swallowed during recording must stay
+            // swallowed, even after recording ended.
+            if !down && eng.swallowed_keys.write().remove(&(keycode as u32)) {
+                if eng.recording.load(Ordering::Relaxed) {
+                    let _ = eng.recorder.write().on_key(keycode as u32, false);
+                }
+                return CallbackResult::Drop;
+            }
+
             // Recording mode handling
             if eng.recording.load(Ordering::Relaxed) {
                 if keycode == kVK_Tab { return CallbackResult::Keep; }
                 if down && keycode == kVK_Escape {
+                    eng.swallowed_keys.write().insert(keycode as u32);
                     eng.recording.store(false, Ordering::Relaxed);
                     let _ = eng.cmd_tx.send(InputCmd::RecordCancel);
                     return CallbackResult::Drop;
                 }
 
+                // Keys without a token (CapsLock, F21+, media keys) pass
+                // through untouched — same as Windows.
+                if keycode_to_token(keycode).is_none() {
+                    return CallbackResult::Keep;
+                }
+
+                if down {
+                    eng.swallowed_keys.write().insert(keycode as u32);
+                }
                 let chord = eng.recorder.write().on_key(keycode as u32, down);
                 if !chord.is_empty() {
                     let _ = eng.cmd_tx.send(InputCmd::Record(chord));
@@ -625,19 +787,31 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
         CGEventType::RightMouseDown => (MouseButton::Right, true),
         CGEventType::RightMouseUp => (MouseButton::Right, false),
         CGEventType::ScrollWheel => {
-            let delta = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-            if delta > 0 {
-                (MouseButton::WheelUp, true)
-            } else if delta < 0 {
-                (MouseButton::WheelDown, true)
-            } else {
-                return CallbackResult::Keep;
+            let continuous = event
+                .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS)
+                != 0;
+            let d1 = event
+                .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+            if d1 == 0 {
+                return CallbackResult::Keep; // pure horizontal or empty event
+            }
+            static SCROLL_ACC: AtomicI64 = AtomicI64::new(0);
+            static LAST_SCROLL_STEP: AtomicU64 = AtomicU64::new(0);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match crate::engine::scroll_step(continuous, d1, &SCROLL_ACC, now_ms, &LAST_SCROLL_STEP) {
+                Some(b) => (b, true),
+                None => return CallbackResult::Keep,
             }
         }
         _ => return CallbackResult::Keep,
     };
 
-    let captured = down && eng.listening.swap(false, Ordering::Relaxed);
+    // Primary buttons never consume the listen session — they keep their
+    // system behavior; the frontend hints via the telemetry pulse.
+    let captured = down && !button.is_primary() && eng.listening.swap(false, Ordering::Relaxed);
     if captured {
         let _ = eng
             .cmd_tx
@@ -648,25 +822,30 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
     let compiled = eng.compiled.load_full();
     let action_opt = compiled.get(button).cloned();
     let is_mapped = action_opt.is_some() && !paused && !captured && !eng.recording.load(Ordering::Relaxed);
-    let mut swallow = (is_mapped || captured) && !button.is_primary();
+    let mut queued = false;
 
     if is_mapped {
-        let queued = eng.enqueue_edge(InputCmd::MouseEdge {
+        queued = eng.enqueue_edge(InputCmd::MouseEdge {
             button,
             down,
             action: action_opt,
             generation: compiled.generation,
+            at: Instant::now(),
         });
-        swallow &= queued;
-    } else if !down && !button.is_primary() {
-        let _ = eng.enqueue_edge(InputCmd::MouseEdge {
-            button,
-            down: false,
-            action: None,
-            generation: compiled.generation,
-        });
+    } else if !down && !button.is_primary() && !button.is_wheel() {
+        let bit = 1u32 << button as u32;
+        if eng.swallowed_buttons.load(Ordering::Relaxed) & bit != 0 {
+            let _ = eng.enqueue_edge(InputCmd::MouseEdge {
+                button,
+                down: false,
+                action: None,
+                generation: compiled.generation,
+                at: Instant::now(),
+            });
+        }
     }
 
+    let mut swallow = crate::engine::decide_swallow(button, down, is_mapped, captured, queued);
     if !button.is_primary() && !button.is_wheel() {
         let bit = 1u32 << button as u32;
         if down && swallow {

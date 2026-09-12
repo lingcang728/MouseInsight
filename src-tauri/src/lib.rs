@@ -1,3 +1,6 @@
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+compile_error!("Mouse Insight supports Windows and macOS only");
+
 mod engine;
 mod native_menu;
 #[cfg(target_os = "macos")]
@@ -20,9 +23,16 @@ fn get_snapshot() -> Snapshot {
 
 #[tauri::command]
 async fn save_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
+    // Earliest explicit cap; engine::set_mappings re-validates everything.
+    if mappings.len() > 5 { return Err("最多支持 5 个鼠标按键映射".into()); }
     let result = tauri::async_runtime::spawn_blocking(move || engine::set_mappings(mappings)).await.map_err(|e| e.to_string())?;
     native_menu::refresh();
     result
+}
+
+#[tauri::command]
+fn clear_recovery_notes() {
+    engine::clear_recovery_notes();
 }
 
 #[tauri::command]
@@ -42,16 +52,22 @@ async fn save_autostart(on: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn arm_listen() {
-    engine::arm_listen();
+fn arm_listen(window: tauri::Window) -> Result<u64, String> {
+    if !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false) {
+        return Err("窗口不在前台，已取消".into());
+    }
+    Ok(engine::arm_listen())
 }
 
 #[tauri::command]
 fn disarm_listen() { engine::disarm_listen(); }
 
 #[tauri::command]
-fn arm_record() {
-    engine::arm_record();
+fn arm_record(window: tauri::Window) -> Result<u64, String> {
+    if !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false) {
+        return Err("窗口不在前台，已取消".into());
+    }
+    Ok(engine::arm_record())
 }
 
 #[tauri::command]
@@ -70,20 +86,30 @@ fn remove_record_key(key: String) {
 }
 
 #[tauri::command]
+fn press_record_key(key: String, down: bool) {
+    engine::press_record_key(key, down);
+}
+
+#[tauri::command]
 fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
+    // SECURITY: exact-match whitelist only. Never relax to starts_with(): cmd /C start re-parses & and | as command separators.
     if url != "https://github.com/lingcang728/MouseInsight/releases/latest"
-        && url != "https://github.com/lingcang728/MouseInsight/releases" {
+        && url != "https://github.com/lingcang728/MouseInsight/releases"
+        && url != "https://developer.microsoft.com/microsoft-edge/webview2/" {
         return Err("Only Mouse Insight release pages can be opened".into());
     }
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        Command::new("cmd")
+        let cmd = std::env::var_os("SystemRoot")
+            .map(|root| std::path::PathBuf::from(root).join("System32\\cmd.exe"))
+            .unwrap_or_else(|| "cmd".into());
+        Command::new(cmd)
             .args(["/C", "start", "", &url])
             .spawn()
             .map_err(|e| format!("open url failed: {e}"))?;
@@ -115,32 +141,61 @@ fn xmbc_running() -> bool {
     engine::xmbc_running()
 }
 
-#[tauri::command]
-fn config_dir() -> String {
-    engine::config_dir().display().to_string()
-}
-
-#[tauri::command]
-fn open_config_dir() -> Result<(), String> {
-    let dir = engine::config_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create config directory failed: {e}"))?;
+fn open_dir(dir: std::path::PathBuf) -> Result<(), String> {
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create directory failed: {e}"))?;
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        Command::new("explorer").arg(dir).spawn().map_err(|e| e.to_string())?;
+        let explorer = std::env::var_os("SystemRoot")
+            .map(|root| std::path::PathBuf::from(root).join("explorer.exe"))
+            .unwrap_or_else(|| "explorer".into());
+        Command::new(explorer).arg(dir).spawn().map_err(|e| e.to_string())?;
     }
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
-        let status = Command::new("/usr/bin/open").arg(dir).status().map_err(|e| e.to_string())?;
-        if !status.success() { return Err("无法打开配置目录".into()); }
+        // Do not wait: `open` can block while Finder shows a dialog.
+        Command::new("/usr/bin/open").arg(dir).spawn().map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
+/// Re-arm the input hook after a recoverable failure — e.g. right after the
+/// user grants Accessibility permission on macOS.
 #[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
-    engine::shutdown();
+fn retry_hook() {
+    engine::retry_hook();
+}
+
+#[tauri::command]
+fn open_accessibility_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("仅 macOS".into())
+    }
+}
+
+#[tauri::command]
+fn open_config_dir() -> Result<(), String> {
+    open_dir(engine::config_dir())
+}
+
+#[tauri::command]
+fn open_logs_dir() -> Result<(), String> {
+    open_dir(engine::config_dir().join("logs"))
+}
+
+#[tauri::command]
+async fn quit_app(app: tauri::AppHandle) {
+    let _ = tauri::async_runtime::spawn_blocking(engine::shutdown).await;
     app.exit(0);
 }
 
@@ -214,7 +269,25 @@ fn create_main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
     {
         Ok(w) => Some(w),
         Err(err) => {
-            eprintln!("[MouseInsight] failed to create main window: {err}");
+            log::error!("failed to create main window: {err}");
+            #[cfg(target_os = "windows")]
+            {
+                use windows::core::w;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    MessageBoxW, MB_ICONERROR, MB_OK,
+                };
+                unsafe {
+                    let _ = MessageBoxW(
+                        None,
+                        w!("Mouse Insight 无法创建窗口。通常是缺少 Microsoft Edge WebView2 运行时，请安装后重试。"),
+                        w!("Mouse Insight"),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+                let _ = open_url(
+                    "https://developer.microsoft.com/microsoft-edge/webview2/".to_string(),
+                );
+            }
             None
         }
     }
@@ -248,15 +321,64 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Must work before the engine (and even the logger) exists.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let text = format!("panic: {msg}\nthread: {thread}\nlocation: {location}\n");
+        log::error!("{text}");
+        let dir = engine::config_dir().join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = std::fs::write(dir.join(format!("crash-{ts}.log")), text);
+    }));
+
     let is_autostart = std::env::args().any(|arg| arg == "--autostart");
     let quit_requested = std::env::args().any(|arg| arg == "--quit");
 
+    let log_targets = {
+        let mut targets = vec![tauri_plugin_log::Target::new(
+            tauri_plugin_log::TargetKind::Folder {
+                path: engine::config_dir().join("logs"),
+                file_name: Some("mouse-insight".into()),
+            },
+        )];
+        #[cfg(debug_assertions)]
+        targets.push(tauri_plugin_log::Target::new(
+            tauri_plugin_log::TargetKind::Stdout,
+        ));
+        targets
+    };
+
     let builder = tauri::Builder::default()
         .on_menu_event(native_menu::on_menu_event)
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets(log_targets)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+                .max_file_size(1_048_576)
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if argv.iter().any(|arg| arg == "--quit") {
                 engine::shutdown();
                 app.exit(0);
+                return;
+            }
+            if argv.iter().any(|arg| arg == "--autostart") {
                 return;
             }
             show_main_window(app);
@@ -297,6 +419,8 @@ pub fn run() {
             let handle_pause = app.handle().clone();
             let handle_err = app.handle().clone();
             let handle_state = app.handle().clone();
+            let handle_fatal = app.handle().clone();
+            let handle_hook = app.handle().clone();
 
             engine::start(
                 move |pulse: Pulse| {
@@ -332,6 +456,15 @@ pub fn run() {
                         let _ = handle_state.emit("runtime-binding-changed", state);
                     }
                 },
+                // Fatal/hook-status events must reach a hidden window too:
+                // the frontend re-reads them on next show.
+                move |msg: String| {
+                    let _ = handle_fatal.emit("engine-fatal", msg);
+                    native_menu::refresh();
+                },
+                move |status: String| {
+                    let _ = handle_hook.emit("hook-status-changed", status);
+                },
             );
 
             native_menu::setup(app)?;
@@ -356,11 +489,15 @@ pub fn run() {
             add_record_key,
             remove_record_key,
             take_record_keys,
+            press_record_key,
             app_version,
             open_url,
             xmbc_running,
-            config_dir,
             open_config_dir,
+            open_logs_dir,
+            retry_hook,
+            open_accessibility_settings,
+            clear_recovery_notes,
             quit_app
         ]);
 

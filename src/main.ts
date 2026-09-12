@@ -1,6 +1,6 @@
 import { isNewer, latestRelease, RELEASES_URL } from "./updates";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   type Mapping,
   type DraftMapping,
@@ -14,6 +14,9 @@ import {
   sanitizeMappings,
   codeToToken,
   normalizeMapping,
+  applyButtonChange,
+  applyModeChange,
+  removeKeyFromSlot,
 } from "./logic";
 
 type Pulse = {
@@ -44,6 +47,9 @@ type Snapshot = {
   listening: boolean;
   is_portable: boolean;
   config_dir: string;
+  emergency_hotkeys: number;
+  active_bindings: { mapping_id: string; button: string; mode: string; active: boolean }[];
+  recovery_notes: string[];
 };
 
 type RuntimeState = {
@@ -56,40 +62,118 @@ let selectedMappingId: string | null = null;
 const collapsedMappings = new Set<string>();
 let currentDraft: DraftMapping | null = null;
 let recordBuf: string[] = [];
+let keysFromBackend = false;
 let isPaused = false;
-const isMac = /Mac/i.test(navigator.platform);
-let listening = false;
+const isMac = /Mac/i.test(
+  (navigator as any).userAgentData?.platform ?? navigator.platform
+);
+let listenGen = 0;
+let localGen = 0;
+let draftGen = 0;
 let hookReady = false;
 let listenTimer = 0;
 let confirmedMappings: Mapping[] = [];
 let saveQueue: Promise<void> = Promise.resolve();
+let saveInFlight = 0;
+let pendingRemote: Mapping[] | null = null;
 let saveRevision = 0;
 let confirming = false;
 let focusBeforeRecord: HTMLElement | null = null;
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const runtimeStates: Map<string, RuntimeState> = new Map();
+const pendingPulses = new Map<string, Pulse>();
+let pendingDown: Pulse | null = null;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
+function invokeT<T>(cmd: string, args?: Record<string, unknown>, ms = 8000): Promise<T> {
+  return Promise.race([
+    invoke<T>(cmd, args),
+    new Promise<never>((_, reject) =>
+      window.setTimeout(() => reject(new Error(`操作超时（${cmd}）`)), ms)
+    ),
+  ]);
+}
+
+async function safeInvoke(
+  cmd: string,
+  args?: Record<string, unknown>,
+  failMsg?: string
+): Promise<void> {
+  try {
+    await invokeT(cmd, args);
+  } catch (err) {
+    showAlert(failMsg ?? `操作未完成：${String(err)}`);
+  }
+}
+
+let alertTimer = 0;
+let currentAlertKind: string | null = null;
+
+function showAlert(
+  msg: string,
+  opts: {
+    sticky?: boolean;
+    timeout?: number;
+    kind?: "save" | "hook" | "recovery" | "undo" | "info";
+    action?: { label: string; onClick: () => void };
+  } = {}
+) {
+  const banner = $("alert-banner");
+  if (!banner) return;
+  clearTimeout(alertTimer);
+  currentAlertKind = opts.kind ?? "info";
+  $("alert-text").textContent = msg;
+  const action = $("alert-action") as HTMLButtonElement;
+  if (opts.action) {
+    action.hidden = false;
+    action.textContent = opts.action.label;
+    action.onclick = () => opts.action?.onClick();
+  } else {
+    action.hidden = true;
+    action.onclick = null;
+  }
+  banner.classList.remove("hidden");
+  if (!opts.sticky) {
+    alertTimer = window.setTimeout(() => hideAlert(), opts.timeout ?? 6000);
+  }
+}
+
+function hideAlert(kind?: string) {
+  if (kind !== undefined && kind !== currentAlertKind) return;
+  clearTimeout(alertTimer);
+  currentAlertKind = null;
+  $("alert-banner")?.classList.add("hidden");
+}
+
 function prettyKeys(keys: string[]): string[] {
   if (!keys.length) return ["空"];
-  return keys.map((k) => {
-    if (k === "LControl") return "Left Ctrl";
-    if (k === "RControl") return "Right Ctrl";
-    if (k === "LAlt") return "Left Alt";
-    if (k === "RAlt") return "Right Alt";
-    if (k === "LShift") return "Left Shift";
-    if (k === "RShift") return "Right Shift";
-    if (k === "LWin") return isMac ? "⌘ Command" : "Left Win";
-    if (k === "RWin") return isMac ? "Right Command" : "Right Win";
-    return k;
-  });
+  const map: Record<string, string> = isMac
+    ? {
+        LControl: "⌃ Control", RControl: "⌃ Right Control",
+        LAlt: "⌥ Option", RAlt: "⌥ Right Option",
+        LShift: "⇧ Shift", RShift: "⇧ Right Shift",
+        LWin: "⌘ Command", RWin: "⌘ Right Command",
+      }
+    : {
+        LControl: "Left Ctrl", RControl: "Right Ctrl",
+        LAlt: "Left Alt", RAlt: "Right Alt",
+        LShift: "Left Shift", RShift: "Right Shift",
+        LWin: "Left Win", RWin: "Right Win",
+      };
+  const common: Record<string, string> = {
+    Space: "空格", Enter: "回车", Backspace: "退格", Escape: "Esc",
+    Delete: "Delete", Insert: "Insert", Home: "Home", End: "End",
+    PageUp: "PgUp", PageDown: "PgDn", Tab: "Tab",
+    ArrowLeft: "←", ArrowRight: "→", ArrowUp: "↑", ArrowDown: "↓",
+  };
+  return keys.map((k) => map[k] ?? common[k] ?? k);
 }
 
 function renderKeys(
   el: HTMLElement,
   keys: string[],
-  opts: { dimEmpty?: boolean; removable?: boolean } = {}
+  opts: { dimEmpty?: boolean; removable?: boolean; emptyText?: string } = {}
 ) {
   const dimEmpty = opts.dimEmpty !== false;
   const removable = !!opts.removable;
@@ -97,7 +181,7 @@ function renderKeys(
   if (!keys.length) {
     const span = document.createElement("span");
     span.className = `key${dimEmpty ? " dim" : ""}`;
-    span.textContent = "空";
+    span.textContent = opts.emptyText ?? "空";
     el.appendChild(span);
     return;
   }
@@ -128,10 +212,14 @@ function applyTheme(theme: string) {
 
 function setPausedUi(paused: boolean) {
   isPaused = paused;
-  $("engine-status").textContent = !hookReady ? "正在检查监听" : paused ? "映射已暂停" : "映射已启用";
+  if (hookReady) {
+    $("engine-status").textContent = mappings.length === 0
+      ? "尚未配置映射"
+      : paused ? "映射已暂停" : "映射已启用";
+  }
   $("engine-status").classList.toggle("paused", paused);
   $("btn-pause").setAttribute("aria-pressed", String(paused));
-  $("btn-pause").textContent = paused ? "继续映射" : "暂停映射";
+  $("btn-pause").textContent = paused ? "恢复映射" : "暂停映射";
   if (paused) {
     runtimeStates.clear();
     updateAllRuntimePills();
@@ -153,8 +241,8 @@ function getStatusPill(m: Mapping): { text: string; className: string } | null {
     return isActive
       ? { text: "保持中", className: "pill pill-on status-pill active" }
       : { text: "已关闭", className: "pill pill-off status-pill inactive" };
-  } else if (m.mode === "hold" || ((m.mode === "dual" || !m.mode) && (m.hold_keys?.length ?? 0))) {
-    return isActive
+  } else if ((m.mode === "dual" || !m.mode) && (m.hold_keys?.length ?? 0)) {
+    return isActive && state?.mode === "hold"
       ? { text: "按住中", className: "pill pill-hold status-pill active" }
       : null;
   }
@@ -263,6 +351,7 @@ function makeComboRow(
 }
 
 function renderMaps(liveButton?: string) {
+  setPausedUi(isPaused);
   resetDeck();
   const host = $("maps");
   $("mapping-count").textContent = `${mappings.length} / 5 已配置`;
@@ -275,7 +364,6 @@ function renderMaps(liveButton?: string) {
   if (!mappings.length) {
     host.replaceChildren();
     const p = document.createElement("p");
-    p.className = "meta";
     p.className = "empty-state";
     p.textContent = "从一颗侧键开始。选择上方按键，或点击「识别鼠标键」，把常用操作放到指尖。";
     host.appendChild(p);
@@ -287,6 +375,7 @@ function renderMaps(liveButton?: string) {
   if (!mappings.some((m) => m.id === selectedMappingId)) {
     selectedMappingId = mappings[0].id;
   }
+  updateDeckIndex();
 
   host.replaceChildren();
   [...mappings].sort((a, b) => Number(b.id === selectedMappingId) - Number(a.id === selectedMappingId)).forEach((m) => {
@@ -309,7 +398,7 @@ function renderMaps(liveButton?: string) {
       opt.value = btnKey;
       const isOccupied = mappings.some((other) => other.id !== m.id && other.button === btnKey);
       const labelText = BUTTON_LABEL[btnKey] ?? btnKey;
-      opt.textContent = isOccupied ? `${labelText} (已绑定)` : labelText;
+      opt.textContent = isOccupied ? `${labelText}（已绑定）` : labelText;
       opt.selected = m.button === btnKey;
       opt.disabled = isOccupied;
       selButton.appendChild(opt);
@@ -321,6 +410,7 @@ function renderMaps(liveButton?: string) {
     selMode.className = "map-sel-mode";
     const availableModes = getAllowedModesForButton(m.button);
     const uiMode = m.mode === "toggle" ? "toggle" : availableModes[0];
+    selMode.disabled = availableModes.length <= 1;
     availableModes.forEach((modeKey) => {
       const opt = document.createElement("option");
       opt.value = modeKey;
@@ -366,12 +456,33 @@ function renderMaps(liveButton?: string) {
 
     const desc = document.createElement("div");
     desc.className = "map-desc mode-hint";
-    desc.textContent = MODE_DESC[uiMode] ?? MODE_DESC[m.mode] ?? "";
+    const hasAnyKeys =
+      (m.keys?.length ?? 0) + (m.tap_keys?.length ?? 0) + (m.hold_keys?.length ?? 0) > 0;
+    desc.textContent = hasAnyKeys
+      ? MODE_DESC[uiMode] ?? MODE_DESC[m.mode] ?? ""
+      : "此映射未绑定任何键，不会生效";
     article.append(desc);
     host.appendChild(article);
   });
 
   renderDock();
+}
+
+function updateDeckIndex() {
+  const el = $("deck-index");
+  if (!el) return;
+  const idx = mappings.findIndex((m) => m.id === selectedMappingId);
+  el.textContent = mappings.length && idx >= 0 ? `第 ${idx + 1} / ${mappings.length} 张` : "";
+}
+
+function applyRemoteMappings(remote: Mapping[]) {
+  mappings = remote;
+  confirmedMappings = structuredClone(mappings);
+  if (!mappings.some((m) => m.id === selectedMappingId)) {
+    selectedMappingId = mappings[0]?.id ?? null;
+  }
+  renderMaps();
+  $("save-status").textContent = "已保存 · 即时生效";
 }
 
 async function persist() {
@@ -380,20 +491,36 @@ async function persist() {
   const revision = ++saveRevision;
   renderMaps();
   $("save-status").textContent = "正在保存…";
-  saveQueue = saveQueue.then(async () => {
-    try {
-      await invoke("save_mappings", { mappings: snapshot });
-      confirmedMappings = snapshot;
-      if (revision === saveRevision) $("save-status").textContent = "已保存 · 即时生效";
-    } catch (err) {
-      if (revision === saveRevision) {
-        mappings = structuredClone(confirmedMappings);
-        renderMaps();
-        $("save-status").textContent = "保存失败 · 已恢复";
+  saveInFlight++;
+  saveQueue = saveQueue
+    .then(async () => {
+      try {
+        await invokeT("save_mappings", { mappings: snapshot });
+        confirmedMappings = snapshot;
+        hideAlert("save");
+        if (revision === saveRevision) $("save-status").textContent = "已保存 · 即时生效";
+      } catch (err) {
+        if (revision === saveRevision) {
+          mappings = structuredClone(confirmedMappings);
+          renderMaps();
+          $("save-status").textContent = "保存失败 · 已恢复";
+        }
+        if (err instanceof Error && err.message.startsWith("操作超时")) {
+          saveQueue = Promise.resolve();
+          showAlert("保存超时，映射引擎可能卡住。已恢复到上次保存的配置。", { sticky: true, kind: "save" });
+        } else {
+          showAlert(`保存配置失败：${String(err)}`, { kind: "save" });
+        }
+      } finally {
+        saveInFlight--;
+        if (saveInFlight === 0 && pendingRemote) {
+          const remote = pendingRemote;
+          pendingRemote = null;
+          applyRemoteMappings(remote);
+        }
       }
-      showAlert(`保存配置失败: ${String(err)}`);
-    }
-  });
+    })
+    .catch(() => {});
   await saveQueue;
 }
 
@@ -409,6 +536,7 @@ function selectMapping(id: string) {
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   });
+  updateDeckIndex();
   renderDock();
 }
 
@@ -421,7 +549,7 @@ function showRecorder() {
 
 async function startRecorder() {
   try {
-    await invoke("arm_record");
+    await invokeT("arm_record");
   } catch (err) {
     await closeRecord();
     showAlert(`无法开始录制：${String(err)}`);
@@ -429,47 +557,34 @@ async function startRecorder() {
 }
 
 async function stopListening() {
-  listening = false;
+  listenGen = 0;
   clearTimeout(listenTimer);
   $("btn-listen").textContent = "识别鼠标键";
   $("listen-copy").textContent = "点击识别，再按侧键、中键或滚轮。也可以直接在下方选择按键。";
   document.querySelector(".listen-sheet")?.classList.remove("armed");
-  await invoke("disarm_listen");
-}
-
-function showAlert(msg: string) {
-  const banner = $("alert-banner");
-  if (banner) {
-    banner.textContent = msg;
-    banner.classList.remove("hidden");
-  }
-}
-
-function keysForSlot(m: Mapping, slot: "tap" | "hold" | "toggle"): string[] {
-  if (slot === "hold") return [...(m.hold_keys ?? [])];
-  if (slot === "tap") return [...(m.tap_keys ?? (m.mode === "click" ? m.keys : []))];
-  return [...(m.keys ?? [])];
+  await safeInvoke("disarm_listen");
 }
 
 async function openRecordForExisting(id: string, slot: "tap" | "hold" | "toggle" = "tap") {
   const m = mappings.find((x) => x.id === id);
   if (!m) return;
-  const initialKeys = keysForSlot(m, slot);
   currentDraft = {
     button: m.button,
     isNew: false,
     existingId: m.id,
-    initialKeys,
     slot,
+    gen: ++draftGen,
   };
   recordBuf = [];
+  keysFromBackend = false;
   showRecorder();
   const title = $("record-mask").querySelector("h2");
   if (title) {
     title.textContent =
       slot === "hold" ? "录长按组合键" : slot === "tap" ? "录短按组合键" : "录切换组合键";
   }
-  renderKeys($("record-keys"), [], { dimEmpty: false, removable: true });
+  renderKeys($("record-keys"), [], { dimEmpty: false, removable: true, emptyText: "正在监听键盘…" });
+  updateRecordOk();
   await startRecorder();
 }
 
@@ -477,29 +592,51 @@ async function openRecordForNew(button: string, slot?: "tap" | "hold" | "toggle"
   currentDraft = {
     button,
     isNew: true,
-    initialKeys: [],
     slot,
+    gen: ++draftGen,
   };
   recordBuf = [];
+  keysFromBackend = false;
   showRecorder();
   const title = $("record-mask").querySelector("h2");
   if (title) {
     title.textContent =
-      `设置${BUTTON_LABEL[button] ?? button}的快捷键`;
+      button === "wheelup" || button === "wheeldown"
+        ? "检测到滚轮 · 设置滚动快捷键"
+        : `为「${BUTTON_LABEL[button] ?? button}」设置快捷键`;
   }
-  renderKeys($("record-keys"), [], { removable: true });
+  renderKeys($("record-keys"), [], { removable: true, emptyText: "正在监听键盘…" });
+  updateRecordOk();
   await startRecorder();
+}
+
+const RECORD_HELP_DEFAULT =
+  "按下键盘组合，或选择上方预设。Esc 取消，Tab 切换焦点；如需映射它们，请点击对应按键。录制期间暂停触发鼠标映射。";
+
+function updateRecordOk() {
+  const ok = $("record-ok") as HTMLButtonElement;
+  const help = $("record-help");
+  if (recordBuf.length >= 16) {
+    ok.disabled = true;
+    if (help) help.textContent = "组合键最多 16 键";
+    return;
+  }
+  if (help) help.textContent = RECORD_HELP_DEFAULT;
+  ok.disabled = confirming || (recordBuf.length === 0 && !keysFromBackend);
 }
 
 async function closeRecord() {
   currentDraft = null;
   recordBuf = [];
+  keysFromBackend = false;
+  confirming = false;
+  ($("record-ok") as HTMLButtonElement).disabled = false;
   $("record-mask").classList.add("hidden");
   document.querySelector<HTMLElement>(".app")!.inert = false;
   if (focusBeforeRecord?.isConnected) focusBeforeRecord.focus();
   focusBeforeRecord = null;
   try {
-    await invoke("disarm_record");
+    await invokeT("disarm_record");
   } catch (err) {
     console.error("disarm_record failed:", err);
   }
@@ -511,13 +648,14 @@ async function confirmRecord() {
     return;
   }
   const draft = currentDraft;
+  if (currentDraft.gen !== draft.gen) return;
   let keys: string[] = [];
   try {
-    keys = await invoke<string[]>("take_record_keys");
+    keys = await invokeT<string[]>("take_record_keys");
   } catch (err) {
     console.error("take_record_keys error:", err);
   }
-  if (currentDraft !== draft) return;
+  if (currentDraft?.gen !== draft.gen) return;
   const rawKeys = keys.length ? keys : recordBuf;
   const finalKeys = normalizeKeyChord(rawKeys);
   if (!finalKeys.length) {
@@ -526,11 +664,11 @@ async function confirmRecord() {
     return;
   }
 
-  const slot = currentDraft.slot ?? (inferTriggerMode(currentDraft.button, finalKeys) === "hold" ? "hold" : "tap");
-  if (currentDraft.isNew) {
+  const slot = draft.slot ?? (inferTriggerMode(draft.button, finalKeys) === "hold" ? "hold" : "tap");
+  if (draft.isNew) {
     const newMapping: Mapping = normalizeMapping({
       id: crypto.randomUUID(),
-      button: currentDraft.button,
+      button: draft.button,
       mode: slot === "toggle" ? "toggle" : "dual",
       keys: slot === "toggle" ? [...finalKeys] : [],
       tap_keys: slot === "tap" ? [...finalKeys] : [],
@@ -539,17 +677,14 @@ async function confirmRecord() {
     mappings.push(newMapping);
     selectedMappingId = newMapping.id;
   } else {
-    const existing = mappings.find((x) => x.id === currentDraft?.existingId);
+    const existing = mappings.find((x) => x.id === draft.existingId);
     if (existing) {
       if (slot === "toggle") {
         existing.mode = "toggle";
         existing.keys = [...finalKeys];
-        existing.tap_keys = [];
-        existing.hold_keys = [];
       } else if (slot === "hold") {
         existing.hold_keys = [...finalKeys];
-        existing.mode = existing.mode === "toggle" ? "dual" : existing.mode || "dual";
-        if (existing.mode !== "toggle") existing.mode = "dual";
+        existing.mode = "dual";
       } else {
         existing.tap_keys = [...finalKeys];
         if (existing.mode !== "toggle") existing.mode = "dual";
@@ -558,87 +693,81 @@ async function confirmRecord() {
     }
   }
 
+  if (currentDraft?.gen !== draft.gen) return;
   await persist();
+  if (currentDraft?.gen !== draft.gen) return;
+  hideAlert("save");
   await closeRecord();
 }
 
-async function checkHook(attempt = 0): Promise<void> {
-  const status = await invoke<string>("get_hook_status");
-  if (status === "starting" && attempt < 10) {
-    window.setTimeout(() => { void checkHook(attempt + 1); }, 500);
+function applyHookStatus(status: string) {
+  if (status === "starting") {
+    $("engine-status").textContent = "正在检查监听";
     return;
   }
-  hookReady = status === "ready";
-  if (hookReady) setPausedUi(isPaused);
-  else {
-    $("engine-status").textContent = "监听需要处理";
-    showAlert(status === "starting" ? "监听启动超时，请重新启动应用。" : status);
+  if (status === "ready") {
+    hookReady = true;
+    setPausedUi(isPaused);
+    hideAlert("hook");
+    return;
+  }
+  hookReady = false;
+  $("engine-status").textContent = "监听需要处理";
+  if (isMac && status.includes("辅助功能")) {
+    showAlert(status, {
+      sticky: true,
+      kind: "hook",
+      action: {
+        label: "打开辅助功能设置",
+        onClick: () => {
+          void safeInvoke("open_accessibility_settings");
+          window.setTimeout(() => void safeInvoke("retry_hook"), 3000);
+        },
+      },
+    });
+    return;
+  }
+  showAlert(status, {
+    sticky: true,
+    kind: "hook",
+    action: { label: "重试监听", onClick: () => void safeInvoke("retry_hook") },
+  });
+}
+
+async function checkHook(attempt = 0): Promise<void> {
+  try {
+    const status = await invokeT<string>("get_hook_status");
+    if (status === "starting" && attempt < 10) {
+      window.setTimeout(() => { void checkHook(attempt + 1); }, 500);
+      return;
+    }
+    applyHookStatus(status === "starting" ? "监听启动超时，请重新启动应用。" : status);
+  } catch (err) {
+    $("engine-status").textContent = "无法读取监听状态";
+    showAlert(`无法读取监听状态：${String(err)}`, { kind: "hook" });
   }
 }
 
 async function boot() {
-  await listen("mappings-changed", async () => {
-    await saveQueue;
-    const latest = await invoke<Snapshot>("get_snapshot");
-    mappings = sanitizeMappings(latest.config.mappings);
-    confirmedMappings = structuredClone(mappings);
-    renderMaps();
-    $("save-status").textContent = "已保存 · 即时生效";
-  });
-  const snap = await invoke<Snapshot>("get_snapshot");
-  const rawMappings = snap.config.mappings ?? [];
-  mappings = sanitizeMappings(rawMappings);
-  confirmedMappings = structuredClone(mappings);
+  const unlisteners: UnlistenFn[] = [];
 
-  if (mappings.length) {
-    selectedMappingId = mappings[0].id;
-  }
-  if (JSON.stringify(rawMappings) !== JSON.stringify(mappings)) {
-    await persist();
-  }
+  unlisteners.push(
+    await listen<Mapping[]>("mappings-changed", (ev) => {
+      const remote = sanitizeMappings(ev.payload ?? []);
+      if (saveInFlight > 0) {
+        pendingRemote = remote;
+        return;
+      }
+      applyRemoteMappings(remote);
+    })
+  );
 
-  applyTheme(snap.config.theme || "light");
-  setPausedUi(!!snap.config.paused);
-  void checkHook();
-  const autostartBox = $("chk-autostart") as HTMLInputElement;
-  try {
-    const { isEnabled } = await import("@tauri-apps/plugin-autostart");
-    const enabled = await isEnabled();
-    autostartBox.checked = enabled;
-    if (enabled !== !!snap.config.autostart) {
-      await invoke("save_autostart", { on: enabled });
-    }
-  } catch {
-    autostartBox.checked = !!snap.config.autostart;
-  }
-  $("xmbc-banner").classList.toggle("hidden", !snap.xmbc_running);
-
-  const modeTag = snap.is_portable ? "[便携模式] " : "[标准安装] ";
-  const pathEl = $("cfg-path");
-  pathEl.textContent = `${modeTag}${snap.config_dir}`;
-  pathEl.title = "点击在文件资源管理器中定位配置目录";
-  pathEl.addEventListener("click", async () => {
-    await invoke("open_config_dir");
-  });
-
-  if (isMac) {
-    $("safety-copy").textContent = "左键与右键始终保留原操作。首次使用请授予辅助功能权限；异常时可从托盘暂停。";
-    document.querySelector<HTMLButtonElement>('[data-key="LWin"]')!.textContent = "⌘ Command";
-  }
-  paintDots("");
-  renderMaps();
-
-  if (snap.last) {
-    $("pulse-name").textContent = BUTTON_LABEL[snap.last.button] ?? snap.last.button;
-    highlightMouse(snap.last.button);
-    paintDots(snap.last.button);
-  }
-
-  const pendingPulses = new Map<string, Pulse>();
-  let pendingDown: Pulse | null = null;
   let feedbackTimer = 0;
   let pulseRaf = 0;
   const applyPulse = (p: Pulse) => {
+    if (listenGen && p.down && (p.button === "left" || p.button === "right")) {
+      $("listen-copy").textContent = "左/右键仅用于识别，不支持映射。请按侧键、中键或滚轮。";
+    }
     $("pulse-name").textContent = BUTTON_LABEL[p.button] ?? p.button;
     $("pulse-state").textContent = p.down
       ? p.swallowed
@@ -660,108 +789,226 @@ async function boot() {
         document.querySelectorAll(".map").forEach((el) => {
           el.classList.toggle("selected", (el as HTMLElement).dataset.id === active.id);
         });
+        updateDeckIndex();
         renderDock();
       }
     }
 
-    const targetMap = mappings.find((m) => m.button === p.button);
-    if (targetMap && targetMap.mode === "hold") {
-      runtimeStates.set(p.button, { active: p.down, mode: "hold" });
-      updateAllRuntimePills();
-    }
   };
-  await listen<Pulse>("mouse-pulse", (ev) => {
-    pendingPulses.set(ev.payload.button, ev.payload);
-    if (ev.payload.down) pendingDown = ev.payload;
-    if (pulseRaf) return;
-    pulseRaf = window.requestAnimationFrame(() => {
-      pulseRaf = 0;
-      for (const pulse of pendingPulses.values()) applyPulse(pulse);
-      pendingPulses.clear();
-      if (pendingDown) {
-        const pulse = pendingDown;
-        const host = document.querySelector<HTMLElement>(".pulse-sheet")!;
-        if (!reducedMotion.matches) {
-          host.getAnimations().forEach((animation) => animation.cancel());
-          const ring = document.querySelector<HTMLElement>(".signal-ring")!;
-          ring.getAnimations().forEach((animation) => animation.cancel());
-          ring.animate([{ transform: "scale(.7)", opacity: "var(--impact-opacity)" }, { transform: "scale(1.55)", opacity: 0 }], { duration: 480, easing: "cubic-bezier(.16,1,.3,1)" });
-          host.animate([{ transform: "scale(1)" }, { transform: "scale(1.012)" }, { transform: "scale(1)" }], { duration: 320, easing: "cubic-bezier(.2,.8,.2,1)" });
+  unlisteners.push(
+    await listen<Pulse>("mouse-pulse", (ev) => {
+      pendingPulses.set(ev.payload.button, ev.payload);
+      if (ev.payload.down) pendingDown = ev.payload;
+      if (pulseRaf) return;
+      pulseRaf = window.requestAnimationFrame(() => {
+        pulseRaf = 0;
+        for (const pulse of pendingPulses.values()) applyPulse(pulse);
+        pendingPulses.clear();
+        if (pendingDown) {
+          const pulse = pendingDown;
+          const host = document.querySelector<HTMLElement>(".pulse-sheet")!;
+          if (!reducedMotion.matches) {
+            host.getAnimations().forEach((animation) => animation.cancel());
+            const ring = document.querySelector<HTMLElement>(".signal-ring")!;
+            ring.getAnimations().forEach((animation) => animation.cancel());
+            ring.animate([{ transform: "scale(.7)", opacity: "var(--impact-opacity)" }, { transform: "scale(1.55)", opacity: 0 }], { duration: 480, easing: "cubic-bezier(.16,1,.3,1)" });
+            host.animate([{ transform: "scale(1)" }, { transform: "scale(1.012)" }, { transform: "scale(1)" }], { duration: 320, easing: "cubic-bezier(.2,.8,.2,1)" });
+          }
+          highlightMouse(pulse.button);
+          clearTimeout(feedbackTimer);
+          feedbackTimer = window.setTimeout(() => {
+            highlightMouse("");
+            document.querySelectorAll(".map.live").forEach((el) => el.classList.remove("live"));
+          }, 240);
+          pendingDown = null;
         }
-        highlightMouse(pulse.button);
-        clearTimeout(feedbackTimer);
-        feedbackTimer = window.setTimeout(() => {
-          highlightMouse("");
-          document.querySelectorAll(".map.live").forEach((el) => el.classList.remove("live"));
-        }, 240);
-        pendingDown = null;
-      }
-    });
-  });
-
-  await listen<{ button: string; active: boolean; mode?: string }>(
-    "runtime-binding-changed",
-    (ev) => {
-      const { button, active, mode } = ev.payload;
-      runtimeStates.set(button, { active, mode });
-      updateAllRuntimePills();
-    }
+      });
+    })
   );
 
-  await listen<{ paused: boolean }>("engine-state-changed", (ev) => {
-    setPausedUi(ev.payload.paused);
-  });
+  unlisteners.push(
+    await listen<{ button: string; active: boolean; mode?: string }>(
+      "runtime-binding-changed",
+      (ev) => {
+        const { button, active, mode } = ev.payload;
+        runtimeStates.set(button, { active, mode });
+        updateAllRuntimePills();
+      }
+    )
+  );
 
-  await listen<SendReport>("injection-error", (ev) => {
-    const r = ev.payload;
-    if (r.is_uipi_blocked) {
-      showAlert("⚠️ 快捷键注入受阻：目标窗口可能以管理员权限运行（受 Windows UIPI 特权保护）。如有需要，请以管理员身份启动 Mouse Insight。");
-    } else {
-      showAlert(`⚠️ 按键注入失败 (成功 ${r.inserted}/${r.expected}, 错误码 ${r.win32_error})`);
-    }
-  });
+  unlisteners.push(
+    await listen<{ paused: boolean }>("engine-state-changed", (ev) => {
+      setPausedUi(ev.payload.paused);
+    })
+  );
 
-  await listen<string>("listen-captured", async (ev) => {
-    const capturedButton = ev.payload;
-    await stopListening();
-    if (currentDraft) return;
+  unlisteners.push(
+    await listen<SendReport>("injection-error", (ev) => {
+      const r = ev.payload;
+      if (r.is_uipi_blocked) {
+        showAlert("⚠️ 快捷键注入受阻：目标窗口可能以管理员权限运行（受 Windows UIPI 特权保护）。如有需要，请以管理员身份启动 Mouse Insight。");
+      } else {
+        showAlert(`⚠️ 按键注入失败（成功 ${r.inserted}/${r.expected}，错误码 ${r.win32_error}）`);
+      }
+    })
+  );
 
-    // 严格限制：左键和右键仅用于识别，不支持映射
-    if (capturedButton === "left" || capturedButton === "right") {
-      showAlert("左/右键仅用于识别，为防止误锁系统，不支持映射。");
-      $("listen-copy").textContent = `听到了：${BUTTON_LABEL[capturedButton] ?? capturedButton}（仅用于识别，不支持映射）。`;
-      $("btn-listen").textContent = "开始听";
+  unlisteners.push(
+    await listen<string>("engine-fatal", (ev) => {
+      showAlert(`${ev.payload}。请重启应用。`, { sticky: true });
+      $("engine-status").textContent = "引擎已停止";
+    })
+  );
+
+  unlisteners.push(
+    await listen<string>("hook-status-changed", (ev) => {
+      applyHookStatus(ev.payload);
+    })
+  );
+
+  unlisteners.push(
+    await listen<string>("listen-captured", async (ev) => {
+      if (!listenGen) return;
+      const capturedButton = ev.payload;
+      await stopListening();
+      if (currentDraft) return;
+
+      // 左右键仅用于识别，不支持映射（后端不会为主键发此事件，防御保留）
+      if (capturedButton === "left" || capturedButton === "right") {
+        showAlert("左/右键仅用于识别，为防止误锁系统，不支持映射。");
+        $("listen-copy").textContent = `听到了：${BUTTON_LABEL[capturedButton] ?? capturedButton}（仅用于识别，不支持映射）。`;
+        $("btn-listen").textContent = "再识别一次";
+        document.querySelector(".listen-sheet")?.classList.remove("armed");
+        return;
+      }
+
+      $("listen-copy").textContent = `听到了：${BUTTON_LABEL[capturedButton] ?? capturedButton}。请录键盘。`;
+      $("btn-listen").textContent = "再识别一次";
       document.querySelector(".listen-sheet")?.classList.remove("armed");
-      return;
+
+      const existing = mappings.find((x) => x.button === capturedButton);
+      const inferredSlot =
+        capturedButton === "wheelup" || capturedButton === "wheeldown" ? "tap" : "hold";
+      if (existing) {
+        selectedMappingId = existing.id;
+        renderMaps(capturedButton);
+        showAlert(`「${BUTTON_LABEL[capturedButton] ?? capturedButton}」已有映射，新录的键会覆盖对应槽位。`);
+        const slot =
+          existing.mode === "toggle" ? "toggle" : inferredSlot === "hold" && !(existing.hold_keys?.length) && (existing.tap_keys?.length) ? "tap" : inferredSlot;
+        await openRecordForExisting(existing.id, slot);
+      } else {
+        await openRecordForNew(capturedButton);
+      }
+    })
+  );
+
+  unlisteners.push(
+    await listen<string[]>("record-keys", (ev) => {
+      if (!currentDraft) return;
+      recordBuf = ev.payload ?? [];
+      if (recordBuf.length) keysFromBackend = true;
+      renderKeys($("record-keys"), recordBuf, { removable: true });
+      updateRecordOk();
+    })
+  );
+
+  unlisteners.push(
+    await listen("record-cancel", () => {
+      closeRecord();
+    })
+  );
+
+  window.addEventListener("beforeunload", () => {
+    for (const u of unlisteners) u();
+  });
+
+  const snap = await invokeT<Snapshot>("get_snapshot");
+  const rawMappings = snap.config.mappings ?? [];
+  mappings = sanitizeMappings(rawMappings);
+  confirmedMappings = structuredClone(mappings);
+
+  if (mappings.length) {
+    selectedMappingId = mappings[0].id;
+  }
+  if (JSON.stringify(rawMappings) !== JSON.stringify(mappings)) {
+    await persist();
+  }
+
+  applyTheme(snap.config.theme || "light");
+  setPausedUi(!!snap.config.paused);
+  void checkHook();
+  const autostartBox = $("chk-autostart") as HTMLInputElement;
+  try {
+    const { isEnabled, enable } = await import("@tauri-apps/plugin-autostart");
+    const enabled = await isEnabled();
+    autostartBox.checked = enabled;
+    if (enabled !== !!snap.config.autostart) {
+      await invokeT("save_autostart", { on: enabled });
     }
-
-    $("listen-copy").textContent = `听到了：${BUTTON_LABEL[capturedButton] ?? capturedButton}。请录键盘。`;
-    $("btn-listen").textContent = "再听一颗";
-    document.querySelector(".listen-sheet")?.classList.remove("armed");
-
-    const existing = mappings.find((x) => x.button === capturedButton);
-    const inferredSlot =
-      capturedButton === "wheelup" || capturedButton === "wheeldown" ? "tap" : "hold";
-    if (existing) {
-      selectedMappingId = existing.id;
-      renderMaps(capturedButton);
-      const slot =
-        existing.mode === "toggle" ? "toggle" : inferredSlot === "hold" && !(existing.hold_keys?.length) && (existing.tap_keys?.length) ? "tap" : inferredSlot;
-      await openRecordForExisting(existing.id, slot);
-    } else {
-      await openRecordForNew(capturedButton);
+    if (!isMac && enabled) {
+      // Refresh the Run-key entry so a moved exe still resolves (P1-30).
+      try { await enable(); } catch (e) { console.warn("autostart refresh failed", e); }
     }
+  } catch {
+    autostartBox.checked = !!snap.config.autostart;
+  }
+  $("xmbc-banner").classList.toggle("hidden", !snap.xmbc_running);
+
+  const modeTag = snap.is_portable ? "[便携模式] " : "[标准安装] ";
+  const pathEl = $("cfg-path");
+  pathEl.textContent = `${modeTag}${snap.config_dir}`;
+  pathEl.title = isMac
+    ? "点击在访达中定位配置目录"
+    : "点击在文件资源管理器中定位配置目录";
+  pathEl.addEventListener("click", async () => {
+    await safeInvoke("open_config_dir");
   });
 
-  await listen<string[]>("record-keys", (ev) => {
-    if (!currentDraft) return;
-    recordBuf = ev.payload ?? [];
-    renderKeys($("record-keys"), recordBuf, { removable: true });
-  });
+  const hotkeys = snap.emergency_hotkeys ?? 0;
+  if (isMac) {
+    $("safety-copy").textContent = "左键与右键始终保留原操作。紧急暂停：F13 或 ⌃⌥⌘P；也可从菜单栏暂停。";
+    document.querySelector<HTMLButtonElement>('[data-key="LWin"]')!.textContent = "⌘ Command";
+  } else if ((hotkeys & 1) === 0 && (hotkeys & 2) === 0) {
+    $("safety-copy").textContent = "左键与右键始终保留原操作。⚠ Pause/Scroll Lock 急停热键被其他程序占用，请从托盘暂停。";
+  } else if ((hotkeys & 1) === 0 || (hotkeys & 2) === 0) {
+    const usable = (hotkeys & 1) !== 0 ? "Pause" : "Scroll Lock";
+    $("safety-copy").textContent = `左键与右键始终保留原操作。紧急暂停：${usable}；也可从托盘暂停。`;
+  }
+  paintDots("");
+  renderMaps();
 
-  await listen("record-cancel", () => {
-    closeRecord();
-  });
+  if (snap.last) {
+    $("pulse-name").textContent = BUTTON_LABEL[snap.last.button] ?? snap.last.button;
+    highlightMouse(snap.last.button);
+    paintDots(snap.last.button);
+  }
+
+  for (const b of snap.active_bindings ?? []) {
+    runtimeStates.set(b.button, { active: b.active, mode: b.mode });
+  }
+  updateAllRuntimePills();
+
+  if (snap.listening && !listenGen) {
+    listenGen = ++localGen;
+    $("listen-copy").textContent = "请按侧键、中键或滚轮。15 秒后自动结束识别。";
+    $("btn-listen").textContent = "取消识别";
+    document.querySelector(".listen-sheet")?.classList.add("armed");
+  }
+
+  if (snap.recovery_notes?.length) {
+    showAlert(snap.recovery_notes.join("；"), {
+      sticky: true,
+      kind: "recovery",
+      action: {
+        label: "知道了",
+        onClick: () => {
+          void safeInvoke("clear_recovery_notes");
+          hideAlert();
+        },
+      },
+    });
+  }
 }
 
 $("btn-theme").addEventListener("click", async () => {
@@ -770,8 +1017,8 @@ $("btn-theme").addEventListener("click", async () => {
   const next = previous === "dark" ? "light" : "dark";
   button.disabled = true;
   applyTheme(next);
-  try { await invoke("save_theme", { theme: next }); }
-  catch (err) { applyTheme(previous); showAlert(`主题保存失败：${String(err)}`); }
+  try { await invokeT("save_theme", { theme: next }); }
+  catch (err) { applyTheme(previous); showAlert(`主题保存失败：${String(err)}`, { kind: "save" }); }
   finally { button.disabled = false; }
 });
 
@@ -780,21 +1027,37 @@ $("btn-pause").addEventListener("click", async () => {
   const button = $("btn-pause") as HTMLButtonElement;
   button.disabled = true;
   try {
-    await invoke("save_paused", { paused: next });
+    await invokeT("save_paused", { paused: next });
     setPausedUi(next);
-  } catch (err) { showAlert(`暂停状态保存失败：${String(err)}`); }
+    hideAlert("save");
+  } catch (err) { showAlert(`暂停状态保存失败：${String(err)}`, { kind: "save" }); }
   finally { button.disabled = false; }
 });
 
 $("btn-listen").addEventListener("click", async () => {
-  if (listening) { await stopListening(); return; }
-  listening = true;
+  if (listenGen) { await stopListening(); return; }
+  if (!hookReady) {
+    showAlert("监听尚未就绪，暂时无法识别。");
+    return;
+  }
+  const gen = ++localGen;
+  listenGen = gen;
   $("listen-copy").textContent = "请按侧键、中键或滚轮。15 秒后自动结束识别。";
   $("btn-listen").textContent = "取消识别";
   document.querySelector(".listen-sheet")?.classList.add("armed");
   try {
-    await invoke("arm_listen");
-    listenTimer = window.setTimeout(() => { void stopListening(); }, 15000);
+    await invokeT("arm_listen");
+    if (listenGen !== gen) return;
+    if (!document.hasFocus()) {
+      await stopListening();
+      return;
+    }
+    listenTimer = window.setTimeout(() => {
+      if (listenGen === gen) {
+        void stopListening();
+        showAlert("15 秒内未检测到鼠标按键，识别已结束。");
+      }
+    }, 15000);
   } catch (err) {
     await stopListening();
     showAlert(`无法识别：${String(err)}`);
@@ -824,12 +1087,22 @@ $("record-presets").addEventListener("click", async (event) => {
     enter: ["Enter"],
   };
   if (!keys[preset]) return;
-  await invoke("arm_record");
-  for (const key of keys[preset]) await invoke("add_record_key", { key });
+  for (const key of keys[preset]) await safeInvoke("add_record_key", { key });
 });
 
+let quitArmed = false;
 $("btn-quit").addEventListener("click", async () => {
-  await invoke("quit_app");
+  const btn = $("btn-quit") as HTMLButtonElement;
+  if (!quitArmed) {
+    quitArmed = true;
+    btn.textContent = "再点一次确认退出";
+    window.setTimeout(() => {
+      quitArmed = false;
+      btn.textContent = "退出应用";
+    }, 3000);
+    return;
+  }
+  await safeInvoke("quit_app");
 });
 
 $("maps").addEventListener("change", async (e) => {
@@ -842,37 +1115,16 @@ $("maps").addEventListener("change", async (e) => {
   if (!sel.matches("select[data-k]")) return;
 
   if (sel.dataset.k === "button") {
-    const nextBtn = sel.value;
-    const isConflict = mappings.some((other) => other.id !== m.id && other.button === nextBtn);
-    if (isConflict) {
+    const changed = applyButtonChange(m, sel.value, mappings);
+    if (!changed) {
       sel.value = m.button;
       return;
     }
     runtimeStates.delete(m.button);
-    m.button = nextBtn;
-    if (nextBtn === "wheelup" || nextBtn === "wheeldown") {
-      m.mode = "click";
-      m.tap_keys = m.tap_keys?.length ? m.tap_keys : m.keys;
-      m.hold_keys = [];
-    }
+    Object.assign(m, changed);
   }
   if (sel.dataset.k === "mode") {
-    if (sel.value === "toggle") {
-      m.mode = "toggle";
-      m.keys = m.tap_keys?.length ? m.tap_keys : m.hold_keys?.length ? m.hold_keys : m.keys;
-      m.tap_keys = [];
-      m.hold_keys = [];
-    } else if (sel.value === "click") {
-      m.mode = "click";
-      m.tap_keys = m.tap_keys?.length ? m.tap_keys : m.keys;
-      m.hold_keys = [];
-    } else {
-      m.mode = "dual";
-      if (!m.tap_keys?.length && !m.hold_keys?.length && m.keys.length) {
-        m.hold_keys = inferTriggerMode(m.button, m.keys) === "hold" ? m.keys : [];
-        m.tap_keys = m.hold_keys.length ? [] : m.keys;
-      }
-    }
+    Object.assign(m, applyModeChange(m, sel.value as "toggle" | "click" | "dual"));
   }
 
   // 清除该按键的旧 runtime 活跃状态
@@ -895,14 +1147,29 @@ $("maps").addEventListener("click", async (e) => {
   }
   if (t.dataset.act === "del") {
     const target = mappings.find((m) => m.id === id);
-    if (target) {
-      runtimeStates.delete(target.button);
-    }
+    if (!target) return;
+    const removed = structuredClone(target);
+    runtimeStates.delete(target.button);
     mappings = mappings.filter((m) => m.id !== id);
     if (selectedMappingId === id) {
       selectedMappingId = mappings[0]?.id ?? null;
     }
     await persist();
+    showAlert(`已删除「${BUTTON_LABEL[target.button] ?? target.button}」的映射`, {
+      timeout: 5000,
+      kind: "undo",
+      action: {
+        label: "撤销",
+        onClick: () => {
+          if (!mappings.some((m) => m.id === removed.id)) {
+            mappings.push(removed);
+            selectedMappingId = removed.id;
+            void persist();
+          }
+          hideAlert();
+        },
+      },
+    });
     return;
   }
 
@@ -915,14 +1182,7 @@ $("maps").addEventListener("click", async (e) => {
       | undefined;
     const target = mappings.find((m) => m.id === id);
     if (target && slot) {
-      if (slot === "hold") {
-        target.hold_keys = (target.hold_keys ?? []).filter((k) => k !== removeKey);
-      } else if (slot === "tap") {
-        target.tap_keys = (target.tap_keys ?? []).filter((k) => k !== removeKey);
-      } else {
-        target.keys = target.keys.filter((k) => k !== removeKey);
-      }
-      if (slot !== "toggle") target.keys = target.tap_keys?.length ? [...target.tap_keys] : [...(target.hold_keys ?? [])];
+      Object.assign(target, removeKeyFromSlot(target, slot, removeKey));
       await persist();
     }
     return;
@@ -966,20 +1226,27 @@ $("record-keys").addEventListener("click", async (e) => {
   e.stopPropagation();
   recordBuf = recordBuf.filter((k) => k !== key);
   renderKeys($("record-keys"), recordBuf, { removable: true });
-  await invoke("remove_record_key", { key });
+  updateRecordOk();
+  await safeInvoke("remove_record_key", { key });
 });
 
 $("record-chips").addEventListener("click", async (e) => {
   const t = e.target as HTMLElement;
   const key = t.dataset.key;
-  if (!key) return;
-  await invoke("add_record_key", { key });
+  if (!key || !currentDraft) return;
+  await safeInvoke("add_record_key", { key });
 });
 
 window.addEventListener(
   "keydown",
   (e) => {
     if (!currentDraft) return;
+    if (
+      (e.key === "Enter" || e.key === " ") &&
+      (e.target as HTMLElement).closest?.("#record-mask button")
+    ) {
+      return;
+    }
     if (e.key === "Tab") {
       const buttons = Array.from($("record-mask").querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
       const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
@@ -996,22 +1263,49 @@ window.addEventListener(
     e.preventDefault();
     e.stopPropagation();
     if (e.repeat) return;
+    if (hookReady) return; // The low-level hook records real key-down events.
     const token = codeToToken(e.code);
     if (!token) return;
-    void invoke("add_record_key", { key: token });
+    void safeInvoke("press_record_key", { key: token, down: true });
   },
   true
 );
 
+window.addEventListener(
+  "keyup",
+  (e) => {
+    if (!currentDraft || hookReady) return;
+    const token = codeToToken(e.code);
+    if (!token) return;
+    void safeInvoke("press_record_key", { key: token, down: false });
+  },
+  true
+);
+
+let autostartBusy = false;
 $("chk-autostart").addEventListener("change", async (e) => {
-  const on = (e.target as HTMLInputElement).checked;
-  const { enable, disable } = await import("@tauri-apps/plugin-autostart");
+  const box = e.target as HTMLInputElement;
+  if (autostartBusy) {
+    box.checked = !box.checked;
+    return;
+  }
+  autostartBusy = true;
+  const on = box.checked;
   try {
+    const { enable, disable } = await import("@tauri-apps/plugin-autostart");
     if (on) await enable();
     else await disable();
-    await invoke("save_autostart", { on });
-  } catch {
-    (e.target as HTMLInputElement).checked = !on;
+    await invokeT("save_autostart", { on });
+  } catch (err) {
+    try {
+      const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+      box.checked = await isEnabled();
+    } catch {
+      box.checked = !on;
+    }
+    showAlert(`开机自启设置失败：${String(err)}`);
+  } finally {
+    autostartBusy = false;
   }
 });
 
@@ -1020,52 +1314,94 @@ async function checkForUpdate(current: string) {
   const button = $("btn-check-update") as HTMLButtonElement;
   if (button.disabled) return;
   button.disabled = true;
-  status.textContent = "正在检查稳定版…";
+  status.textContent = "正在检查更新…";
   try {
     const release = await latestRelease();
-    status.textContent = isNewer(release.version, current) ? `可更新至 ${release.version}` : "当前已是最新版本";
-    if (isNewer(release.version, current)) {
+    const newer = isNewer(release.version, current);
+    status.textContent = newer ? `可更新至 ${release.version}` : "当前已是最新版本";
+    if (newer) {
       const link = document.createElement("button");
       link.className = "ghost";
       link.textContent = "查看发行说明";
-      link.addEventListener("click", () => { void invoke("open_url", { url: release.url }); });
+      link.addEventListener("click", () => { void safeInvoke("open_url", { url: release.url }); });
       status.appendChild(link);
     }
-  } catch {
-    status.textContent = "暂时无法连接 GitHub，请稍后重试。";
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    status.textContent =
+      msg === "NO_RELEASE"
+        ? "尚未发布正式更新"
+        : msg === "RATE_LIMITED"
+          ? "GitHub 接口暂时限流，请稍后再试"
+          : msg === "TIMEOUT"
+            ? "连接超时"
+            : "暂时无法连接 GitHub";
     const link = document.createElement("button");
     link.className = "ghost";
     link.textContent = "打开下载页面";
-    link.addEventListener("click", () => { void invoke("open_url", { url: RELEASES_URL }); });
+    link.addEventListener("click", () => { void safeInvoke("open_url", { url: RELEASES_URL }); });
     status.appendChild(link);
   } finally {
     button.disabled = false;
   }
 }
 
+$("xmbc-recheck").addEventListener("click", async () => {
+  try {
+    const running = await invokeT<boolean>("xmbc_running");
+    $("xmbc-banner").classList.toggle("hidden", !running);
+  } catch (err) {
+    console.error("xmbc_running check failed:", err);
+  }
+});
+
 window.addEventListener("blur", () => {
-  if (currentDraft) void closeRecord();
-  if (listening) void stopListening();
+  if (currentDraft) {
+    const count = recordBuf.length;
+    void closeRecord();
+    if (count) {
+      showAlert(`窗口失去焦点，录制已取消（已录 ${count} 键未保存）。`);
+    }
+  }
+  if (listenGen) void stopListening();
 });
 window.addEventListener("unhandledrejection", (event) => {
+  console.error("unhandled rejection:", event.reason);
+  if (event.reason instanceof Error && event.reason.name === "AbortError") return;
   showAlert(`操作未完成：${String(event.reason)}`);
 });
 
-boot()
-  .then(async () => {
-    try {
-      const ver = await invoke<string>("app_version");
-      $("app-version").textContent = `v${ver}`;
-      $("btn-check-update").addEventListener("click", () => {
-        void checkForUpdate(ver);
-      });
-    } catch {
-      $("app-version").textContent = "版本读取失败";
-    }
-  })
-  .catch((err) => {
-    showAlert(`无法连接映射引擎，请重新打开控制面板：${String(err)}`);
+let currentVersion = "0.0.0";
+$("btn-check-update").addEventListener("click", () => {
+  void checkForUpdate(currentVersion);
+});
+void (async () => {
+  try {
+    currentVersion = await invokeT<string>("app_version");
+    $("app-version").textContent = `v${currentVersion}`;
+  } catch {
+    $("app-version").textContent = "版本未知";
+  }
+})();
+
+function bootFailed(err: unknown) {
+  const host = $("maps");
+  host.replaceChildren();
+  const p = document.createElement("p");
+  p.className = "empty-state";
+  p.textContent = `无法连接映射引擎：${String(err)}`;
+  const retry = document.createElement("button");
+  retry.className = "solid";
+  retry.id = "btn-retry-boot";
+  retry.textContent = "重试";
+  retry.addEventListener("click", () => {
+    void boot().catch(bootFailed);
   });
+  host.append(p, retry);
+  showAlert(`无法连接映射引擎，请重新打开控制面板：${String(err)}`);
+}
+
+void boot().catch(bootFailed);
 
 type CardDrag = { x: number; y: number; lastX: number; lastY: number; lastTime: number; velocity: number; dx: number; dy: number; id: number; grip: HTMLElement; card: HTMLElement };
 let drag: CardDrag | null = null;
@@ -1219,7 +1555,13 @@ $("maps").addEventListener("lostpointercapture", () => { if (drag) resetDeck(); 
 window.addEventListener("blur", resetDeck);
 window.addEventListener("keydown", () => { if (drag || deckBusy) resetDeck(); });
 window.addEventListener("resize", resetDeck);
-document.addEventListener("visibilitychange", () => { if (document.hidden) resetDeck(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    pendingPulses.clear();
+    pendingDown = null;
+    resetDeck();
+  }
+});
 reducedMotion.addEventListener("change", resetDeck);
 document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach(link => {
   link.addEventListener("click", () => {

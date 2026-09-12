@@ -5,6 +5,7 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
+        "installerHooks": "./windows/hooks.nsi",
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico"

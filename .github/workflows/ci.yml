@@ -34,14 +34,25 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Release version consistency
+        run: node scripts/check-release-version.mjs
 
       - name: Frontend unit tests
         run: node tests/frontend_logic.test.mjs
 
       - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Frontend production build
         run: npm run build
@@ -65,14 +76,21 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Release version consistency
+        run: node scripts/check-release-version.mjs
 
       - name: Frontend unit tests
         run: node tests/frontend_logic.test.mjs
 
       - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Frontend production build
         run: npm run build

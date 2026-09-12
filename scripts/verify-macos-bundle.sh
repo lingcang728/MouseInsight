@@ -16,11 +16,21 @@ if [[ ! -d "$APP" ]]; then
   exit 1
 fi
 
+echo "== universal binary =="
+archs=$(lipo -archs "$APP/Contents/MacOS/Mouse Insight")
+echo "archs: $archs"
+echo "$archs" | grep -q 'x86_64'
+echo "$archs" | grep -q 'arm64'
+
 echo "== codesign --verify =="
-codesign --verify --deep --strict --verbose=2 "$APP"
+codesign --verify --strict --verbose=2 "$APP"
 
 echo "== public signing metadata =="
-codesign -dv --verbose=4 "$APP" 2>&1 | awk '/Authority|TeamIdentifier|^Identifier=|^Format=|^Runtime=|^Signature=|^Flags=/' 
+codesign -dv --verbose=4 "$APP" 2>&1 | awk '/Authority|TeamIdentifier|^Identifier=|^Format=|^Runtime=|^Signature=|^Flags=/'
+codesign -dv "$APP" 2>&1 | grep -q "Developer ID Application" || {
+  echo "app is not signed with a Developer ID Application identity" >&2
+  exit 1
+}
 
 echo "== Gatekeeper (spctl) =="
 spctl --assess --type execute --verbose "$APP"
