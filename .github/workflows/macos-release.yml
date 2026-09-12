@@ -235,7 +235,7 @@ jobs:
             dist-macos/SHA256SUMS-macos.txt
           if-no-files-found: error
 
-      - name: Upload Draft GitHub Release assets
+      - name: Upload GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -250,9 +250,8 @@ jobs:
           if ! gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "$tag" \
               --repo "${GITHUB_REPOSITORY}" \
-              --draft \
               --title "Mouse Insight ${version}" \
-              --notes "Draft release for ${tag}. Windows assets may still be attached manually."
+              --notes "Mouse Insight ${version}. Windows assets may still be attached manually."
           fi
           gh release upload "$tag" \
             "dist-macos/${{ steps.bundle.outputs.DMG_NAME }}" \
