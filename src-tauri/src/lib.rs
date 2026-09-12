@@ -348,19 +348,17 @@ pub fn run() {
     let is_autostart = std::env::args().any(|arg| arg == "--autostart");
     let quit_requested = std::env::args().any(|arg| arg == "--quit");
 
-    let log_targets = {
-        let mut targets = vec![tauri_plugin_log::Target::new(
-            tauri_plugin_log::TargetKind::Folder {
-                path: engine::config_dir().join("logs"),
-                file_name: Some("mouse-insight".into()),
-            },
-        )];
-        #[cfg(debug_assertions)]
-        targets.push(tauri_plugin_log::Target::new(
-            tauri_plugin_log::TargetKind::Stdout,
-        ));
-        targets
-    };
+    #[allow(unused_mut)]
+    let mut log_targets = vec![tauri_plugin_log::Target::new(
+        tauri_plugin_log::TargetKind::Folder {
+            path: engine::config_dir().join("logs"),
+            file_name: Some("mouse-insight".into()),
+        },
+    )];
+    #[cfg(debug_assertions)]
+    log_targets.push(tauri_plugin_log::Target::new(
+        tauri_plugin_log::TargetKind::Stdout,
+    ));
 
     let builder = tauri::Builder::default()
         .on_menu_event(native_menu::on_menu_event)

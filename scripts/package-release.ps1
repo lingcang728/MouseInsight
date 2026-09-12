@@ -6,6 +6,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Some hosts keep an incompatible PowerShell 7 copy of this module earlier in
+# PSModulePath, which makes Get-FileHash unresolvable under Windows PowerShell.
+if ($PSVersionTable.PSVersion.Major -lt 7 -and -not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    Import-Module Microsoft.PowerShell.Utility -RequiredVersion 3.1.0.0
+}
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 Set-Location -LiteralPath $root
 $releaseDir = Join-Path $root 'release'
@@ -179,7 +184,7 @@ foreach ($file in @(Get-ChildItem -LiteralPath $stageDir -File)) {
     $path = Assert-ReleasePath $file.FullName
     Remove-Item -LiteralPath $path -Force
 }
-Remove-Item -LiteralPath (Assert-ReleasePath $stageDir)
+Remove-Item -LiteralPath (Assert-ReleasePath $stageDir) -Recurse -Force
 
 # Keep the user's existing entry points on the portable executable. Shortcuts are
 # only repointed when they already exist; -CreateShortcuts opts in to creating them.
