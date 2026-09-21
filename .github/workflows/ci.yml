@@ -77,9 +77,13 @@ jobs:
           node-version: 24
           cache: npm
 
+      # rust-toolchain.toml overrides the action's default toolchain, so the
+      # action's `targets:` input would install them on the wrong toolchain;
+      # add them explicitly so rustup applies the repo override.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Add universal macOS targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
