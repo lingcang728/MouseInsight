@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
 // The paused state the menu displayed at last refresh; menu clicks act on
@@ -16,6 +16,18 @@ struct MenuState {
     pause: MenuItem<tauri::Wry>,
     error: MenuItem<tauri::Wry>,
     slots: Vec<(String, String, Submenu<tauri::Wry>)>,
+    icon_normal: tauri::image::Image<'static>,
+    icon_paused: tauri::image::Image<'static>,
+}
+
+/// The physical emergency-stop key(s), surfaced next to the pause action so
+/// the feature is discoverable without reading the settings footnote.
+fn pause_label() -> String {
+    if cfg!(target_os = "macos") {
+        "暂停映射并释放按键（急停 F13 / ⌃⌥⌘P）".into()
+    } else {
+        "暂停映射并释放按键（急停 Pause）".into()
+    }
 }
 
 fn status_text(paused: bool, count: usize, hook: &str) -> String {
@@ -30,7 +42,9 @@ fn status_text(paused: bool, count: usize, hook: &str) -> String {
     } else if count == 0 {
         "尚未配置映射".into()
     } else {
-        format!("映射已启用 · {count} 个按键")
+        // `count` is the number of compiled shortcut slots — a dual mapping
+        // with tap+hold counts as 2 — matching the "个快捷方式" wording.
+        format!("映射已启用 · {count} 个快捷方式")
     }
 }
 
@@ -52,28 +66,53 @@ pub fn refresh() {
             // slot it represented so the menu never shows a stale "未设置".
             let keys: Option<&[String]> = mapping.map(|m| {
                 if slot == "hold" {
-                    if !m.hold_keys.is_empty() { m.hold_keys.as_slice() }
-                    else if m.mode == "hold" { m.keys.as_slice() }
-                    else { &[] }
+                    if !m.hold_keys.is_empty() {
+                        m.hold_keys.as_slice()
+                    } else if m.mode == "hold" {
+                        m.keys.as_slice()
+                    } else {
+                        &[]
+                    }
                 } else {
-                    if !m.tap_keys.is_empty() { m.tap_keys.as_slice() }
-                    else if m.mode != "hold" { m.keys.as_slice() }
-                    else { &[] }
+                    if !m.tap_keys.is_empty() {
+                        m.tap_keys.as_slice()
+                    } else if m.mode != "hold" {
+                        m.keys.as_slice()
+                    } else {
+                        &[]
+                    }
                 }
             });
-            let chord = keys.filter(|keys| !keys.is_empty()).map(|keys| keys.join(" + ")).unwrap_or_else(|| "未设置".into());
-            let label = if button.starts_with("wheel") { "滚动" } else if slot == "hold" { "长按" } else { "短按" };
+            let chord = keys
+                .filter(|keys| !keys.is_empty())
+                .map(|keys| keys.join(" + "))
+                .unwrap_or_else(|| "未设置".into());
+            let label = if button.starts_with("wheel") {
+                "滚动"
+            } else if slot == "hold" {
+                "长按"
+            } else {
+                "短按"
+            };
             let _ = submenu.set_text(format!("{label} · {chord}"));
             let _ = submenu.set_enabled(!mapping.is_some_and(|m| m.mode == "toggle"));
         }
         let _ = state.status.set_text(&text);
         let _ = state.pause.set_text(if paused {
-            "恢复映射"
+            "恢复映射".to_string()
         } else {
-            "暂停映射并释放按键"
+            pause_label()
         });
         if let Some(tray) = handle.tray_by_id("main") {
             let _ = tray.set_tooltip(Some(format!("Mouse Insight · {text}")));
+            // A paused or faulted engine must be visible with the window
+            // closed; the dimmed icon is the only ambient signal besides tooltip.
+            let icon = if paused || hook != "ready" {
+                &state.icon_paused
+            } else {
+                &state.icon_normal
+            };
+            let _ = tray.set_icon_with_as_template(Some(icon.clone()), cfg!(target_os = "macos"));
         }
     });
 }
@@ -100,7 +139,9 @@ pub fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let result = engine::set_quick_mapping(&parts[0], &parts[1], &parts[2]);
-                if result.is_ok() { let _ = app.emit("mappings-changed", engine::menu_mappings()); }
+                if result.is_ok() {
+                    let _ = app.emit("mappings-changed", engine::menu_mappings());
+                }
                 refresh();
                 let handle = app.clone();
                 let _ = app.run_on_main_thread(move || report_error(&handle, result));
@@ -124,7 +165,9 @@ pub fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                     }
                     "open_config" => crate::open_config_dir(),
                     "open_logs" => crate::open_logs_dir(),
-                    "releases" => crate::open_url("https://github.com/lingcang728/MouseInsight/releases/latest".into()),
+                    "releases" => crate::open_url(
+                        "https://github.com/lingcang728/MouseInsight/releases/latest".into(),
+                    ),
                     #[cfg(target_os = "macos")]
                     "accessibility" => crate::open_accessibility_settings(),
                     _ => Ok(()),
@@ -142,15 +185,20 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     // Accelerators only make sense in the macOS app menu; on the Windows tray they
     // would imply global shortcuts that do not exist.
     let shortcut = |s: &'static str| -> Option<&'static str> {
-        if cfg!(target_os = "macos") { Some(s) } else { None }
+        if cfg!(target_os = "macos") {
+            Some(s)
+        } else {
+            None
+        }
     };
     let item = |id, text, shortcut: Option<&str>| MenuItem::with_id(app, id, text, true, shortcut);
     let sep = || PredefinedMenuItem::separator(app);
     let status = MenuItem::with_id(app, "status", "正在启动监听…", false, None::<&str>)?;
     let show = item("show", "打开按键工作台…", shortcut("CmdOrCtrl+Comma"))?;
+    let pause_text = pause_label();
     let pause = item(
         "toggle_pause",
-        "暂停映射并释放按键",
+        &pause_text,
         shortcut("CmdOrCtrl+Shift+P"),
     )?;
     let config = item("open_config", "打开配置目录…", None)?;
@@ -166,13 +214,41 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
     )?;
     let menu = Menu::with_items(app, &[&status, &pause, &sep()?])?;
     let mut slots = Vec::new();
-    for (button, label) in [("xbutton2", "前侧键"), ("xbutton1", "后侧键"), ("middle", "中键"), ("wheelup", "滚轮上"), ("wheeldown", "滚轮下")] {
+    for (button, label) in [
+        ("xbutton2", "前侧键"),
+        ("xbutton1", "后侧键"),
+        ("middle", "中键"),
+        ("wheelup", "滚轮上"),
+        ("wheeldown", "滚轮下"),
+    ] {
         let button_menu = Submenu::new(app, label, true)?;
         for (slot, title) in [("tap", "短按"), ("hold", "长按")] {
-            if button.starts_with("wheel") && slot == "hold" { continue; }
-            let actions = Submenu::new(app, if button.starts_with("wheel") { "滚动操作" } else { title }, true)?;
-            for (preset, title) in [("copy", "复制"), ("paste", "粘贴"), ("undo", "撤销"), ("enter", "回车"), ("clear", "清除绑定")] {
-                actions.append(&MenuItem::with_id(app, format!("quick:{button}:{slot}:{preset}"), title, true, None::<&str>)?)?;
+            if button.starts_with("wheel") && slot == "hold" {
+                continue;
+            }
+            let actions = Submenu::new(
+                app,
+                if button.starts_with("wheel") {
+                    "滚动操作"
+                } else {
+                    title
+                },
+                true,
+            )?;
+            for (preset, title) in [
+                ("copy", "复制"),
+                ("paste", "粘贴"),
+                ("undo", "撤销"),
+                ("enter", "回车"),
+                ("clear", "清除映射"),
+            ] {
+                actions.append(&MenuItem::with_id(
+                    app,
+                    format!("quick:{button}:{slot}:{preset}"),
+                    title,
+                    true,
+                    None::<&str>,
+                )?)?;
             }
             button_menu.append(&actions)?;
             slots.push((button.to_owned(), slot.to_owned(), actions));
@@ -230,39 +306,44 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         app.set_menu(Menu::with_items(app, &[&app_menu, &edit, &window])?)?;
     }
     menu.append_items(&[&releases, &sep()?, &error, &quit])?;
+    #[cfg(target_os = "macos")]
+    let icon_normal = template_icon();
+    #[cfg(not(target_os = "macos"))]
+    let icon_normal = match app.default_window_icon() {
+        Some(icon) => {
+            tauri::image::Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height())
+        }
+        None => template_icon(),
+    };
+    let icon_paused = paused_icon(&icon_normal);
     app.manage(MenuState {
         status,
         pause,
         error,
         slots,
+        icon_normal: icon_normal.clone(),
+        icon_paused,
     });
     let tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
         .tooltip("Mouse Insight")
         .show_menu_on_left_click(cfg!(target_os = "macos"));
     #[cfg(target_os = "macos")]
-    let tray = tray.icon(template_icon()).icon_as_template(true);
+    let tray = tray.icon(icon_normal).icon_as_template(true);
     #[cfg(not(target_os = "macos"))]
-    let app_icon = match app.default_window_icon() {
-        Some(icon) => icon.clone(),
-        None => template_icon(),
-    };
-    #[cfg(not(target_os = "macos"))]
-    let tray = tray
-        .icon(app_icon)
-        .on_tray_icon_event(|tray, event| {
-            use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-            if matches!(
-                event,
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                }
-            ) {
-                show_main_window(tray.app_handle());
+    let tray = tray.icon(icon_normal).on_tray_icon_event(|tray, event| {
+        use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
             }
-        });
+        ) {
+            show_main_window(tray.app_handle());
+        }
+    });
     tray.build(app)?;
     let _ = APP.set(app.handle().clone());
     refresh();
@@ -296,6 +377,37 @@ fn template_icon() -> tauri::image::Image<'static> {
     tauri::image::Image::new_owned(rgba, 36, 36)
 }
 
+/// Paused-state tray icon: the base icon desaturated and dimmed with two
+/// opaque pause bars on top. macOS renders template icons from the alpha
+/// channel only, which this keeps meaningful (dimmed silhouette + solid bars).
+fn paused_icon(base: &tauri::image::Image) -> tauri::image::Image<'static> {
+    let (w, h) = (base.width() as usize, base.height() as usize);
+    let mut rgba = base.rgba().to_vec();
+    for px in rgba.chunks_exact_mut(4) {
+        let lum = (px[0] as u32 * 30 + px[1] as u32 * 59 + px[2] as u32 * 11) / 100;
+        let dim = (lum * 3 / 5) as u8;
+        px[0] = dim;
+        px[1] = dim;
+        px[2] = dim;
+        px[3] = (px[3] as u32 * 55 / 100) as u8;
+    }
+    let bar_h = h * 11 / 20;
+    let bar_w = (w / 9).max(2);
+    let gap = (w / 12).max(1);
+    let top = h.saturating_sub(bar_h) / 2;
+    let left1 = w.saturating_sub(bar_w * 2 + gap) / 2;
+    let left2 = left1 + bar_w + gap;
+    for y in top..(top + bar_h).min(h) {
+        for x in [left1, left2] {
+            for x in x..(x + bar_w).min(w) {
+                let i = (y * w + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&[0xC0, 0x50, 0x37, 0xFF]);
+            }
+        }
+    }
+    tauri::image::Image::new_owned(rgba, base.width(), base.height())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +417,7 @@ mod tests {
         assert!(status_text(true, 5, "starting").contains("启动"));
         assert_eq!(status_text(false, 0, "ready"), "尚未配置映射");
         assert_eq!(status_text(true, 3, "ready"), "映射已暂停");
-        assert_eq!(status_text(false, 3, "ready"), "映射已启用 · 3 个按键");
+        assert_eq!(status_text(false, 3, "ready"), "映射已启用 · 3 个快捷方式");
     }
     #[test]
     fn template_has_transparent_padding_and_visible_antialiased_strokes() {
@@ -316,5 +428,24 @@ mod tests {
         assert!(alpha.contains(&255));
         assert!(alpha.iter().any(|a| *a > 0 && *a < 255));
         assert!(alpha.iter().filter(|a| **a > 0).count() < 36 * 36 / 2);
+    }
+
+    #[test]
+    fn paused_icon_dims_base_and_stamps_bars() {
+        let base = template_icon();
+        let paused = paused_icon(&base);
+        assert_eq!(paused.width(), base.width());
+        assert_eq!(paused.height(), base.height());
+        // The bars are the only opaque, danger-tinted pixels (base rgb is 0).
+        assert!(paused
+            .rgba()
+            .chunks_exact(4)
+            .any(|p| p[3] == 255 && p[0] > 0xA0));
+        // Silhouette pixels outside the bars keep a reduced alpha.
+        assert!(base
+            .rgba()
+            .chunks_exact(4)
+            .zip(paused.rgba().chunks_exact(4))
+            .any(|(b, p)| b[3] > 200 && p[3] > 0 && p[3] < b[3]));
     }
 }

@@ -9,3 +9,6 @@ src-tauri/gen/
 
 # Local packages, metadata, portable configuration and WebView user data
 /release/
+
+# UI smoke-test evidence (npm run verify:ui --output artifacts/verify-ui)
+/artifacts/

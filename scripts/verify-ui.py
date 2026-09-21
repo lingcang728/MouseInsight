@@ -6,6 +6,8 @@ Requirements:
   * An isolated portable review build with an empty, paused config, launched with
     WebView2 remote debugging enabled, e.g. environment variable
     `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223`.
+    Release builds strip that variable unless `MOUSE_INSIGHT_ALLOW_WEBVIEW2_ARGS`
+    is also set, so pass both when reviewing a release binary.
 Usage: python scripts/verify-ui.py --cdp http://127.0.0.1:9223 --output <directory>
 """
 import argparse

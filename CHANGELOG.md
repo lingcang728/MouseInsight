@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 前端 `invoke` 无超时、无失败提示（P0-5、P0-7）。
 - 配置解析一处字段损坏即整文件丢弃；现逐字段恢复，损坏映射条目单独跳过，未知字段保留（P0-6、P1-17、P1-18）。
 - 配置文件写入非原子（Windows 下崩溃可致半截文件）：改 `MoveFileExW` 原子替换，损坏副本最多保留 5 份（P1-31）。
+- 进程被杀/panic 后注入键残留系统层、重启播种把幻影键当物理按住永不释放：新增 `held-keys.json` 预写日志，启动时先于物理播种补发 key-up；panic 钩子 `try_lock` 兜底释放（P1-1、04-F1）。
+- 钩子线程 panic 后 `HOOK_TID` 残留、`hook_status` 停在 ready、`retry_hook` 空转：hook 线程外裹 `catch_unwind`，panic 时清零标识、上报状态并释放注入键（E7、04-F12）。
+- 快照 `paused` 改用运行时原子量：队列溢出/看门狗等未持久化暂停不再在前端显示为「已启用」（04-F2）。
+- 配置加载校验：非法 `mode` 归位为 hold 并提示；同鼠标键重复映射保留首条；非布尔 `paused`/`autostart` 记录恢复说明（04-F3/F14）。
+- `.bak` 仅在现有 `config.json` 可解析时原子更新：从备份恢复后的首次保存不再用损坏文件覆盖唯一好备份（04-F4）。
+- 急停持久化线程加 `catch_unwind` 且 `EMERGENCY_SAVE_PENDING` 必清位；退出时短暂等待在途急停保存（04-F5）。
+- `save_mappings` 前端超时后不再直接回滚：invoke 落地时用 `get_snapshot` 对账，三方状态收敛（04-F13/前端 F2）。
+- `schema_version` 保存不降级更高版本；Mapping 级未知字段随 `extra` 往返保留（04-F6/F7）。
+- `config.json` 符号链接写穿透至真实目标、`.bak` 链接先解除；启动清扫 `config.json.*.tmp`/`held-keys.*.tmp`/`.write-test` 残留（04-F9/F10）。
+- 便携标记后补/移除导致配置位置切换时给出旧配置位置提示，不自动迁移不删除（04-F15）。
+- `logs/crash-*.log` 上限 5 份（04-F11）。
 - 暂停状态运行时与磁盘不一致：`set_paused` 先应用运行时、持久化失败返回错误（P1-35、P1-36）。
 - `SendInput` 部分注入成功时引用计数失衡，改用待释放队列补偿（P1-21）。
 - 录制时物理按键状态初始化存在 TOCTOU（P1-23）。
@@ -55,10 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- 版本要求：Node `>=22`（原 `>=24`）。
+- 版本要求：Node `>=22.20`（原 `>=24`）。
 - 移除 `src-tauri/icons/{android,ios}`（桌面应用未引用）。
 - 移除 `DraftSession` 及若干死代码；`decide_swallow` 抽为双端共用纯函数。
-- 测试：Rust 71→78、前端 41→48；`npm test` 现含 tsc、版本一致性检查与 cargo test。
+- 测试：Rust 71→93、前端 41→48；`npm test` 现含 tsc、版本一致性检查与 cargo test。
 
 ### Known limitations（需实机验证，见 MouseInsight.md）
 

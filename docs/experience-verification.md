@@ -28,11 +28,13 @@
 
 ## Reproduce native smoke
 
-Use the existing Python Playwright installation. Build a review executable with a separate Tauri identifier, copy it into an empty temporary folder with a `.portable` file and `config.json` containing `{"schema_version":1,"theme":"light","paused":true,"autostart":false,"mappings":[]}`. Enable WebView2 CDP only for that test process via `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223`, then run:
+Use the existing Python Playwright installation. Build a review executable with a separate Tauri identifier, copy it into an empty temporary folder with a `.portable` file and `config.json` containing `{"schema_version":1,"theme":"light","paused":true,"autostart":false,"mappings":[]}`. Enable WebView2 CDP only for that test process via `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223`; release builds strip that variable unless `MOUSE_INSIGHT_ALLOW_WEBVIEW2_ARGS` is also set, so pass both, then run:
 
 ```powershell
 python scripts/verify-ui.py --cdp http://127.0.0.1:9223 --output <temporary-evidence-directory>
 ```
+
+`npm run verify:ui` runs the same script with the default `--cdp http://127.0.0.1:9223 --output artifacts/verify-ui`.
 
 Close the review process after testing; do not enable the debugging port for normal use.
 

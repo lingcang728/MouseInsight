@@ -16,6 +16,14 @@ function cargoPackageVersion(text) {
   return match[1];
 }
 
+function changelogLatestVersion(text) {
+  // Top-most released heading, skipping a Keep-a-Changelog [Unreleased] block.
+  for (const match of text.matchAll(/^## \[([^\]]+)\]/gm)) {
+    if (match[1].toLowerCase() !== "unreleased") return match[1];
+  }
+  return null;
+}
+
 export function readVersions() {
   const packageVersion = readJson("package.json").version;
   const tauriVersion = readJson("src-tauri/tauri.conf.json").version;
@@ -26,6 +34,9 @@ export function readVersions() {
   const npmLock = readJson("package-lock.json");
   const rustLock = readFileSync(join(root, "src-tauri/Cargo.lock"), "utf8");
   const cargoLockVersion = rustLock.match(/name = "mouse_insight"\r?\nversion = "([^"]+)"/)?.[1];
+  const changelogVersion = changelogLatestVersion(
+    readFileSync(join(root, "CHANGELOG.md"), "utf8")
+  );
   const files = {
     "package.json": packageVersion,
     "src-tauri/Cargo.toml": cargoVersion,
@@ -33,6 +44,7 @@ export function readVersions() {
     "package-lock.json": npmLock.version,
     "package-lock.json root package": npmLock.packages?.[""]?.version ?? npmLock.version,
     "src-tauri/Cargo.lock": cargoLockVersion,
+    "CHANGELOG.md": changelogVersion,
   };
   return { packageVersion, files };
 }

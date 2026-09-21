@@ -2,8 +2,8 @@
 #![allow(dead_code)]
 
 use crate::engine::{
-    physical_down_set, InputCmd, InputInjector, KeySpec, MouseButton, Pulse, SendReport,
-    VIRTUAL_KEY, ENGINE, EXTRA_INFO,
+    physical_down_set, InputCmd, InputInjector, KeySpec, MouseButton, Pulse, SendReport, ENGINE,
+    EXTRA_INFO, VIRTUAL_KEY,
 };
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
@@ -11,12 +11,12 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::CFString;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation,
-    CGEventTapOptions, CGEventTapPlacement, CGEventType, CallbackResult, EventField,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CallbackResult, EventField,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // =========================================================================
@@ -136,7 +136,8 @@ pub const kVK_Help: u16 = 0x72; // 114 (Insert on PC keyboards)
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> bool;
+    fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef)
+        -> bool;
 }
 
 pub fn check_accessibility_permission() -> bool {
@@ -447,7 +448,8 @@ extern "C" {
 }
 
 fn injected_flags(physical: CGEventFlags, held: &HashSet<u16>) -> CGEventFlags {
-    held.iter().fold(physical, |flags, key| flags | modifier_flag(*key))
+    held.iter()
+        .fold(physical, |flags, key| flags | modifier_flag(*key))
 }
 
 pub struct MacosInjector {
@@ -474,10 +476,19 @@ pub fn post_key_ups(specs: &[KeySpec]) {
         log::error!("failsafe release: failed to create CGEventSource");
         return;
     };
+    // FlagsChanged events must carry the modifier state as of that event —
+    // empty flags would read as "all modifiers released" and could clear a
+    // physically held Shift/⌘ the user never let go of.
+    let mut remaining: HashSet<u16> = specs.iter().map(|s| s.vk.0).collect();
     for spec in specs {
         if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), spec.vk.0, false) {
             if is_modifier_keycode(spec.vk.0) {
+                remaining.remove(&spec.vk.0);
+                let physical = CGEventFlags::from_bits_retain(unsafe {
+                    CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState)
+                });
                 event.set_type(CGEventType::FlagsChanged);
+                event.set_flags(injected_flags(physical, &remaining));
             }
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
             event.post(CGEventTapLocation::HID);
@@ -491,18 +502,36 @@ impl InputInjector for MacosInjector {
             return Ok(());
         }
 
+        if down {
+            // Write-ahead: mark keys held (and journal them) before posting
+            // so a process kill in between cannot strand them in the OS.
+            let mut held = crate::engine::injected_held().lock();
+            for s in specs {
+                held.insert(*s);
+            }
+            crate::engine::persist_held_journal(&held);
+        }
         for (inserted, spec) in specs.iter().enumerate() {
-            let event = CGEvent::new_keyboard_event(self.source.clone(), spec.vk.0, down)
-                .map_err(|_| SendReport {
-                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                    expected: specs.len() as u32, inserted: inserted as u32,
-                    win32_error: 0, is_uipi_blocked: false,
-                })?;
+            let event = CGEvent::new_keyboard_event(self.source.clone(), spec.vk.0, down).map_err(
+                |_| SendReport {
+                    timestamp: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    expected: specs.len() as u32,
+                    inserted: inserted as u32,
+                    win32_error: 0,
+                    is_uipi_blocked: false,
+                },
+            )?;
             // Only modifier keycodes carry flags; tracking anything else would
             // fold a bogus flag into every subsequent event.
             if is_modifier_keycode(spec.vk.0) {
-                if down { self.active_modifiers.insert(spec.vk.0); }
-                else { self.active_modifiers.remove(&spec.vk.0); }
+                if down {
+                    self.active_modifiers.insert(spec.vk.0);
+                } else {
+                    self.active_modifiers.remove(&spec.vk.0);
+                }
             }
             // Carry the state at this event, not the final state of the batch.
             // A sibling modifier (left/right) and physical modifiers remain set.
@@ -518,18 +547,19 @@ impl InputInjector for MacosInjector {
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, EXTRA_INFO as i64);
             event.post(CGEventTapLocation::HID);
             // Ledger for the failsafe release path.
-            let mut held = crate::engine::injected_held().lock();
-            if down {
-                held.insert(*spec);
-            } else {
-                held.remove(spec);
+            if !down {
+                crate::engine::injected_held().lock().remove(spec);
             }
+        }
+        if !down {
+            crate::engine::persist_held_journal(&crate::engine::injected_held().lock());
         }
         Ok(())
     }
 
     fn relinquish_key(&mut self, spec: &KeySpec) {
         self.active_modifiers.remove(&spec.vk.0);
+        crate::engine::relinquish_ledger_entry(spec);
     }
 
     fn send_mask(&mut self) -> Result<(), SendReport> {
@@ -561,8 +591,13 @@ impl InputInjector for MacosInjector {
 static TAP_PORT: AtomicUsize = AtomicUsize::new(0);
 extern "C" {
     fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
+    fn CGEventTapIsEnabled(tap: *const std::ffi::c_void) -> bool;
     fn CGEventSourceKeyState(state: CGEventSourceStateID, key: u16) -> bool;
     fn CGEventSourceButtonState(state: CGEventSourceStateID, button: u32) -> bool;
+    // Input Monitoring (ListenEvent) is a separate TCC domain from
+    // Accessibility; core-graphics 0.25 does not expose these yet.
+    fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
 }
 
 extern "C" {
@@ -570,9 +605,27 @@ extern "C" {
     fn CFRunLoopWakeUp(rl: core_foundation::runloop::CFRunLoopRef);
 }
 
+// Scroll-wheel accumulation state; cleared when the tap is disabled so a
+// stale remainder cannot offset the next opposite-direction scroll step.
+static SCROLL_ACC: AtomicI64 = AtomicI64::new(0);
+static LAST_SCROLL_STEP: AtomicU64 = AtomicU64::new(0);
 static RUN_LOOP_REF: parking_lot::Mutex<Option<CFRunLoop>> = parking_lot::Mutex::new(None);
 // Set when stop_hook() runs before the loop has published its runloop.
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+// Covers the spawn→publish window that RUN_LOOP_REF cannot see: two rapid
+// retries must never create two event taps, or every edge is processed
+// twice and mapped keys get double-injected.
+static HOOK_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Clears HOOK_LOOP_ACTIVE on every hook_loop exit path — early returns,
+/// runloop exit, unwind — so a later retry can spawn a fresh loop.
+struct HookLoopGuard;
+
+impl Drop for HookLoopGuard {
+    fn drop(&mut self) {
+        HOOK_LOOP_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
 
 pub fn stop_hook() {
     let rl = RUN_LOOP_REF.lock().take();
@@ -587,17 +640,66 @@ pub fn stop_hook() {
 /// Respawn the event tap after a recoverable failure (e.g. Accessibility
 /// permission was just granted). No-op while a loop is already live.
 pub fn retry_hook() {
-    if crate::engine::hook_status() == "ready" || RUN_LOOP_REF.lock().is_some() {
+    if crate::engine::hook_status() == "ready"
+        || RUN_LOOP_REF.lock().is_some()
+        || HOOK_LOOP_ACTIVE.load(Ordering::SeqCst)
+    {
         return;
     }
     STOP_REQUESTED.store(false, Ordering::SeqCst);
-    std::thread::spawn(hook_loop);
+    // Same name as the initial spawn so panic logs identify the thread.
+    std::thread::Builder::new()
+        .name("mi-macos-tap".into())
+        .spawn(guarded_hook_loop)
+        .expect("macos tap thread");
+}
+
+/// After the tap thread dies unexpectedly, drop the stale runloop/port so a
+/// later retry can spawn a fresh loop instead of no-op'ing forever.
+fn clear_hook_state() {
+    *RUN_LOOP_REF.lock() = None;
+    TAP_PORT.store(0, Ordering::SeqCst);
+}
+
+/// Panic guard mirroring the Windows hook thread and the worker: a panicked
+/// hook_loop releases the injected-key ledger, reports the failure and clears
+/// published hook state so 「重试监听」 can still recover.
+pub(crate) fn guarded_hook_loop() {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_loop));
+    if let Err(payload) = outcome {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        log::error!("macos tap thread panicked: {msg}");
+        crate::engine::set_hook_status(
+            "macOS 监听线程异常终止，请点击「重试监听」恢复；若反复失败请重新启动应用",
+        );
+        clear_hook_state();
+        crate::engine::failsafe_release_all();
+    }
 }
 
 pub fn hook_loop() {
+    // A second loop would create a second event tap and double-inject keys.
+    if HOOK_LOOP_ACTIVE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _loop_guard = HookLoopGuard;
+
     if !check_accessibility_permission() {
         crate::engine::set_hook_status("macOS 尚未授予辅助功能权限。请在系统设置 → 隐私与安全性 → 辅助功能中添加当前安装的 Mouse Insight。若旧版本已勾选，请移除旧条目并重新添加，再启动应用。授权后点击「重试监听」即可，无需重启。");
         return;
+    }
+
+    // On macOS 10.15+ key/mouse delivery to a session tap also needs the
+    // separate Input Monitoring (ListenEvent) grant; Accessibility alone can
+    // leave a tap that exists but receives nothing. Preflight it and request
+    // once so the app gets listed in System Settings — the definitive check
+    // is CGEventTapIsEnabled below, since preflight can lag a fresh grant.
+    if !unsafe { CGPreflightListenEventAccess() } {
+        unsafe { CGRequestListenEventAccess() };
     }
 
     let events_of_interest = vec![
@@ -618,13 +720,13 @@ pub fn hook_loop() {
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         events_of_interest,
-        |_proxy, etype, event| {
-            handle_cgevent(etype, event)
-        },
+        |_proxy, etype, event| handle_cgevent(etype, event),
     ) {
         Ok(t) => t,
         Err(_) => {
-            log::error!("Failed to create CGEventTap. Please ensure Accessibility permissions are granted.");
+            log::error!(
+                "Failed to create CGEventTap. Please ensure Accessibility permissions are granted."
+            );
             if ENGINE.get().is_some() {
                 crate::engine::set_hook_status("macOS 辅助功能已授权，但监听创建失败。请检查输入监控权限及其他鼠标工具；若刚替换应用，请重新添加当前应用的权限条目。");
             }
@@ -643,8 +745,20 @@ pub fn hook_loop() {
 
     let current_rl = CFRunLoop::get_current();
     current_rl.add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
-    TAP_PORT.store(tap.mach_port().as_concrete_TypeRef() as usize, Ordering::SeqCst);
+    TAP_PORT.store(
+        tap.mach_port().as_concrete_TypeRef() as usize,
+        Ordering::SeqCst,
+    );
     tap.enable();
+    // A missing Input Monitoring grant lets CGEventTapCreate succeed but
+    // leaves the tap disabled — a silent dead end where no event ever
+    // arrives. Catch it instead of reporting "ready" for a deaf listener.
+    if !unsafe { CGEventTapIsEnabled(tap.mach_port().as_concrete_TypeRef() as *const _) } {
+        log::error!("CGEventTap stayed disabled right after enable; Input Monitoring permission is likely missing.");
+        crate::engine::set_hook_status("macOS 监听已创建但被系统禁用（通常缺少输入监控权限）。请在系统设置 → 隐私与安全性 → 输入监控中启用本应用，然后点击「重试监听」。");
+        TAP_PORT.store(0, Ordering::SeqCst);
+        return;
+    }
     crate::engine::set_hook_status("ready");
 
     *RUN_LOOP_REF.lock() = Some(current_rl);
@@ -662,15 +776,28 @@ pub fn hook_loop() {
 fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
     if matches!(etype, CGEventType::TapDisabledByUserInput) {
         // The system or the user revoked the tap; re-enabling it would just be
-        // disabled again. Surface it and let the user re-authorize + retry.
-        crate::engine::set_hook_status("macOS 已禁用事件监听（权限被撤销或系统策略），请重新授权后点击「重试监听」");
+        // disabled again. Stop the runloop so this thread exits and drops
+        // RUN_LOOP_REF — otherwise 「重试监听」 keeps no-op'ing on the stale
+        // reference and only an app restart could recover (D1).
+        crate::engine::set_hook_status(
+            "macOS 已禁用事件监听（权限被撤销或系统策略），请重新授权后点击「重试监听」",
+        );
         crate::engine::request_emergency_stop(false);
+        SCROLL_ACC.store(0, Ordering::Relaxed);
+        LAST_SCROLL_STEP.store(0, Ordering::Relaxed);
+        CFRunLoop::get_current().stop();
         return CallbackResult::Keep;
     }
     if matches!(etype, CGEventType::TapDisabledByTimeout) {
         crate::engine::request_emergency_stop(false);
+        SCROLL_ACC.store(0, Ordering::Relaxed);
+        LAST_SCROLL_STEP.store(0, Ordering::Relaxed);
         let port = TAP_PORT.load(Ordering::SeqCst);
-        if port != 0 { unsafe { CGEventTapEnable(port as *const _, true); } }
+        if port != 0 {
+            unsafe {
+                CGEventTapEnable(port as *const _, true);
+            }
+        }
         return CallbackResult::Keep;
     }
     // 1. Ignore events injected by Mouse Insight
@@ -733,11 +860,13 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
 
             // Recording mode handling
             if eng.recording.load(Ordering::Relaxed) {
-                if keycode == kVK_Tab { return CallbackResult::Keep; }
+                if keycode == kVK_Tab {
+                    return CallbackResult::Keep;
+                }
                 if down && keycode == kVK_Escape {
                     eng.swallowed_keys.write().insert(keycode as u32);
                     eng.recording.store(false, Ordering::Relaxed);
-                    let _ = eng.cmd_tx.send(InputCmd::RecordCancel);
+                    eng.enqueue_cmd(InputCmd::RecordCancel);
                     return CallbackResult::Drop;
                 }
 
@@ -752,7 +881,7 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
                 }
                 let chord = eng.recorder.write().on_key(keycode as u32, down);
                 if !chord.is_empty() {
-                    let _ = eng.cmd_tx.send(InputCmd::Record(chord));
+                    eng.enqueue_cmd(InputCmd::Record(chord));
                 }
                 return CallbackResult::Drop;
             }
@@ -787,21 +916,19 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
         CGEventType::RightMouseDown => (MouseButton::Right, true),
         CGEventType::RightMouseUp => (MouseButton::Right, false),
         CGEventType::ScrollWheel => {
-            let continuous = event
-                .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS)
-                != 0;
-            let d1 = event
-                .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+            let continuous =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0;
+            let d1 =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
             if d1 == 0 {
                 return CallbackResult::Keep; // pure horizontal or empty event
             }
-            static SCROLL_ACC: AtomicI64 = AtomicI64::new(0);
-            static LAST_SCROLL_STEP: AtomicU64 = AtomicU64::new(0);
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            match crate::engine::scroll_step(continuous, d1, &SCROLL_ACC, now_ms, &LAST_SCROLL_STEP) {
+            match crate::engine::scroll_step(continuous, d1, &SCROLL_ACC, now_ms, &LAST_SCROLL_STEP)
+            {
                 Some(b) => (b, true),
                 None => return CallbackResult::Keep,
             }
@@ -813,15 +940,14 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
     // system behavior; the frontend hints via the telemetry pulse.
     let captured = down && !button.is_primary() && eng.listening.swap(false, Ordering::Relaxed);
     if captured {
-        let _ = eng
-            .cmd_tx
-            .send(InputCmd::ListenCaptured(button.as_str().to_string()));
+        eng.enqueue_cmd(InputCmd::ListenCaptured(button.as_str().to_string()));
     }
 
     let paused = eng.paused.load(Ordering::Relaxed);
     let compiled = eng.compiled.load_full();
     let action_opt = compiled.get(button).cloned();
-    let is_mapped = action_opt.is_some() && !paused && !captured && !eng.recording.load(Ordering::Relaxed);
+    let is_mapped =
+        action_opt.is_some() && !paused && !captured && !eng.recording.load(Ordering::Relaxed);
     let mut queued = false;
 
     if is_mapped {
@@ -850,7 +976,11 @@ fn handle_cgevent(etype: CGEventType, event: &CGEvent) -> CallbackResult {
         let bit = 1u32 << button as u32;
         if down && swallow {
             eng.swallowed_buttons.fetch_or(bit, Ordering::Relaxed);
-        } else if !down {
+        } else if down {
+            // The OS saw this down, so its up must also pass — a stale bit
+            // from a lost earlier release would wrongly eat it.
+            eng.swallowed_buttons.fetch_and(!bit, Ordering::Relaxed);
+        } else {
             swallow = eng.swallowed_buttons.fetch_and(!bit, Ordering::Relaxed) & bit != 0;
         }
     }
@@ -935,16 +1065,20 @@ mod tests {
     fn both_option_sides_share_flag_but_have_distinct_ownership() {
         let mut held = HashSet::from([kVK_Option, kVK_RightOption]);
         held.remove(&kVK_RightOption);
-        let flags = held.into_iter().fold(CGEventFlags::empty(), |f, key| f | modifier_flag(key));
+        let flags = held
+            .into_iter()
+            .fold(CGEventFlags::empty(), |f, key| f | modifier_flag(key));
         assert!(flags.contains(CGEventFlags::CGEventFlagAlternate));
     }
 
     #[test]
     fn injected_modifiers_preserve_sides_and_caps_lock() {
-        let pairs = [(kVK_Command, kVK_RightCommand, 0x08, 0x10),
+        let pairs = [
+            (kVK_Command, kVK_RightCommand, 0x08, 0x10),
             (kVK_Option, kVK_RightOption, 0x20, 0x40),
             (kVK_Control, kVK_RightControl, 0x01, 0x2000),
-            (kVK_Shift, kVK_RightShift, 0x02, 0x04)];
+            (kVK_Shift, kVK_RightShift, 0x02, 0x04),
+        ];
         for (left, right, left_mask, right_mask) in pairs {
             let mut held = HashSet::from([left, right]);
             let both = injected_flags(CGEventFlags::CGEventFlagAlphaShift, &held);
@@ -958,6 +1092,4 @@ mod tests {
             assert_eq!(released.bits() & 0x80, 0);
         }
     }
-
 }
-

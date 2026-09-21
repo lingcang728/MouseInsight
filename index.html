@@ -13,11 +13,11 @@
     <div class="app">
       <header class="rail">
         <nav aria-label="主导航">
-          <a class="rail-link active" href="#workspace">鼠标映射</a>
+          <a class="rail-link active" aria-current="true" href="#workspace">鼠标映射</a>
           <a class="rail-link" href="#settings">偏好设置</a>
         </nav>
-        <button type="button" class="ghost" id="btn-pause">暂停映射</button>
-        <button type="button" class="ghost" id="btn-theme">换成深色</button>
+        <button type="button" class="ghost" id="btn-pause" title="暂停/恢复所有映射">暂停映射</button>
+        <button type="button" class="ghost" id="btn-theme">深色外观</button>
       </header>
 
       <main class="stage" id="workspace">
@@ -32,7 +32,7 @@
           <button type="button" class="ghost" id="alert-action" hidden></button>
           <button type="button" class="ghost alert-close" aria-label="关闭提示">×</button>
         </div>
-        <div id="xmbc-banner" class="banner hidden">
+        <div id="xmbc-banner" class="banner hidden" role="alert">
           检测到 X-Mouse Button Control 还在跑。两套钩子会抢事件，先退出它。
           <button type="button" class="ghost" id="xmbc-recheck">重新检测</button>
         </div>
@@ -41,7 +41,7 @@
           <div class="sheet pulse-sheet">
             <div class="sheet-top">
               <span>实时输入</span>
-              <span id="pulse-ago" class="meta">还没按过</span>
+              <span id="pulse-edge" class="meta">还没按过</span>
             </div>
             <div class="pulse-body">
               <div class="mouse" aria-hidden="true">
@@ -57,10 +57,10 @@
                   </div>
                 </div>
               </div>
-              <div class="pulse-text">
-                <div id="pulse-name" class="pulse-name" aria-live="polite">等你按一下</div>
-                <div id="pulse-state" class="meta" aria-live="polite">按下鼠标按键，查看按键与映射状态</div>
-                <div class="dots" id="dots"></div>
+              <div class="pulse-text" aria-live="polite">
+                <div id="pulse-name" class="pulse-name">等你按一下</div>
+                <div id="pulse-state" class="meta">按下鼠标按键，查看按键与映射状态</div>
+                <div class="dots" id="dots" aria-hidden="true"></div>
               </div>
             </div>
           </div>
@@ -77,7 +77,7 @@
             <h2>按键工作台 <span class="meta" id="mapping-count">0 / 5 已配置</span></h2>
             <span class="meta" id="save-status" role="status">已保存</span>
           </div>
-          <div class="quick-add" id="quick-add" aria-label="直接添加鼠标映射">
+          <div class="quick-add" id="quick-add" role="group" aria-label="直接添加鼠标映射">
             <button data-add-button="xbutton1">＋ 后侧键</button>
             <button data-add-button="xbutton2">＋ 前侧键</button>
             <button data-add-button="middle">＋ 中键</button>
@@ -90,13 +90,13 @@
       <aside class="dock" id="settings">
         <div class="sheet dock-card">
           <div class="sheet-top"><span>当前组合</span></div>
-          <p class="dock-lead" id="dock-lead">还没有绑定</p>
+          <p class="dock-lead" id="dock-lead">还没有映射</p>
           <div class="keys" id="dock-keys">
             <span class="key dim">空</span>
           </div>
         </div>
         <div class="sheet dock-card">
-          <div class="sheet-top"><span>偏好设置</span></div><p class="meta" id="safety-copy">左右键保留原操作 · Pause/Scroll Lock 急停</p>
+          <div class="sheet-top"><span>偏好设置</span></div><p class="meta" id="safety-copy">左右键保留原操作 · Pause 急停</p>
           <label class="check">
             <input type="checkbox" id="chk-autostart" />
             开机自启
@@ -105,8 +105,9 @@
           <div class="rail-foot">
             <span id="app-version" class="ver">读取中…</span>
             <button type="button" class="ghost" id="btn-check-update">检查更新</button>
-            <button type="button" class="ghost danger-exit" id="btn-quit">退出应用</button>
+            <button type="button" class="ghost danger" id="btn-quit">退出应用</button>
             <p id="update-status" class="meta" role="status"></p>
+            <div id="update-actions"></div>
           </div>
         </div>
       </aside>
@@ -117,7 +118,7 @@
       <div class="sheet record-card" role="dialog" aria-modal="true" aria-labelledby="record-title" aria-describedby="record-help">
         <span class="eyebrow">定义你的快捷操作</span><h2 id="record-title">同时按下组合键</h2>
         <div class="keys" id="record-keys" aria-live="polite"><span class="key dim">在听</span></div>
-        <div class="presets" id="record-presets" aria-label="常用快捷键">
+        <div class="presets" id="record-presets" role="group" aria-label="常用快捷键">
           <button type="button" data-preset="copy">复制</button><button type="button" data-preset="paste">粘贴</button>
           <button type="button" data-preset="undo">撤销</button><button type="button" data-preset="enter">回车</button>
         </div>

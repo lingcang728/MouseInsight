@@ -17,6 +17,7 @@ import {
   applyButtonChange,
   applyModeChange,
   removeKeyFromSlot,
+  chordRiskHint,
 } from "./logic";
 
 type Pulse = {
@@ -42,12 +43,14 @@ type Snapshot = {
     paused: boolean;
     mappings: Mapping[];
   };
+  hook_status: string;
   xmbc_running: boolean;
   last: Pulse | null;
   listening: boolean;
   is_portable: boolean;
   config_dir: string;
   emergency_hotkeys: number;
+  paused_emergency: boolean;
   active_bindings: { mapping_id: string; button: string; mode: string; active: boolean }[];
   recovery_notes: string[];
 };
@@ -64,6 +67,8 @@ let currentDraft: DraftMapping | null = null;
 let recordBuf: string[] = [];
 let keysFromBackend = false;
 let isPaused = false;
+let emergencyPaused = false;
+let emergencyNoticeShown = false;
 const isMac = /Mac/i.test(
   (navigator as any).userAgentData?.platform ?? navigator.platform
 );
@@ -88,6 +93,12 @@ let pendingDown: Pulse | null = null;
 let wheelHoldButton: string | null = null;
 let wheelHoldTimer = 0;
 let scrollSpyStarted = false;
+let saveNeedsReconcile = false;
+let booting = false;
+const unlisteners: UnlistenFn[] = [];
+window.addEventListener("beforeunload", () => {
+  for (const u of unlisteners) u();
+});
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -95,7 +106,7 @@ function invokeT<T>(cmd: string, args?: Record<string, unknown>, ms = 8000): Pro
   return Promise.race([
     invoke<T>(cmd, args),
     new Promise<never>((_, reject) =>
-      window.setTimeout(() => reject(new Error(`操作超时（${cmd}）`)), ms)
+      window.setTimeout(() => reject(new Error("操作超时，请重试")), ms)
     ),
   ]);
 }
@@ -108,7 +119,7 @@ async function safeInvoke(
   try {
     await invokeT(cmd, args);
   } catch (err) {
-    showAlert(failMsg ?? `操作未完成：${String(err)}`);
+    showAlert(failMsg ?? `操作未完成，请重试。${String(err)}`);
   }
 }
 
@@ -120,7 +131,7 @@ function showAlert(
   opts: {
     sticky?: boolean;
     timeout?: number;
-    kind?: "save" | "hook" | "recovery" | "undo" | "info";
+    kind?: "save" | "hook" | "recovery" | "undo" | "info" | "error" | "emergency";
     action?: { label: string; onClick: () => void };
   } = {}
 ) {
@@ -128,6 +139,7 @@ function showAlert(
   if (!banner) return;
   clearTimeout(alertTimer);
   currentAlertKind = opts.kind ?? "info";
+  banner.dataset.kind = currentAlertKind;
   $("alert-text").textContent = msg;
   const action = $("alert-action") as HTMLButtonElement;
   if (opts.action) {
@@ -140,7 +152,10 @@ function showAlert(
   }
   banner.classList.remove("hidden");
   if (!opts.sticky) {
-    alertTimer = window.setTimeout(() => hideAlert(), opts.timeout ?? 6000);
+    // Serious kinds stay up longer than routine info: a 6s toast can hide a
+    // save/injection failure before the user finishes reading it.
+    const fallback = currentAlertKind === "info" || currentAlertKind === "undo" ? 6000 : 12000;
+    alertTimer = window.setTimeout(() => hideAlert(), opts.timeout ?? fallback);
   }
 }
 
@@ -148,7 +163,9 @@ function hideAlert(kind?: string) {
   if (kind !== undefined && kind !== currentAlertKind) return;
   clearTimeout(alertTimer);
   currentAlertKind = null;
-  $("alert-banner")?.classList.add("hidden");
+  const banner = $("alert-banner");
+  banner?.classList.add("hidden");
+  banner?.removeAttribute("data-kind");
 }
 
 function prettyKeys(keys: string[]): string[] {
@@ -246,9 +263,11 @@ function flashPauseGlyph(paused: boolean) {
   }
 }
 
-function setPausedUi(paused: boolean) {
+function setPausedUi(paused: boolean, emergency?: boolean) {
   const changed = paused !== isPaused;
   isPaused = paused;
+  if (emergency !== undefined) emergencyPaused = emergency;
+  if (!paused) emergencyPaused = false;
   if (hookReady) {
     $("engine-status").textContent = mappings.length === 0
       ? "尚未配置映射"
@@ -262,6 +281,25 @@ function setPausedUi(paused: boolean) {
     updateAllRuntimePills();
   }
   if (changed) flashPauseGlyph(paused);
+  if (emergencyPaused) {
+    // Sticky until dismissed or resumed: this is the only in-window trace of an
+    // emergency stop, so a re-render must not silently bring it back after the
+    // user closed it — but it must survive the window being reopened.
+    if (!emergencyNoticeShown) {
+      emergencyNoticeShown = true;
+      showAlert(
+        `已触发急停（${isMac ? "F13 / ⌃⌥⌘P" : "Pause"}）：全部映射已暂停，按住的按键已释放。`,
+        {
+          sticky: true,
+          kind: "emergency",
+          action: { label: "恢复映射", onClick: () => $("btn-pause").click() },
+        }
+      );
+    }
+  } else {
+    emergencyNoticeShown = false;
+    hideAlert("emergency");
+  }
 }
 
 /** Write text into a meta element; play a small bump animation only when the value changed. */
@@ -279,7 +317,7 @@ function bumpText(el: HTMLElement, text: string) {
 function getStatusPill(m: Mapping): { text: string; className: string } | null {
   if (isPaused) {
     if (m.mode === "toggle") {
-      return { text: "已关闭", className: "pill pill-off status-pill inactive" };
+      return { text: "已关闭", className: "pill status-pill inactive" };
     }
     return null;
   }
@@ -289,11 +327,11 @@ function getStatusPill(m: Mapping): { text: string; className: string } | null {
 
   if (m.mode === "toggle") {
     return isActive
-      ? { text: "保持中", className: "pill pill-on status-pill active" }
-      : { text: "已关闭", className: "pill pill-off status-pill inactive" };
+      ? { text: "保持中", className: "pill status-pill active" }
+      : { text: "已关闭", className: "pill status-pill inactive" };
   } else if ((m.mode === "dual" || !m.mode) && (m.hold_keys?.length ?? 0)) {
     return isActive && state?.mode === "hold"
-      ? { text: "按住中", className: "pill pill-hold status-pill active" }
+      ? { text: "按住中", className: "pill status-pill active" }
       : null;
   }
   return null;
@@ -355,7 +393,7 @@ function highlightMouse(button: string) {
 function renderDock() {
   const selected = mappings.find((m) => m.id === selectedMappingId) ?? mappings[0];
   if (!selected) {
-    $("dock-lead").textContent = "还没有绑定";
+    $("dock-lead").textContent = "还没有映射";
     renderKeys($("dock-keys"), []);
     return;
   }
@@ -400,8 +438,12 @@ function renderMaps(liveButton?: string) {
   document.querySelectorAll<HTMLButtonElement>("[data-add-button]").forEach((button) => {
     const existing = mappings.find((m) => m.button === button.dataset.addButton);
     button.textContent = `${existing ? "" : "＋ "}${BUTTON_LABEL[button.dataset.addButton!]}`;
-    button.classList.toggle("active", existing?.id === selectedMappingId);
-    button.setAttribute("aria-pressed", String(existing?.id === selectedMappingId));
+    const active = existing?.id === selectedMappingId;
+    button.classList.toggle("active", active);
+    // These are select/add actions, not toggles — aria-current marks the row
+    // shown on top, aria-pressed would claim a pressed state that isn't one.
+    if (active) button.setAttribute("aria-current", "true");
+    else button.removeAttribute("aria-current");
   });
   if (!mappings.length) {
     host.replaceChildren();
@@ -440,7 +482,7 @@ function renderMaps(liveButton?: string) {
       opt.value = btnKey;
       const isOccupied = mappings.some((other) => other.id !== m.id && other.button === btnKey);
       const labelText = BUTTON_LABEL[btnKey] ?? btnKey;
-      opt.textContent = isOccupied ? `${labelText}（已绑定）` : labelText;
+      opt.textContent = isOccupied ? `${labelText}（已占用）` : labelText;
       opt.selected = m.button === btnKey;
       opt.disabled = isOccupied;
       selButton.appendChild(opt);
@@ -453,6 +495,11 @@ function renderMaps(liveButton?: string) {
     const availableModes = getAllowedModesForButton(m.button);
     const uiMode = m.mode === "toggle" ? "toggle" : availableModes[0];
     selMode.disabled = availableModes.length <= 1;
+    if (selMode.disabled) {
+      selMode.title = m.button === "wheelup" || m.button === "wheeldown"
+        ? "滚轮滚动只支持「单击」触发"
+        : "该按键只有这一种触发方式";
+    }
     availableModes.forEach((modeKey) => {
       const opt = document.createElement("option");
       opt.value = modeKey;
@@ -496,7 +543,7 @@ function renderMaps(liveButton?: string) {
     if (m.mode === "toggle") {
       article.append(makeComboRow("toggle", "组合", m.keys ?? []));
     } else if (isWheel) {
-      article.append(makeComboRow("tap", "短按", m.tap_keys ?? m.keys ?? []));
+      article.append(makeComboRow("tap", "滚动", m.tap_keys ?? m.keys ?? []));
     } else {
       article.append(makeComboRow("tap", "短按", m.tap_keys ?? []));
       article.append(makeComboRow("hold", "长按", m.hold_keys ?? []));
@@ -506,9 +553,10 @@ function renderMaps(liveButton?: string) {
     desc.className = "map-desc mode-hint";
     const hasAnyKeys =
       (m.keys?.length ?? 0) + (m.tap_keys?.length ?? 0) + (m.hold_keys?.length ?? 0) > 0;
+    desc.classList.toggle("warn", !hasAnyKeys);
     desc.textContent = hasAnyKeys
       ? MODE_DESC[uiMode] ?? MODE_DESC[m.mode] ?? ""
-      : "此映射未绑定任何键，不会生效";
+      : "此映射未设置按键，不会生效";
     article.append(desc);
     host.appendChild(article);
   });
@@ -533,6 +581,33 @@ function applyRemoteMappings(remote: Mapping[]) {
   $("save-status").textContent = "已保存 · 即时生效";
 }
 
+/**
+ * Re-read the engine's authoritative config and converge the UI to it.
+ * Covers two divergence windows: a raced-out save_mappings that ends up
+ * landing anyway, and a tray quick-mapping whose emit-time snapshot was
+ * applied over a later save that had already overwritten it.
+ */
+async function reconcileWithEngine() {
+  const rev = saveRevision;
+  try {
+    const snap = await invokeT<Snapshot>("get_snapshot");
+    if (rev !== saveRevision || saveInFlight > 0) {
+      // A newer save owns the truth; let its completion re-check.
+      saveNeedsReconcile = true;
+      return;
+    }
+    const engineMappings = sanitizeMappings(snap.config.mappings ?? []);
+    if (JSON.stringify(engineMappings) !== JSON.stringify(mappings)) {
+      applyRemoteMappings(engineMappings);
+      hideAlert("save"); // a sticky "已恢复" notice is stale once the save turns out applied
+    } else {
+      confirmedMappings = structuredClone(engineMappings);
+    }
+  } catch {
+    saveNeedsReconcile = true; // engine unreachable; retry after the next save settles
+  }
+}
+
 async function persist() {
   mappings = sanitizeMappings(mappings);
   const snapshot = structuredClone(mappings);
@@ -542,8 +617,14 @@ async function persist() {
   saveInFlight++;
   saveQueue = saveQueue
     .then(async () => {
+      const saveCall = invoke<void>("save_mappings", { mappings: snapshot });
       try {
-        await invokeT("save_mappings", { mappings: snapshot });
+        await Promise.race([
+          saveCall,
+          new Promise<never>((_, reject) =>
+            window.setTimeout(() => reject(new Error("操作超时（save_mappings）")), 8000)
+          ),
+        ]);
         confirmedMappings = snapshot;
         hideAlert("save");
         if (revision === saveRevision) $("save-status").textContent = "已保存 · 即时生效";
@@ -555,6 +636,11 @@ async function persist() {
         }
         if (err instanceof Error && err.message.startsWith("操作超时")) {
           saveQueue = Promise.resolve();
+          // The race only abandoned the wait — the invoke may still land on
+          // the engine. Reconcile once it settles so UI and engine can't
+          // silently diverge.
+          const recheck = () => void reconcileWithEngine();
+          void saveCall.then(recheck, recheck);
           showAlert("保存超时，映射引擎可能卡住。已恢复到上次保存的配置。", { sticky: true, kind: "save" });
         } else {
           showAlert(`保存配置失败：${String(err)}`, { kind: "save" });
@@ -565,6 +651,13 @@ async function persist() {
           const remote = pendingRemote;
           pendingRemote = null;
           applyRemoteMappings(remote);
+          // The applied snapshot predates this save's landing; verify against
+          // the engine instead of trusting the emit-time payload.
+          saveNeedsReconcile = true;
+        }
+        if (saveInFlight === 0 && saveNeedsReconcile) {
+          saveNeedsReconcile = false;
+          void reconcileWithEngine();
         }
       }
     })
@@ -582,7 +675,8 @@ function selectMapping(id: string) {
   document.querySelectorAll<HTMLElement>("[data-add-button]").forEach(button => {
     const active = mappings.find(m => m.id === id)?.button === button.dataset.addButton;
     button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
+    if (active) button.setAttribute("aria-current", "true");
+    else button.removeAttribute("aria-current");
   });
   updateDeckIndex();
   renderDock();
@@ -595,12 +689,14 @@ function showRecorder() {
   $("record-cancel").focus();
 }
 
-async function startRecorder() {
+async function startRecorder(): Promise<boolean> {
   try {
     await invokeT("arm_record");
+    return true;
   } catch (err) {
     await closeRecord();
     showAlert(`无法开始录制：${String(err)}`);
+    return false;
   }
 }
 
@@ -625,15 +721,24 @@ async function openRecordForExisting(id: string, slot: "tap" | "hold" | "toggle"
   };
   recordBuf = [];
   keysFromBackend = false;
+  const slotKeys =
+    slot === "hold" ? m.hold_keys : slot === "toggle" ? m.keys : m.tap_keys;
+  const slotName = m.button.startsWith("wheel")
+    ? "滚动"
+    : slot === "hold" ? "长按" : slot === "toggle" ? "切换" : "短按";
+  recordHelpOverride = (slotKeys?.length ?? 0) > 0
+    ? `将覆盖现有${slotName}组合。Esc 取消，Tab 切换焦点；录制期间暂停触发鼠标映射。`
+    : null;
+  // Arm before showing: a failed arm must not flash the dialog open.
+  if (!(await startRecorder())) return;
   showRecorder();
   const title = $("record-mask").querySelector("h2");
   if (title) {
     title.textContent =
-      slot === "hold" ? "录长按组合键" : slot === "tap" ? "录短按组合键" : "录切换组合键";
+      slot === "hold" ? "录长按组合键" : slot === "tap" ? (m.button.startsWith("wheel") ? "录滚动组合键" : "录短按组合键") : "录切换组合键";
   }
   renderKeys($("record-keys"), [], { dimEmpty: false, removable: true, emptyText: "正在监听键盘…" });
   updateRecordOk();
-  await startRecorder();
 }
 
 async function openRecordForNew(button: string, slot?: "tap" | "hold" | "toggle") {
@@ -645,6 +750,9 @@ async function openRecordForNew(button: string, slot?: "tap" | "hold" | "toggle"
   };
   recordBuf = [];
   keysFromBackend = false;
+  recordHelpOverride = null;
+  // Arm before showing: a failed arm must not flash the dialog open.
+  if (!(await startRecorder())) return;
   showRecorder();
   const title = $("record-mask").querySelector("h2");
   if (title) {
@@ -655,22 +763,54 @@ async function openRecordForNew(button: string, slot?: "tap" | "hold" | "toggle"
   }
   renderKeys($("record-keys"), [], { removable: true, emptyText: "正在监听键盘…" });
   updateRecordOk();
-  await startRecorder();
 }
 
 const RECORD_HELP_DEFAULT =
   "按下键盘组合，或选择上方预设。Esc 取消，Tab 切换焦点；如需映射它们，请点击对应按键。录制期间暂停触发鼠标映射。";
 
+// One-shot overwrite notice shown in the dialog's help line instead of the
+// default text — the pre-record banner is invisible under the mask.
+let recordHelpOverride: string | null = null;
+
 function updateRecordOk() {
   const ok = $("record-ok") as HTMLButtonElement;
   const help = $("record-help");
-  if (recordBuf.length >= 16) {
+  if (recordBuf.length > 16) {
     ok.disabled = true;
     if (help) help.textContent = "组合键最多 16 键";
     return;
   }
-  if (help) help.textContent = RECORD_HELP_DEFAULT;
+  const risk = chordRiskHint(recordBuf);
+  if (help) {
+    help.textContent = risk
+      ? `⚠ ${risk}，仍可保存。`
+      : recordHelpOverride ?? RECORD_HELP_DEFAULT;
+  }
   ok.disabled = confirming || (recordBuf.length === 0 && !keysFromBackend);
+}
+
+function warnIfActive(m: Mapping) {
+  const state = runtimeStates.get(m.button);
+  if (!state?.active) return;
+  const label = state.mode === "hold" ? "按住中" : "保持中";
+  showAlert(`「${BUTTON_LABEL[m.button] ?? m.button}」正处于${label}状态，修改会释放已按住的快捷键。`, { timeout: 9000 });
+}
+
+let discardArmed = false;
+let discardTimer = 0;
+function disarmDiscard() {
+  discardArmed = false;
+  clearTimeout(discardTimer);
+  ($("record-cancel") as HTMLButtonElement).textContent = "取消";
+}
+function requestCloseRecord() {
+  if (recordBuf.length && !discardArmed) {
+    discardArmed = true;
+    ($("record-cancel") as HTMLButtonElement).textContent = "再点一次丢弃已录按键";
+    discardTimer = window.setTimeout(disarmDiscard, 3000);
+    return;
+  }
+  void closeRecord();
 }
 
 async function closeRecord() {
@@ -678,6 +818,8 @@ async function closeRecord() {
   recordBuf = [];
   keysFromBackend = false;
   confirming = false;
+  disarmDiscard();
+  recordHelpOverride = null;
   ($("record-ok") as HTMLButtonElement).disabled = false;
   $("record-mask").classList.add("hidden");
   document.querySelector<HTMLElement>(".app")!.inert = false;
@@ -741,11 +883,23 @@ async function confirmRecord() {
     }
   }
 
+  const risk = chordRiskHint(finalKeys);
+  if (risk) showAlert(`已录制的组合注意：${risk}。`, { timeout: 9000 });
   if (currentDraft?.gen !== draft.gen) return;
   await persist();
   if (currentDraft?.gen !== draft.gen) return;
   hideAlert("save");
   await closeRecord();
+}
+
+// Non-ready hook states are failures, not "paused": they get the danger-styled
+// .error pill so a dead engine never looks the same as an enabled one.
+function setEngineError(text: string) {
+  hookReady = false;
+  const el = $("engine-status");
+  el.classList.remove("paused");
+  el.classList.add("error");
+  el.textContent = text;
 }
 
 function applyHookStatus(status: string) {
@@ -755,12 +909,20 @@ function applyHookStatus(status: string) {
   }
   if (status === "ready") {
     hookReady = true;
+    $("engine-status").classList.remove("error");
     setPausedUi(isPaused);
     hideAlert("hook");
     return;
   }
   hookReady = false;
-  $("engine-status").textContent = "监听需要处理";
+  // Worker thread died: the hook may still be up, so retry_hook would no-op —
+  // offer restart, not a dead 「重试监听」 button.
+  if (status === "engine stopped") {
+    setEngineError("引擎已停止");
+    showAlert("映射引擎已停止，请重启应用。", { sticky: true, kind: "hook" });
+    return;
+  }
+  setEngineError("监听需要处理");
   if (isMac && status.includes("辅助功能")) {
     showAlert(status, {
       sticky: true,
@@ -791,13 +953,15 @@ async function checkHook(attempt = 0): Promise<void> {
     }
     applyHookStatus(status === "starting" ? "监听启动超时，请重新启动应用。" : status);
   } catch (err) {
-    $("engine-status").textContent = "无法读取监听状态";
+    setEngineError("无法读取监听状态");
     showAlert(`无法读取监听状态：${String(err)}`, { kind: "hook" });
   }
 }
 
 async function boot() {
-  const unlisteners: UnlistenFn[] = [];
+  // A retried boot must not stack another round of listeners on the previous
+  // attempt's partially-registered ones.
+  for (const u of unlisteners.splice(0)) u();
 
   unlisteners.push(
     await listen<Mapping[]>("mappings-changed", (ev) => {
@@ -837,7 +1001,7 @@ async function boot() {
         ? "已拦截，改发快捷键"
         : "保留系统原操作"
       : "松开");
-    setPulseText("pulse-ago", p.down ? "按下" : "松开");
+    setPulseText("pulse-edge", p.down ? "按下" : "松开");
     // While a same-direction wheel hold is active the zone is already lit —
     // skipping this keeps .zone.on (and its CSS animation) from re-triggering.
     if (!wheelHeld) highlightMouse(wheel || p.down ? p.button : "");
@@ -847,15 +1011,12 @@ async function boot() {
       el.classList.toggle("live", (el as HTMLElement).dataset.button === p.button && (wheel || p.down));
     });
 
-    if (p.down) {
+    // Non-top cards are visibility:hidden, so toggling .selected alone would
+    // select an invisible card; selectMapping also prepends it onto the deck.
+    if (p.down && !drag && !deckBusy) {
       const active = mappings.find((m) => m.button === p.button);
       if (active && selectedMappingId !== active.id) {
-        selectedMappingId = active.id;
-        document.querySelectorAll(".map").forEach((el) => {
-          el.classList.toggle("selected", (el as HTMLElement).dataset.id === active.id);
-        });
-        updateDeckIndex();
-        renderDock();
+        selectMapping(active.id);
       }
     }
 
@@ -919,8 +1080,8 @@ async function boot() {
   );
 
   unlisteners.push(
-    await listen<{ paused: boolean }>("engine-state-changed", (ev) => {
-      setPausedUi(ev.payload.paused);
+    await listen<{ paused: boolean; emergency?: boolean }>("engine-state-changed", (ev) => {
+      setPausedUi(ev.payload.paused, !!ev.payload.emergency);
     })
   );
 
@@ -928,17 +1089,19 @@ async function boot() {
     await listen<SendReport>("injection-error", (ev) => {
       const r = ev.payload;
       if (r.is_uipi_blocked) {
-        showAlert("⚠️ 快捷键注入受阻：目标窗口可能以管理员权限运行（受 Windows UIPI 特权保护）。如有需要，请以管理员身份启动 Mouse Insight。");
+        showAlert("⚠️ 快捷键注入受阻：目标窗口可能以管理员权限运行（受 Windows UIPI 特权保护）。如有需要，请以管理员身份启动 Mouse Insight。", { sticky: true, kind: "error" });
       } else {
-        showAlert(`⚠️ 按键注入失败（成功 ${r.inserted}/${r.expected}，错误码 ${r.win32_error}）`);
+        showAlert(`⚠️ 按键注入失败（成功 ${r.inserted}/${r.expected}，错误码 ${r.win32_error}）`, { timeout: 15000, kind: "error" });
       }
     })
   );
 
   unlisteners.push(
     await listen<string>("engine-fatal", (ev) => {
-      showAlert(`${ev.payload}。请重启应用。`, { sticky: true });
-      $("engine-status").textContent = "引擎已停止";
+      runtimeStates.clear();
+      updateAllRuntimePills();
+      setEngineError("引擎已停止");
+      showAlert(`${ev.payload}。请重启应用。`, { sticky: true, kind: "error" });
     })
   );
 
@@ -974,6 +1137,7 @@ async function boot() {
       if (existing) {
         selectedMappingId = existing.id;
         renderMaps(capturedButton);
+        warnIfActive(existing);
         showAlert(`「${BUTTON_LABEL[capturedButton] ?? capturedButton}」已有映射，新录的键会覆盖对应槽位。`);
         const slot =
           existing.mode === "toggle" ? "toggle" : inferredSlot === "hold" && !(existing.hold_keys?.length) && (existing.tap_keys?.length) ? "tap" : inferredSlot;
@@ -988,7 +1152,7 @@ async function boot() {
     await listen<string[]>("record-keys", (ev) => {
       if (!currentDraft) return;
       recordBuf = ev.payload ?? [];
-      if (recordBuf.length) keysFromBackend = true;
+      keysFromBackend = recordBuf.length > 0;
       renderKeys($("record-keys"), recordBuf, { removable: true });
       updateRecordOk();
     })
@@ -999,10 +1163,6 @@ async function boot() {
       closeRecord();
     })
   );
-
-  window.addEventListener("beforeunload", () => {
-    for (const u of unlisteners) u();
-  });
 
   const snap = await invokeT<Snapshot>("get_snapshot");
   const rawMappings = snap.config.mappings ?? [];
@@ -1017,7 +1177,10 @@ async function boot() {
   }
 
   applyTheme(snap.config.theme || "light");
-  setPausedUi(!!snap.config.paused);
+  setPausedUi(!!snap.config.paused, !!snap.paused_emergency);
+  // A recreated window missed every status event while it was gone; apply the
+  // snapshot's live status so a dead engine can't render as a retryable panel.
+  applyHookStatus(snap.hook_status);
   void checkHook();
   const autostartBox = $("chk-autostart") as HTMLInputElement;
   try {
@@ -1046,15 +1209,14 @@ async function boot() {
     await safeInvoke("open_config_dir");
   });
 
-  const hotkeys = snap.emergency_hotkeys ?? 0;
+  $("btn-pause").title = isMac
+    ? "暂停/恢复所有映射（急停 F13 / ⌃⌥⌘P）"
+    : "暂停/恢复所有映射（急停 Pause）";
   if (isMac) {
     $("safety-copy").textContent = "左右键保留原操作 · 急停 F13 或 ⌃⌥⌘P";
-    document.querySelector<HTMLButtonElement>('[data-key="LWin"]')!.textContent = "⌘ Command";
-  } else if ((hotkeys & 1) === 0 && (hotkeys & 2) === 0) {
-    $("safety-copy").textContent = "左右键保留原操作 · ⚠ 急停热键被占用，请从托盘暂停";
-  } else if ((hotkeys & 1) === 0 || (hotkeys & 2) === 0) {
-    const usable = (hotkeys & 1) !== 0 ? "Pause" : "Scroll Lock";
-    $("safety-copy").textContent = `左右键保留原操作 · 急停 ${usable}`;
+    document.querySelectorAll<HTMLElement>("#record-chips [data-key]").forEach((chip) => {
+      chip.textContent = prettyKeys([chip.dataset.key!])[0];
+    });
   }
   paintDots("");
   renderMaps();
@@ -1071,10 +1233,19 @@ async function boot() {
   updateAllRuntimePills();
 
   if (snap.listening && !listenGen) {
-    listenGen = ++localGen;
+    // A reload kept the backend listening; re-arm the same 15s expiry the
+    // manual path uses so the restored session can't run forever.
+    const gen = ++localGen;
+    listenGen = gen;
     $("listen-copy").textContent = "请按侧键、中键或滚轮。15 秒后自动结束识别。";
     $("btn-listen").textContent = "取消识别";
     document.querySelector(".listen-sheet")?.classList.add("armed");
+    listenTimer = window.setTimeout(() => {
+      if (listenGen === gen) {
+        void stopListening();
+        showAlert("15 秒内未检测到鼠标按键，识别已结束。");
+      }
+    }, 15000);
   }
 
   if (snap.recovery_notes?.length) {
@@ -1101,7 +1272,10 @@ async function boot() {
     if (stageEl && dockEl) {
       const setActiveRailLink = (hash: string) => {
         document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach((el) => {
-          el.classList.toggle("active", el.getAttribute("href") === hash);
+          const active = el.getAttribute("href") === hash;
+          el.classList.toggle("active", active);
+          if (active) el.setAttribute("aria-current", "true");
+          else el.removeAttribute("aria-current");
         });
         syncRailThumb();
       };
@@ -1253,6 +1427,7 @@ $("maps").addEventListener("change", async (e) => {
   const sel = t as HTMLSelectElement;
   if (!sel.matches("select[data-k]")) return;
 
+  warnIfActive(m);
   if (sel.dataset.k === "button") {
     const changed = applyButtonChange(m, sel.value, mappings);
     if (!changed) {
@@ -1287,6 +1462,7 @@ $("maps").addEventListener("click", async (e) => {
   if (t.dataset.act === "del") {
     const target = mappings.find((m) => m.id === id);
     if (!target) return;
+    warnIfActive(target);
     const removed = structuredClone(target);
     runtimeStates.delete(target.button);
     mappings = mappings.filter((m) => m.id !== id);
@@ -1300,12 +1476,19 @@ $("maps").addEventListener("click", async (e) => {
       action: {
         label: "撤销",
         onClick: () => {
-          if (!mappings.some((m) => m.id === removed.id)) {
-            mappings.push(removed);
-            selectedMappingId = removed.id;
-            void persist();
-          }
           hideAlert();
+          if (mappings.some((m) => m.id === removed.id)) return;
+          const occupant = mappings.find((m) => m.button === removed.button);
+          if (occupant) {
+            // sanitizeMappings keeps the first row per button, so restoring
+            // alongside a newer mapping would silently drop the undo.
+            selectMapping(occupant.id);
+            showAlert(`「${BUTTON_LABEL[removed.button] ?? removed.button}」已有新映射，未恢复删除项。`);
+            return;
+          }
+          mappings.push(removed);
+          selectedMappingId = removed.id;
+          void persist();
         },
       },
     });
@@ -1321,6 +1504,7 @@ $("maps").addEventListener("click", async (e) => {
       | undefined;
     const target = mappings.find((m) => m.id === id);
     if (target && slot) {
+      warnIfActive(target);
       Object.assign(target, removeKeyFromSlot(target, slot, removeKey));
       await persist();
     }
@@ -1330,6 +1514,8 @@ $("maps").addEventListener("click", async (e) => {
   if (t.dataset.act === "record") {
     const slot = (t.dataset.slot as "tap" | "hold" | "toggle") || "tap";
     selectMapping(id);
+    const target = mappings.find((m) => m.id === id);
+    if (target) warnIfActive(target);
     await openRecordForExisting(id, slot);
     return;
   }
@@ -1340,7 +1526,7 @@ $("maps").addEventListener("click", async (e) => {
 });
 
 $("record-cancel").addEventListener("click", () => {
-  closeRecord();
+  requestCloseRecord();
 });
 
 $("record-ok").addEventListener("click", async () => {
@@ -1353,7 +1539,7 @@ $("record-ok").addEventListener("click", async () => {
 
 $("record-mask").addEventListener("click", (e) => {
   if (e.target === $("record-mask")) {
-    closeRecord();
+    requestCloseRecord();
   }
 });
 
@@ -1450,21 +1636,24 @@ $("chk-autostart").addEventListener("change", async (e) => {
 
 async function checkForUpdate(current: string) {
   const status = $("update-status");
+  const actions = $("update-actions");
   const button = $("btn-check-update") as HTMLButtonElement;
   if (button.disabled) return;
   button.disabled = true;
   status.textContent = "正在检查更新…";
+  actions.replaceChildren();
+  const actionBtn = (label: string, url: string) => {
+    const link = document.createElement("button");
+    link.className = "ghost";
+    link.textContent = label;
+    link.addEventListener("click", () => { void safeInvoke("open_url", { url }); });
+    actions.appendChild(link);
+  };
   try {
     const release = await latestRelease();
     const newer = isNewer(release.version, current);
     status.textContent = newer ? `可更新至 ${release.version}` : "当前已是最新版本";
-    if (newer) {
-      const link = document.createElement("button");
-      link.className = "ghost";
-      link.textContent = "查看发行说明";
-      link.addEventListener("click", () => { void safeInvoke("open_url", { url: release.url }); });
-      status.appendChild(link);
-    }
+    if (newer) actionBtn("查看发行说明", release.url);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "";
     status.textContent =
@@ -1475,15 +1664,13 @@ async function checkForUpdate(current: string) {
           : msg === "TIMEOUT"
             ? "连接超时"
             : "暂时无法连接 GitHub";
-    const link = document.createElement("button");
-    link.className = "ghost";
-    link.textContent = "打开下载页面";
-    link.addEventListener("click", () => { void safeInvoke("open_url", { url: RELEASES_URL }); });
-    status.appendChild(link);
+    actionBtn("打开下载页面", RELEASES_URL);
   } finally {
     button.disabled = false;
   }
 }
+
+document.querySelector(".alert-close")?.addEventListener("click", () => hideAlert());
 
 $("xmbc-recheck").addEventListener("click", async () => {
   try {
@@ -1507,7 +1694,7 @@ window.addEventListener("blur", () => {
 window.addEventListener("unhandledrejection", (event) => {
   console.error("unhandled rejection:", event.reason);
   if (event.reason instanceof Error && event.reason.name === "AbortError") return;
-  showAlert(`操作未完成：${String(event.reason)}`);
+  showAlert(`操作未完成，请重试。${String(event.reason)}`);
 });
 
 let currentVersion = "0.0.0";
@@ -1534,13 +1721,24 @@ function bootFailed(err: unknown) {
   retry.id = "btn-retry-boot";
   retry.textContent = "重试";
   retry.addEventListener("click", () => {
-    void boot().catch(bootFailed);
+    retry.disabled = true;
+    runBoot();
   });
   host.append(p, retry);
   showAlert(`无法连接映射引擎，请重新打开控制面板：${String(err)}`);
 }
 
-void boot().catch(bootFailed);
+// Re-entrant guard: a failed boot leaves listeners registered; without the
+// mutex, rapid retries would double-subscribe before boot() can clear them.
+function runBoot() {
+  if (booting) return;
+  booting = true;
+  void boot()
+    .catch(bootFailed)
+    .finally(() => { booting = false; });
+}
+
+runBoot();
 
 type CardDrag = { x: number; y: number; lastX: number; lastY: number; lastTime: number; velocity: number; dx: number; dy: number; id: number; captureEl: HTMLElement; card: HTMLElement };
 let drag: CardDrag | null = null;
@@ -1911,7 +2109,12 @@ document.querySelectorAll<HTMLAnchorElement>(".rail-link").forEach(link => {
         block: "start",
       });
     }
-    document.querySelectorAll(".rail-link").forEach(el => el.classList.toggle("active", el === link));
+    document.querySelectorAll<HTMLElement>(".rail-link").forEach(el => {
+      const active = el === link;
+      el.classList.toggle("active", active);
+      if (active) el.setAttribute("aria-current", "true");
+      else el.removeAttribute("aria-current");
+    });
     syncRailThumb();
   });
 });

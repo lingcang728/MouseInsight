@@ -4,7 +4,7 @@
   "private": true,
   "description": "Mouse Insight",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.20"
   },
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "build": "tsc --noEmit && vite build",
     "test": "tsc --noEmit && node tests/frontend_logic.test.mjs && node tests/check_release_version.test.mjs && node scripts/check-release-version.mjs && cargo test --locked --manifest-path src-tauri/Cargo.toml",
     "check:release-version": "node scripts/check-release-version.mjs",
+    "verify:ui": "python scripts/verify-ui.py --cdp http://127.0.0.1:9223 --output artifacts/verify-ui",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",

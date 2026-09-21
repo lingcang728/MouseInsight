@@ -6,16 +6,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 #[cfg(any(target_os = "macos", test))]
 use std::sync::atomic::AtomicI64;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Devices::HumanInterfaceDevice::GUID_DEVINTERFACE_MOUSE;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -25,8 +29,6 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Threading::GetCurrentThreadId;
-#[cfg(target_os = "windows")]
 use windows::Win32::System::Power::{
     RegisterSuspendResumeNotification, UnregisterSuspendResumeNotification, HPOWERNOTIFY,
 };
@@ -35,31 +37,32 @@ use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 #[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::GetCurrentThreadId;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0,
-    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MAPVK_VK_TO_VSC, MOD_NOREPEAT, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
-    VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
-    VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL,
-    VK_RETURN, VK_RIGHT,
-    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SPACE, VK_TAB, VK_UP,
+    GetAsyncKeyState, GetLastInputInfo, MapVirtualKeyW, RegisterHotKey, SendInput,
+    UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO, MAPVK_VK_TO_VSC,
+    MOD_NOREPEAT, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
+    VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1,
+    VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS,
+    VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SPACE, VK_TAB, VK_UP,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::Devices::HumanInterfaceDevice::GUID_DEVINTERFACE_MOUSE;
-#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, KillTimer, PostThreadMessageW, RegisterClassW, RegisterDeviceNotificationW,
-    SetTimer, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, UnregisterDeviceNotification,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    KillTimer, PostThreadMessageW, RegisterClassW, RegisterDeviceNotificationW, SetTimer,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterDeviceNotification,
     DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE,
-    DEV_BROADCAST_DEVICEINTERFACE_W, HC_ACTION, HDEVNOTIFY, HWND_MESSAGE, KBDLLHOOKSTRUCT,
-    MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DEVICECHANGE,
-    WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    DEV_BROADCAST_DEVICEINTERFACE_W, EVENT_SYSTEM_DESKTOPSWITCH, HC_ACTION, HDEVNOTIFY,
+    HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WM_DEVICECHANGE, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    WM_POWERBROADCAST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
     WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
@@ -153,11 +156,17 @@ pub const EXTRA_INFO: usize = 0x4D49_484B;
 pub const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFC);
 const TAP_QUEUE_CAP: usize = 32;
 const EDGE_CHANNEL_CAP: usize = 256;
+const CMD_CHANNEL_CAP: usize = 128;
+/// Flooded save_* calls already serialize on CFG_MUTATE_LOCK; this floor caps
+/// the fsync+rename rate so IPC cannot amplify into a disk busy loop.
+const SAVE_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const HOLD_THRESHOLD: Duration = Duration::from_millis(400);
+/// Schema stamped on save. A config written by a newer version keeps its
+/// higher number on round-trip so a future migration can still tell
+/// "never migrated" apart from "downgraded by an older build".
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 #[cfg(target_os = "windows")]
 const HOTKEY_PAUSE: i32 = 1;
-#[cfg(target_os = "windows")]
-const HOTKEY_SCROLL: i32 = 2;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -278,7 +287,9 @@ fn specs_from_names(names: &[String]) -> Vec<KeySpec> {
         // contents are deliberately not logged (privacy rule).
         match key_spec(&name) {
             Some(spec) => {
-                if !specs.contains(&spec) { specs.push(spec); }
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
             }
             None => log::warn!("skipped an unsupported key token in a chord"),
         }
@@ -372,6 +383,10 @@ pub struct Mapping {
     pub hold_keys: Vec<String>,
     #[serde(default)]
     pub label: String,
+    // Same forward-compat rule as AppConfig::extra: fields a newer version
+    // adds to a mapping round-trip instead of being dropped on save.
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -424,12 +439,16 @@ pub struct Pulse {
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub config: AppConfig,
+    /// Lets a reopened window reconcile engine state without an extra
+    /// get_hook_status round-trip (engine-fatal is lost while destroyed).
+    pub hook_status: String,
     pub xmbc_running: bool,
     pub last: Option<Pulse>,
     pub listening: bool,
     pub is_portable: bool,
     pub config_dir: String,
     pub emergency_hotkeys: u8,
+    pub paused_emergency: bool,
     pub active_bindings: Vec<RuntimeBindingState>,
     pub recovery_notes: Vec<String>,
 }
@@ -476,15 +495,13 @@ pub struct InjectedRecord {
 }
 
 pub trait InputInjector: Send + 'static {
-    #[allow(dead_code)]
-    fn send_key(&mut self, spec: &KeySpec, down: bool) -> Result<(), SendReport> {
-        self.send_keys(std::slice::from_ref(spec), down)
-    }
     fn send_keys(&mut self, specs: &[KeySpec], down: bool) -> Result<(), SendReport>;
     fn send_mask(&mut self) -> Result<(), SendReport>;
     fn is_physical_down(&self, vk: VIRTUAL_KEY) -> bool;
     fn is_button_physically_down(&self, btn: MouseButton) -> bool;
-    fn relinquish_key(&mut self, _spec: &KeySpec) {}
+    fn relinquish_key(&mut self, spec: &KeySpec) {
+        relinquish_ledger_entry(spec);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -496,6 +513,15 @@ impl InputInjector for Win32Injector {
         if specs.is_empty() {
             return Ok(());
         }
+        if down {
+            // Write-ahead: mark keys held (and journal them) before SendInput
+            // so a process kill in between cannot strand them in the OS.
+            let mut held = injected_held().lock();
+            for s in specs {
+                held.insert(*s);
+            }
+            persist_held_journal(&held);
+        }
         let inputs: Vec<INPUT> = specs.iter().map(|s| make_input(s, down)).collect();
         let result = execute_send_inputs(&inputs);
         let inserted = match &result {
@@ -504,11 +530,21 @@ impl InputInjector for Win32Injector {
         };
         {
             let mut held = injected_held().lock();
-            for s in &specs[..inserted] {
-                if down {
-                    held.insert(*s);
-                } else {
-                    held.remove(s);
+            if down {
+                // Undo the write-ahead for keys that were never inserted.
+                if inserted < specs.len() {
+                    for s in &specs[inserted..] {
+                        held.remove(s);
+                    }
+                    persist_held_journal(&held);
+                }
+            } else {
+                let mut changed = false;
+                for s in &specs[..inserted] {
+                    changed |= held.remove(s);
+                }
+                if changed {
+                    persist_held_journal(&held);
                 }
             }
         }
@@ -671,6 +707,10 @@ struct DualPending {
     mapping_id: String,
     tap_specs: Vec<KeySpec>,
     hold_specs: Vec<KeySpec>,
+    /// Physical press time from the hook callback; tap/hold is decided on
+    /// this, never on processing time (worker backlog must not flip a tap
+    /// into a hold flash).
+    pressed_at: Instant,
     due: Instant,
 }
 
@@ -761,6 +801,10 @@ impl<I: InputInjector> InputStateMachine<I> {
         self.reset_all(ResetReason::ConfigChanged);
     }
 
+    /// Deadlines are `Instant`s, so a machine asleep past `due` resolves late:
+    /// a hold engaged across sleep stays injected until wake, then the
+    /// physical-state watchdog corrects it (accepted semantics — no wall-clock
+    /// deadline can fire while the process itself is suspended).
     pub fn next_deadline(&self) -> Option<Instant> {
         self.tap_in_flight
             .values()
@@ -842,7 +886,8 @@ impl<I: InputInjector> InputStateMachine<I> {
         if !to_release.is_empty() {
             if let Err(report) = self.injector.send_keys(&to_release, false) {
                 let inserted = (report.inserted as usize).min(to_release.len());
-                self.pending_release.extend_from_slice(&to_release[inserted..]);
+                self.pending_release
+                    .extend_from_slice(&to_release[inserted..]);
                 if let Some(cb) = &self.on_send_error {
                     cb(report);
                 }
@@ -862,25 +907,25 @@ impl<I: InputInjector> InputStateMachine<I> {
         mapping_id: String,
         button: MouseButton,
         specs: Vec<KeySpec>,
-        at: Instant,
+        now: Instant,
     ) {
         if self.tap_in_flight.contains_key(&button) {
             let q = self.tap_queue.entry(button).or_default();
             if q.len() < TAP_QUEUE_CAP {
-                q.push_back(QueuedTap {
-                    mapping_id,
-                    specs,
-                });
+                q.push_back(QueuedTap { mapping_id, specs });
             }
             return;
         }
         self.acquire_specs(&specs);
+        // Dwell anchors at processing time: anchoring at the hook timestamp
+        // would let a backlogged queue shrink the tap to a back-to-back
+        // down/up that targets may ignore.
         self.tap_in_flight.insert(
             button,
             ActiveTap {
                 mapping_id: mapping_id.clone(),
                 specs,
-                due: at + self.tap_dwell,
+                due: now + self.tap_dwell,
             },
         );
         self.emit_state_change(mapping_id, button, TriggerMode::Click, true);
@@ -888,14 +933,26 @@ impl<I: InputInjector> InputStateMachine<I> {
 
     pub fn tick(&mut self, now: Instant) {
         // Retry key-ups that failed earlier; SendInput can transiently refuse
-        // under UIPI and the keys would otherwise stay held forever.
+        // under UIPI and the keys would otherwise stay held forever. Re-check
+        // physical state first: a key the user pressed while the up was
+        // waiting must not get the late release.
         if !self.pending_release.is_empty() {
             let pending = std::mem::take(&mut self.pending_release);
-            if let Err(report) = self.injector.send_keys(&pending, false) {
-                let inserted = (report.inserted as usize).min(pending.len());
-                self.pending_release.extend_from_slice(&pending[inserted..]);
-                if let Some(cb) = &self.on_send_error {
-                    cb(report);
+            let mut retry: Vec<KeySpec> = Vec::new();
+            for spec in pending {
+                if self.injector.is_physical_down(spec.vk) {
+                    self.injector.relinquish_key(&spec);
+                } else {
+                    retry.push(spec);
+                }
+            }
+            if !retry.is_empty() {
+                if let Err(report) = self.injector.send_keys(&retry, false) {
+                    let inserted = (report.inserted as usize).min(retry.len());
+                    self.pending_release.extend_from_slice(&retry[inserted..]);
+                    if let Some(cb) = &self.on_send_error {
+                        cb(report);
+                    }
                 }
             }
         }
@@ -909,10 +966,8 @@ impl<I: InputInjector> InputStateMachine<I> {
         for btn in due_dual {
             if let Some(pending) = self.pending_dual.remove(&btn) {
                 self.acquire_specs(&pending.hold_specs);
-                self.active_holds.insert(
-                    btn,
-                    (pending.mapping_id.clone(), pending.hold_specs),
-                );
+                self.active_holds
+                    .insert(btn, (pending.mapping_id.clone(), pending.hold_specs));
                 self.emit_state_change(pending.mapping_id, btn, TriggerMode::Hold, true);
             }
         }
@@ -931,10 +986,7 @@ impl<I: InputInjector> InputStateMachine<I> {
 
                 // P2-eng-28: drop empty queues so tap_queue does not grow
                 // one dead entry per button ever tapped.
-                let next = self
-                    .tap_queue
-                    .get_mut(&btn)
-                    .and_then(|q| q.pop_front());
+                let next = self.tap_queue.get_mut(&btn).and_then(|q| q.pop_front());
                 if let Some(next) = next {
                     self.acquire_specs(&next.specs);
                     self.tap_in_flight.insert(
@@ -989,6 +1041,22 @@ impl<I: InputInjector> InputStateMachine<I> {
         now: Instant,
         at: Instant,
     ) {
+        // Decide a dual press's tap-vs-hold by physical duration before tick()
+        // can convert it on processing time: a backlogged worker would
+        // otherwise see `due <= now` for a press already released long ago
+        // and flash the hold chord instead of firing the tap.
+        let dual_tap = if down || self.paused {
+            None
+        } else if self
+            .pending_dual
+            .get(&button)
+            .is_some_and(|p| at.saturating_duration_since(p.pressed_at) < self.hold_threshold)
+        {
+            self.pending_dual.remove(&button)
+        } else {
+            None
+        };
+
         self.tick(now);
 
         if self.paused {
@@ -999,6 +1067,11 @@ impl<I: InputInjector> InputStateMachine<I> {
                     self.emit_state_change(mapping_id, button, TriggerMode::Hold, false);
                 }
             }
+            return;
+        }
+
+        if let Some(pending) = dual_tap {
+            self.fire_click(pending.mapping_id, button, pending.tap_specs, now);
             return;
         }
 
@@ -1025,12 +1098,7 @@ impl<I: InputInjector> InputStateMachine<I> {
                     );
                 }
                 TriggerMode::Click => {
-                    self.fire_click(
-                        action.mapping_id.clone(),
-                        button,
-                        action.specs.clone(),
-                        at,
-                    );
+                    self.fire_click(action.mapping_id.clone(), button, action.specs.clone(), now);
                 }
                 TriggerMode::Dual => {
                     if self.pending_dual.contains_key(&button)
@@ -1044,6 +1112,7 @@ impl<I: InputInjector> InputStateMachine<I> {
                             mapping_id: action.mapping_id.clone(),
                             tap_specs: action.tap_specs.clone(),
                             hold_specs: action.hold_specs.clone(),
+                            pressed_at: at,
                             due: at + self.hold_threshold,
                         },
                     );
@@ -1051,11 +1120,9 @@ impl<I: InputInjector> InputStateMachine<I> {
                 TriggerMode::Toggle => {
                     // Debounce: a bouncing switch or a double-fed edge must not
                     // flip a latched toggle back off within a few ms.
-                    if self
-                        .last_toggle
-                        .get(&button)
-                        .is_some_and(|t| at.saturating_duration_since(*t) < Duration::from_millis(60))
-                    {
+                    if self.last_toggle.get(&button).is_some_and(|t| {
+                        at.saturating_duration_since(*t) < Duration::from_millis(60)
+                    }) {
                         return;
                     }
                     self.last_toggle.insert(button, at);
@@ -1076,10 +1143,10 @@ impl<I: InputInjector> InputStateMachine<I> {
                 }
             }
         } else {
-            if let Some(pending) = self.pending_dual.remove(&button) {
-                self.fire_click(pending.mapping_id, button, pending.tap_specs, at);
-                return;
-            }
+            // A pending that survived tick() was a physically long press
+            // already converted into active_holds; anything else left here
+            // (non-monotonic timestamps) must not fire a tap.
+            self.pending_dual.remove(&button);
             if let Some((mapping_id, specs)) = self.active_holds.remove(&button) {
                 self.release_specs(&specs);
                 self.emit_state_change(mapping_id, button, TriggerMode::Hold, false);
@@ -1124,7 +1191,8 @@ impl<I: InputInjector> InputStateMachine<I> {
         if !to_release.is_empty() {
             if let Err(report) = self.injector.send_keys(&to_release, false) {
                 let inserted = (report.inserted as usize).min(to_release.len());
-                self.pending_release.extend_from_slice(&to_release[inserted..]);
+                self.pending_release
+                    .extend_from_slice(&to_release[inserted..]);
                 if let Some(cb) = &self.on_send_error {
                     cb(report);
                 }
@@ -1264,8 +1332,8 @@ fn modifier_weight(key: &str) -> u32 {
         "LControl" | "RControl" | "Ctrl" | "Control" => 10,
         "LShift" | "RShift" | "Shift" => 20,
         "LAlt" | "RAlt" | "Alt" | "Option" | "LOption" | "ROption" => 30,
-        "LWin" | "RWin" | "Win" | "Meta" | "LMeta" | "RMeta" | "Cmd" | "Command"
-        | "LCommand" | "RCommand" => 40,
+        "LWin" | "RWin" | "Win" | "Meta" | "LMeta" | "RMeta" | "Cmd" | "Command" | "LCommand"
+        | "RCommand" => 40,
         _ => 100,
     }
 }
@@ -1315,6 +1383,10 @@ pub(crate) struct Engine {
     pub(crate) hook_status: RwLock<String>,
     pub(crate) compiled: ArcSwap<CompiledMappings>,
     pub(crate) paused: AtomicBool,
+    // Whether the current pause came from an emergency stop rather than a
+    // user-initiated pause; the frontend surfaces it so the state is never
+    // silently active when the window reopens.
+    pub(crate) paused_emergency: AtomicBool,
     pub(crate) listening: AtomicBool,
     pub(crate) swallowed_buttons: AtomicU32,
     pub(crate) recording: AtomicBool,
@@ -1331,13 +1403,24 @@ pub(crate) struct Engine {
 
 impl Engine {
     pub(crate) fn enqueue_edge(&self, edge: InputCmd) -> bool {
-        if self.edge_tx.try_send(edge).is_ok() { return true; }
+        if self.edge_tx.try_send(edge).is_ok() {
+            return true;
+        }
         // Never block a native hook or silently lose a key-up. Stop and release
         // on the priority control channel, retaining the bounded edge queue.
-        if !self.paused.swap(true, Ordering::SeqCst) {
-            request_emergency_stop_on(self, false);
-        }
+        request_emergency_stop_on(self, false);
         false
+    }
+
+    /// Bounded control channel: sends never block, so hook callbacks and the
+    /// session window proc cannot stall on a flooded queue. Every command is
+    /// safe to drop — the worker re-reads `paused` and the mapping generation
+    /// from shared state on each edge, and a dropped emergency stop is still
+    /// covered by the failsafe watchdog in `request_emergency_stop_on`.
+    pub(crate) fn enqueue_cmd(&self, cmd: InputCmd) {
+        if self.cmd_tx.try_send(cmd).is_err() {
+            log::debug!("control channel full; command dropped");
+        }
     }
 }
 
@@ -1346,6 +1429,7 @@ pub(crate) static ENGINE: OnceLock<Engine> = OnceLock::new();
 static HOOK_TID: AtomicU32 = AtomicU32::new(0);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
+static LAST_CONFIG_SAVE: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
 static CFG_MUTATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DIR_INFO: OnceLock<(PathBuf, bool)> = OnceLock::new();
 static PHYSICAL_DOWN: OnceLock<RwLock<HashSet<u32>>> = OnceLock::new();
@@ -1356,7 +1440,9 @@ static EMERGENCY_SAVE_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static EMERGENCY_HOTKEYS: AtomicU8 = AtomicU8::new(0);
 #[cfg(target_os = "windows")]
-static HOOK_EVENTS: AtomicU64 = AtomicU64::new(0);
+static HOOK_MOUSE_EVENTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static HOOK_KBD_EVENTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static WHEEL_ACC: AtomicI32 = AtomicI32::new(0);
 static HOOK_STATUS_CB: OnceLock<Box<dyn Fn(String) + Send + Sync>> = OnceLock::new();
@@ -1371,10 +1457,88 @@ pub(crate) fn injected_held() -> &'static parking_lot::Mutex<HashSet<KeySpec>> {
     INJECTED_HELD.get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
 }
 
-/// Release every key the injector still believes is held, without going
-/// through the worker thread. Last-resort path for a stuck worker.
-pub(crate) fn failsafe_release_all() {
-    let held: Vec<KeySpec> = injected_held().lock().drain().collect();
+/// A physically held key owns itself again after a relinquish: drop the
+/// ledger entry (and its journal line) so a later failsafe does not send a
+/// key-up for a key the user, not we, is holding.
+pub(crate) fn relinquish_ledger_entry(spec: &KeySpec) {
+    let mut held = injected_held().lock();
+    if held.remove(spec) {
+        persist_held_journal(&held);
+    }
+}
+
+/// Held-keys journal: mirrors `injected_held` to disk so keys left held by a
+/// killed or panicked process can be released on the next launch. Written
+/// with tmp + atomic rename like the config; no fsync is needed because the
+/// journal only matters across process death (a power loss resets OS key
+/// state anyway).
+fn held_keys_path() -> PathBuf {
+    config_dir().join("held-keys.json")
+}
+
+/// Called with `injected_held` locked. IO failure only loses the recovery
+/// hint, never the in-memory ledger.
+pub(crate) fn persist_held_journal(held: &HashSet<KeySpec>) {
+    let path = held_keys_path();
+    if held.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    let items: Vec<(u16, bool)> = held.iter().map(|s| (s.vk.0, s.extended)).collect();
+    let Ok(json) = serde_json::to_string(&items) else {
+        return;
+    };
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = config_dir().join(format!("held-keys.{}.{seq}.tmp", std::process::id()));
+    if fs::write(&tmp, json.as_bytes()).is_ok() {
+        let _ = replace_file_atomic(&tmp, &path);
+    }
+    let _ = fs::remove_file(&tmp);
+}
+
+fn clear_held_journal() {
+    let _ = fs::remove_file(held_keys_path());
+}
+
+/// Keys a previous process injected and never released stay held in the OS
+/// input stream after the process dies. Replay their key-ups at startup,
+/// before the hook seeds physical state, so phantom modifiers are not
+/// mistaken for physically held keys. A spurious key-up for a key that is
+/// not held is a no-op; for a physically held key it self-heals on the next
+/// press.
+fn release_journaled_keys() {
+    let path = held_keys_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = fs::remove_file(&path);
+    let held: Vec<KeySpec> = serde_json::from_str::<Vec<(u16, bool)>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(vk, extended)| KeySpec {
+            vk: VIRTUAL_KEY(vk),
+            extended,
+        })
+        .collect();
+    if held.is_empty() {
+        return;
+    }
+    log::warn!(
+        "releasing {} injected key(s) left held by a previous process",
+        held.len()
+    );
+    // GetAsyncKeyState can lag a just-posted key-up; the startup physical
+    // seed must not re-adopt these phantoms while the release is in flight.
+    JOURNAL_RELEASED
+        .get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
+        .lock()
+        .extend(held.iter().map(|s| s.vk.0 as u32));
+    send_key_ups(&held);
+}
+
+static JOURNAL_RELEASED: OnceLock<parking_lot::Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn send_key_ups(held: &[KeySpec]) {
     if held.is_empty() {
         return;
     }
@@ -1399,12 +1563,38 @@ pub(crate) fn failsafe_release_all() {
     }
     #[cfg(target_os = "macos")]
     {
-        crate::macos::post_key_ups(&held);
+        crate::macos::post_key_ups(held);
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = held;
     }
+}
+
+/// Release every key the injector still believes is held, without going
+/// through the worker thread. Last-resort path for a stuck worker.
+pub(crate) fn failsafe_release_all() {
+    let held: Vec<KeySpec> = injected_held().lock().drain().collect();
+    clear_held_journal();
+    send_key_ups(&held);
+    // The worker may never run reset_all; drop binding state so the UI does
+    // not keep showing a hold that no longer exists.
+    if let Some(e) = ENGINE.get() {
+        e.active_bindings.write().clear();
+    }
+}
+
+/// Panic-hook variant: a panicking thread may itself hold the ledger lock,
+/// so never block on it. The journal stays untouched when the lock is busy
+/// and the next launch replays it instead.
+pub(crate) fn failsafe_release_all_try() {
+    let Some(mut guard) = injected_held().try_lock() else {
+        return;
+    };
+    let held: Vec<KeySpec> = guard.drain().collect();
+    drop(guard);
+    clear_held_journal();
+    send_key_ups(&held);
 }
 
 /// A session lock/unlock, suspend/resume or device removal can sever physical
@@ -1414,11 +1604,84 @@ pub(crate) fn failsafe_release_all() {
 #[cfg(target_os = "windows")]
 pub(crate) fn session_reset() {
     if let Some(e) = ENGINE.get() {
-        let _ = e
-            .cmd_tx
-            .send(InputCmd::ResetState(ResetReason::SessionChanged));
         e.swallowed_buttons.store(0, Ordering::Relaxed);
+        // A swallowed down whose up never arrived must not stay latched —
+        // otherwise the next ordinary press of that key loses its release.
+        e.swallowed_keys.write().clear();
+        // Key-ups hidden by the transition left phantom "still held" entries
+        // that would suppress every later release; rebuild from async state.
+        reseed_physical_down_set(&HashSet::new());
+        WHEEL_ACC.store(0, Ordering::Relaxed);
+        // The worker's reset reads the reseeded set; queue it last.
+        e.enqueue_cmd(InputCmd::ResetState(ResetReason::SessionChanged));
         log::info!("session/power/device change; released held state");
+    }
+}
+
+/// Rebuild the physical-hold set from GetAsyncKeyState after a boundary that
+/// could hide key-ups from the hook (secure desktop switch, session change,
+/// hook re-installation). Every keyboard virtual-key is scanned — not just
+/// modifiers — so a held letter whose up was lost is not released either.
+/// Keys we injected are excluded: their async state reads "held" even with
+/// no finger on them, and seeding them would strand our own held keys.
+/// `skip` carries journal-released keys that must not be re-seeded.
+#[cfg(target_os = "windows")]
+fn reseed_physical_down_set(skip: &HashSet<u32>) {
+    let injected: HashSet<u16> = injected_held().lock().iter().map(|s| s.vk.0).collect();
+    let mut held = physical_down_set().write();
+    held.clear();
+    for vk in 0x08u16..=0xFE {
+        if vk == VK_MASK_KEY.0 || injected.contains(&vk) || skip.contains(&(vk as u32)) {
+            continue;
+        }
+        if unsafe { GetAsyncKeyState(vk as i32) } < 0 {
+            held.insert(vk as u32);
+        }
+    }
+}
+
+/// Tick of the last OS-level input event — lets the heartbeat tell a truly
+/// idle desktop (both counters flat and nothing reached the OS) from a
+/// silently stripped hook (input arrived but our callback never ran).
+#[cfg(target_os = "windows")]
+fn last_input_tick() -> Option<u32> {
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        Some(info.dwTime)
+    } else {
+        None
+    }
+}
+
+/// Spawn the Windows hook thread with a panic guard: a panicked hook_loop
+/// must not leave HOOK_TID non-zero (blocking retry_hook) and hook_status
+/// stuck on "ready" while every hook is silently gone.
+#[cfg(target_os = "windows")]
+fn spawn_hook_thread() {
+    let spawned = thread::Builder::new().name("mi-hook".into()).spawn(|| {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook_loop));
+        if let Err(payload) = outcome {
+            HOOK_TID.store(0, Ordering::Relaxed);
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            log::error!("hook thread panicked: {msg}");
+            set_hook_status(
+                "Windows 监听线程异常终止，请点击「重试监听」恢复；若反复失败请重新启动应用",
+            );
+            failsafe_release_all();
+        }
+    });
+    if let Err(err) = spawned {
+        // Release the retry_hook sentinel so a later retry can try again.
+        HOOK_TID.store(0, Ordering::Relaxed);
+        log::error!("hook thread spawn failed: {err}");
+        set_hook_status("Windows 监听线程启动失败，请点击「重试监听」或重新启动应用");
     }
 }
 
@@ -1428,8 +1691,14 @@ pub(crate) fn session_reset() {
 pub fn retry_hook() {
     #[cfg(target_os = "windows")]
     {
-        if HOOK_TID.load(Ordering::Relaxed) == 0 {
-            thread::spawn(hook_loop);
+        // CAS a sentinel so two rapid retries can't each pass a ==0 check
+        // and spawn duplicate hook threads; hook_loop overwrites it with
+        // the real thread id once running.
+        if HOOK_TID
+            .compare_exchange(0, u32::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            spawn_hook_thread();
         }
     }
     #[cfg(target_os = "macos")]
@@ -1463,6 +1732,23 @@ unsafe extern "system" fn session_wndproc(
     LRESULT(0)
 }
 
+/// UAC prompts and Ctrl+Alt+Del switch to the secure desktop: the low-level
+/// hooks go blind for the transition and can lose the ups of swallowed keys
+/// and buttons. WinEvents still reach this thread's message queue, so both
+/// edges of the switch reset the bookkeeping like a session change.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn desktop_switch_proc(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _time_ms: u32,
+) {
+    session_reset();
+}
+
 pub(crate) fn request_emergency_stop(persist: bool) {
     if let Some(e) = ENGINE.get() {
         request_emergency_stop_on(e, persist);
@@ -1470,12 +1756,20 @@ pub(crate) fn request_emergency_stop(persist: bool) {
 }
 
 pub(crate) fn request_emergency_stop_on(e: &Engine, persist: bool) {
-    e.paused.store(true, Ordering::SeqCst);
+    // Auto-repeated emergency keydowns re-enter here from inside the hook
+    // callback at ~30/s; the worker command and watchdog thread are needed
+    // only on the paused false→true transition.
+    let first = !e.paused.swap(true, Ordering::SeqCst);
+    e.paused_emergency.store(true, Ordering::SeqCst);
     e.recording.store(false, Ordering::Relaxed);
     e.listening.store(false, Ordering::Relaxed);
     e.recorder.write().reset();
+    e.swallowed_keys.write().clear();
+    if !first {
+        return;
+    }
     let before = EMERGENCY_ACK.load(Ordering::SeqCst);
-    let _ = e.cmd_tx.send(InputCmd::EmergencyStop { persist });
+    e.enqueue_cmd(InputCmd::EmergencyStop { persist });
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(300));
         if EMERGENCY_ACK.load(Ordering::SeqCst) <= before {
@@ -1542,43 +1836,40 @@ fn resolve_dir() -> (PathBuf, bool) {
         return (data, true);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        match std::env::var_os("APPDATA") {
-            Some(appdata) => (PathBuf::from(appdata).join("MouseInsight"), false),
-            None => {
-                log::warn!("APPDATA is not set; falling back to the program directory");
-                early_notes()
-                    .lock()
-                    .push("未找到用户数据目录，配置将保存在程序目录".into());
-                (exe_dir, false)
-            }
+    match roaming_config_dir() {
+        Some(dir) => (dir, false),
+        None => {
+            log::warn!("user data dir env is not set; falling back to the program directory");
+            early_notes()
+                .lock()
+                .push("未找到用户数据目录，配置将保存在程序目录".into());
+            (exe_dir, false)
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        // Installed .app bundles are not writable; keep user data out of /Applications.
-        match std::env::var_os("HOME") {
-            Some(home) => (
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Application Support")
-                    .join("MouseInsight"),
-                false,
-            ),
-            None => {
-                log::warn!("HOME is not set; falling back to the program directory");
-                early_notes()
-                    .lock()
-                    .push("未找到用户数据目录，配置将保存在程序目录".into());
-                (exe_dir, false)
-            }
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        (exe_dir, false)
-    }
+}
+
+/// The per-user config dir used when no portable marker exists. None when
+/// the platform env var is missing.
+#[cfg(target_os = "windows")]
+fn roaming_config_dir() -> Option<PathBuf> {
+    // Installed builds keep user data under %APPDATA%.
+    std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("MouseInsight"))
+}
+
+#[cfg(target_os = "macos")]
+fn roaming_config_dir() -> Option<PathBuf> {
+    // Installed .app bundles are not writable; keep user data out of /Applications.
+    std::env::var_os("HOME").map(|h| {
+        PathBuf::from(h)
+            .join("Library")
+            .join("Application Support")
+            .join("MouseInsight")
+    })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn roaming_config_dir() -> Option<PathBuf> {
+    None
 }
 
 pub fn is_portable_mode() -> bool {
@@ -1613,7 +1904,10 @@ fn parse_config_lenient(text: &str) -> Result<(AppConfig, Vec<String>), String> 
 
     if let Some(v) = obj.get("schema_version") {
         // Never reject on version; saturate instead of failing.
-        cfg.schema_version = v.as_u64().map(|n| n.min(u32::MAX as u64) as u32).unwrap_or(1);
+        cfg.schema_version = v
+            .as_u64()
+            .map(|n| n.min(u32::MAX as u64) as u32)
+            .unwrap_or(1);
     }
     if let Some(v) = obj.get("theme") {
         match v.as_str() {
@@ -1623,20 +1917,65 @@ fn parse_config_lenient(text: &str) -> Result<(AppConfig, Vec<String>), String> 
             }
         }
     }
-    cfg.autostart = obj.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false);
-    cfg.paused = obj.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
+    if let Some(v) = obj.get("autostart") {
+        match v.as_bool() {
+            Some(b) => cfg.autostart = b,
+            None => notes.push("autostart 值无法识别，已重置为关闭".into()),
+        }
+    }
+    if let Some(v) = obj.get("paused") {
+        match v.as_bool() {
+            Some(b) => cfg.paused = b,
+            None => notes.push("paused 值无法识别，已重置为未暂停".into()),
+        }
+    }
 
     match obj.get("mappings") {
         Some(serde_json::Value::Array(items)) => {
             for (i, item) in items.iter().enumerate() {
                 match serde_json::from_value::<Mapping>(item.clone()) {
-                    Ok(m) => cfg.mappings.push(m),
+                    Ok(mut m) => {
+                        // The lenient path otherwise lets an unknown mode
+                        // silently behave as Hold; normalize it and say so.
+                        if !["hold", "click", "toggle", "dual"].contains(&m.mode.as_str()) {
+                            notes.push(format!(
+                                "映射「{}」的触发方式无效，已按「跟随按住」处理",
+                                m.button
+                            ));
+                            m.mode = "hold".into();
+                        }
+                        cfg.mappings.push(m);
+                    }
                     Err(_) => notes.push(format!("映射 #{i} 格式无效，已跳过")),
                 }
             }
         }
         Some(_) => notes.push("mappings 字段格式无效，已忽略".into()),
         None => {}
+    }
+
+    // Same dedup rule the compiler applies (first row per button wins), but
+    // reported so a hand-edited file does not keep silent shadow rows.
+    let mut seen_buttons = HashSet::new();
+    let mut dropped = 0usize;
+    cfg.mappings
+        .retain(|m| match MouseButton::from_str_fast(&m.button) {
+            // Rows for buttons this build cannot map stay in the file; the
+            // compiler already ignores them and a future version may know them.
+            Some(b) if !b.is_primary() => {
+                if seen_buttons.insert(b) {
+                    true
+                } else {
+                    dropped += 1;
+                    false
+                }
+            }
+            _ => true,
+        });
+    if dropped > 0 {
+        notes.push(format!(
+            "存在 {dropped} 条重复鼠标按键映射，已保留每键第一条"
+        ));
     }
 
     // Chords containing keys this build cannot map still load; the offending
@@ -1647,7 +1986,10 @@ fn parse_config_lenient(text: &str) -> Result<(AppConfig, Vec<String>), String> 
             .flat_map(|chord| chord.iter())
             .any(|k| key_spec(k).is_none());
         if unsupported {
-            notes.push(format!("映射「{}」含当前系统不支持的按键，已忽略该键", m.button));
+            notes.push(format!(
+                "映射「{}」含当前系统不支持的按键，已忽略该键",
+                m.button
+            ));
         }
     }
 
@@ -1695,18 +2037,56 @@ fn preserve_corrupted_config(path: &PathBuf) -> Option<String> {
 
 fn load_config() -> (AppConfig, Vec<String>) {
     let dir = config_dir();
-    // Sweep temp files left behind by interrupted saves.
+    // Sweep temp files left behind by interrupted saves, plus a probe file
+    // stranded by a crash between its create and delete.
     if let Ok(rd) = fs::read_dir(&dir) {
         for entry in rd.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("config.json.") && name.ends_with(".tmp") {
+            if ((name.starts_with("config.json.") || name.starts_with("held-keys."))
+                && name.ends_with(".tmp"))
+                || name == ".write-test"
+            {
                 let _ = fs::remove_file(entry.path());
             }
         }
     }
 
     let mut notes = std::mem::take(&mut *early_notes().lock());
+
+    // A portable marker added after the fact moves the config location
+    // without migrating anything; tell the user where the old file still is.
+    if !config_path().exists() {
+        if is_portable_mode() {
+            if let Some(std_dir) = roaming_config_dir() {
+                let old = std_dir.join("config.json");
+                if old.is_file() {
+                    notes.push(format!(
+                        "便携模式已启用，当前配置目录为 {}；检测到原配置仍在 {}，未自动迁移",
+                        dir.display(),
+                        old.display()
+                    ));
+                }
+            }
+        } else if let Ok(exe) = std::env::current_exe() {
+            // The reverse move: marker removed, portable config orphaned.
+            if let Some(exe_dir) = exe.parent() {
+                for old in [
+                    exe_dir.join("data").join("config.json"),
+                    exe_dir.join("config.json"),
+                ] {
+                    if old.is_file() {
+                        notes.push(format!(
+                            "检测到便携配置仍保留在 {}，当前配置目录为 {}，未自动迁移",
+                            old.display(),
+                            dir.display()
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     let path = config_path();
     let mut resolved: Option<AppConfig> = None;
@@ -1763,20 +2143,47 @@ fn load_config() -> (AppConfig, Vec<String>) {
 
 // Callers hold CFG_MUTATE_LOCK; save_config itself does not lock.
 fn save_config(cfg: &AppConfig) -> Result<(), String> {
-    let dir = config_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {e}"))?;
+    {
+        let mut last = LAST_CONFIG_SAVE.lock();
+        if let Some(prev) = *last {
+            let wait = SAVE_MIN_INTERVAL.saturating_sub(prev.elapsed());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+        }
+        *last = Some(Instant::now());
+    }
+    save_config_in(&config_dir(), cfg)
+}
 
-    // Always stamp the current schema version on write.
+fn save_config_in(dir: &PathBuf, cfg: &AppConfig) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("Failed to create config dir: {e}"))?;
+
+    // Never downgrade a higher version number written by a newer build.
     let mut out = cfg.clone();
-    out.schema_version = 2;
+    out.schema_version = out.schema_version.max(CURRENT_SCHEMA_VERSION);
     let json = serde_json::to_string_pretty(&out)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
 
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let tmp_path = dir.join(format!("config.json.{pid}.{seq}.tmp"));
-    let file_path = config_path();
-    let bak_path = config_bak_path();
+    let link_path = dir.join("config.json");
+    let bak_path = dir.join("config.json.bak");
+
+    // A user-placed symlink at config.json is followed on read; write through
+    // to its target as well instead of silently replacing the link itself.
+    let file_path = match fs::symlink_metadata(&link_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::canonicalize(&link_path).unwrap_or_else(|_| link_path.clone())
+        }
+        _ => link_path.clone(),
+    };
+    // The tmp file must live next to the rename target (same volume).
+    let tmp_dir = file_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| dir.clone());
+    let tmp_path = tmp_dir.join(format!("config.json.{pid}.{seq}.tmp"));
 
     {
         let mut file = OpenOptions::new()
@@ -1799,8 +2206,27 @@ fn save_config(cfg: &AppConfig) -> Result<(), String> {
                 let _ = fs::remove_file(&bak_path);
             }
         }
-        if let Err(err) = fs::copy(&file_path, &bak_path) {
-            log::warn!("config backup copy failed: {err}");
+        // .bak is the last-known-good copy. Right after a restore the file on
+        // disk can still be the corrupt one; never let it overwrite the only
+        // good backup. The backup itself is written atomically so a crash
+        // mid-copy cannot truncate it.
+        match fs::read_to_string(&file_path) {
+            Ok(text) if parse_config_lenient(&text).is_ok() => {
+                let bak_tmp = dir.join(format!("config.json.bak.{pid}.{seq}.tmp"));
+                let wrote = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&bak_tmp)
+                    .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|_| f.sync_all()))
+                    .is_ok();
+                if wrote {
+                    let _ = replace_file_atomic(&bak_tmp, &bak_path);
+                }
+                let _ = fs::remove_file(&bak_tmp);
+            }
+            Ok(_) => log::warn!("skipping .bak update: current config.json does not parse"),
+            Err(err) => log::warn!("config backup read failed: {err}"),
         }
     }
 
@@ -1817,8 +2243,16 @@ fn replace_file_atomic(from: &PathBuf, to: &PathBuf) -> Result<(), String> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
-        let src: Vec<u16> = from.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = to.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let src: Vec<u16> = from
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let dst: Vec<u16> = to
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let ok = unsafe {
             MoveFileExW(
                 PCWSTR(src.as_ptr()),
@@ -1967,14 +2401,21 @@ pub fn toggle_paused_from(shown_paused: bool) -> Result<(), String> {
 
 pub fn snapshot() -> Snapshot {
     let e = engine();
+    // The atomic is authoritative: non-persisted emergency stops (edge-queue
+    // overflow, watchdog, macOS tap disabled) pause the engine without ever
+    // writing cfg.paused to disk.
+    let mut config = e.cfg.read().clone();
+    config.paused = e.paused.load(Ordering::SeqCst);
     Snapshot {
-        config: e.cfg.read().clone(),
+        config,
+        hook_status: e.hook_status.read().clone(),
         xmbc_running: xmbc_running(),
         last: e.last.read().clone(),
         listening: e.listening.load(Ordering::Relaxed),
         is_portable: is_portable_mode(),
         config_dir: config_dir().display().to_string(),
         emergency_hotkeys: emergency_hotkeys_state(),
+        paused_emergency: e.paused_emergency.load(Ordering::SeqCst),
         active_bindings: e.active_bindings.read().values().cloned().collect(),
         recovery_notes: e.recovery_notes.read().clone(),
     }
@@ -1983,6 +2424,13 @@ pub fn snapshot() -> Snapshot {
 /// The frontend acknowledged the recovery notes; stop reporting them.
 pub fn clear_recovery_notes() {
     engine().recovery_notes.write().clear();
+}
+
+/// Whether the current pause was triggered by an emergency stop.
+pub fn paused_emergency() -> bool {
+    ENGINE
+        .get()
+        .is_some_and(|e| e.paused_emergency.load(Ordering::SeqCst))
 }
 
 fn emergency_hotkeys_state() -> u8 {
@@ -1997,7 +2445,9 @@ fn emergency_hotkeys_state() -> u8 {
 }
 
 fn validate_mappings(mappings: &[Mapping]) -> Result<(), String> {
-    if mappings.len() > 5 { return Err("最多支持 5 个鼠标按键映射".into()); }
+    if mappings.len() > 5 {
+        return Err("最多支持 5 个鼠标按键映射".into());
+    }
     let mut buttons = HashSet::new();
     let mut ids = HashSet::new();
     for mapping in mappings {
@@ -2039,46 +2489,100 @@ pub fn set_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
     next.mappings = mappings;
     save_config(&next)?;
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    e.compiled.store(Arc::new(compile_mappings_with_gen(&next.mappings, generation)));
+    e.compiled.store(Arc::new(compile_mappings_with_gen(
+        &next.mappings,
+        generation,
+    )));
     *e.cfg.write() = next;
-    let _ = e.cmd_tx.send(InputCmd::UpdateMappings { generation });
+    e.enqueue_cmd(InputCmd::UpdateMappings { generation });
     Ok(())
 }
 
-fn apply_quick_mapping(next: &mut AppConfig, button: &str, slot: &str, preset: &str) -> Result<(), String> {
+fn apply_quick_mapping(
+    next: &mut AppConfig,
+    button: &str,
+    slot: &str,
+    preset: &str,
+) -> Result<(), String> {
     if !["xbutton1", "xbutton2", "middle", "wheelup", "wheeldown"].contains(&button)
         || !["tap", "hold"].contains(&slot)
-        || (slot == "hold" && button.starts_with("wheel")) { return Err("不支持的按键操作".into()); }
-    let modifier = if cfg!(target_os = "macos") { "LWin" } else { "LControl" };
+        || (slot == "hold" && button.starts_with("wheel"))
+    {
+        return Err("不支持的按键操作".into());
+    }
+    let modifier = if cfg!(target_os = "macos") {
+        "LWin"
+    } else {
+        "LControl"
+    };
     let keys: Vec<String> = match preset {
-        "copy" => vec![modifier, "C"], "paste" => vec![modifier, "V"],
-        "undo" => vec![modifier, "Z"], "enter" => vec!["Enter"], "clear" => vec![],
+        "copy" => vec![modifier, "C"],
+        "paste" => vec![modifier, "V"],
+        "undo" => vec![modifier, "Z"],
+        "enter" => vec!["Enter"],
+        "clear" => vec![],
         _ => return Err("不支持的快捷操作".into()),
-    }.into_iter().map(str::to_owned).collect();
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     let index = match next.mappings.iter().position(|m| m.button == button) {
         Some(index) => index,
         None => {
-            if keys.is_empty() { return Ok(()); }
-            if next.mappings.len() >= 5 { return Err("最多支持 5 个鼠标按键映射".into()); }
+            if keys.is_empty() {
+                return Ok(());
+            }
+            if next.mappings.len() >= 5 {
+                return Err("最多支持 5 个鼠标按键映射".into());
+            }
             let mut suffix = 0;
             let id = loop {
                 let candidate = format!("quick-{button}-{suffix}");
-                if next.mappings.iter().all(|m| m.id != candidate) { break candidate; }
+                if next.mappings.iter().all(|m| m.id != candidate) {
+                    break candidate;
+                }
                 suffix += 1;
             };
-            next.mappings.push(Mapping { id, button: button.into(),
-                mode: "dual".into(), keys: vec![], tap_keys: vec![], hold_keys: vec![], label: String::new() });
+            next.mappings.push(Mapping {
+                id,
+                button: button.into(),
+                mode: "dual".into(),
+                keys: vec![],
+                tap_keys: vec![],
+                hold_keys: vec![],
+                label: String::new(),
+                extra: Default::default(),
+            });
             next.mappings.len() - 1
         }
     };
     let m = &mut next.mappings[index];
-    if m.mode == "toggle" { return Err("此按键正在使用切换保持，请先在按键工作台更改触发方式。".into()); }
-    if m.tap_keys.is_empty() && m.hold_keys.is_empty() {
-        if m.mode == "hold" { m.hold_keys = m.keys.clone(); } else { m.tap_keys = m.keys.clone(); }
+    if m.mode == "toggle" {
+        return Err("此按键正在使用切换保持，请先在按键工作台更改触发方式。".into());
     }
-    m.mode = if button.starts_with("wheel") { "click" } else { "dual" }.into();
-    if slot == "tap" { m.tap_keys = keys; } else { m.hold_keys = keys; }
-    m.keys = if m.tap_keys.is_empty() { m.hold_keys.clone() } else { m.tap_keys.clone() };
+    if m.tap_keys.is_empty() && m.hold_keys.is_empty() {
+        if m.mode == "hold" {
+            m.hold_keys = m.keys.clone();
+        } else {
+            m.tap_keys = m.keys.clone();
+        }
+    }
+    m.mode = if button.starts_with("wheel") {
+        "click"
+    } else {
+        "dual"
+    }
+    .into();
+    if slot == "tap" {
+        m.tap_keys = keys;
+    } else {
+        m.hold_keys = keys;
+    }
+    m.keys = if m.tap_keys.is_empty() {
+        m.hold_keys.clone()
+    } else {
+        m.tap_keys.clone()
+    };
     if m.keys.is_empty() && m.tap_keys.is_empty() && m.hold_keys.is_empty() {
         // Clearing the last slot removes the mapping row entirely.
         next.mappings.remove(index);
@@ -2095,9 +2599,12 @@ pub fn set_quick_mapping(button: &str, slot: &str, preset: &str) -> Result<(), S
     apply_quick_mapping(&mut next, button, slot, preset)?;
     save_config(&next)?;
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    e.compiled.store(Arc::new(compile_mappings_with_gen(&next.mappings, generation)));
+    e.compiled.store(Arc::new(compile_mappings_with_gen(
+        &next.mappings,
+        generation,
+    )));
     *e.cfg.write() = next;
-    let _ = e.cmd_tx.send(InputCmd::UpdateMappings { generation });
+    e.enqueue_cmd(InputCmd::UpdateMappings { generation });
     Ok(())
 }
 
@@ -2120,7 +2627,9 @@ pub fn set_paused(paused: bool) -> Result<(), String> {
     let e = engine();
     // Safety takes effect even when storage is unavailable.
     e.paused.store(paused, Ordering::SeqCst);
-    let _ = e.cmd_tx.send(InputCmd::SetPaused(paused));
+    // A manual pause/resume supersedes any earlier emergency-stop marker.
+    e.paused_emergency.store(false, Ordering::SeqCst);
+    e.enqueue_cmd(InputCmd::SetPaused(paused));
     let _g = cfg_mutate_lock()
         .lock()
         .map_err(|_| "config save lock poisoned".to_string())?;
@@ -2158,7 +2667,13 @@ pub fn disarm_listen() {
 }
 
 pub fn arm_listen() -> u64 {
-    engine().listening.store(true, Ordering::Relaxed);
+    let e = engine();
+    // Listen and record sessions are mutually exclusive; a leftover
+    // recording flag would keep swallowing keys during button capture.
+    e.recording.store(false, Ordering::Relaxed);
+    e.recorder.write().reset();
+    e.swallowed_keys.write().clear();
+    e.listening.store(true, Ordering::Relaxed);
     ARM_GEN.fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -2172,9 +2687,12 @@ pub fn arm_record() -> u64 {
         rec.physical_held = physical_down_set().read().iter().copied().collect();
     }
     e.listening.store(false, Ordering::Relaxed);
+    // Drop swallowed downs left over from a previous session before arming —
+    // a stale entry would eat the first same-key release of this one.
+    e.swallowed_keys.write().clear();
     e.recording.store(true, Ordering::Relaxed);
     *RECORD_ARMED_AT.lock() = Some(Instant::now());
-    let _ = e.cmd_tx.send(InputCmd::ResetState(ResetReason::UserPause));
+    e.enqueue_cmd(InputCmd::ResetState(ResetReason::UserPause));
     ARM_GEN.fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -2182,14 +2700,17 @@ pub fn disarm_record() {
     let e = engine();
     e.recording.store(false, Ordering::Relaxed);
     e.recorder.write().reset();
+    e.swallowed_keys.write().clear();
 }
 
 pub fn add_record_key(key: String) {
     let e = engine();
-    if !e.recording.load(Ordering::Relaxed) || key_spec(&key).is_none() { return; }
+    if !e.recording.load(Ordering::Relaxed) || key_spec(&key).is_none() {
+        return;
+    }
     let chord = e.recorder.write().add_chip(key);
     if !chord.is_empty() {
-        let _ = e.cmd_tx.send(InputCmd::Record(chord));
+        e.enqueue_cmd(InputCmd::Record(chord));
     }
 }
 
@@ -2202,7 +2723,7 @@ pub fn press_record_key(key: String, down: bool) {
     }
     let chord = e.recorder.write().on_token(key, down);
     if !chord.is_empty() {
-        let _ = e.cmd_tx.send(InputCmd::Record(chord));
+        e.enqueue_cmd(InputCmd::Record(chord));
     }
 }
 
@@ -2212,12 +2733,13 @@ pub fn remove_record_key(key: String) {
     rec.remove_token(&key);
     let chord = rec.max_chord.clone();
     drop(rec);
-    let _ = e.cmd_tx.send(InputCmd::Record(chord));
+    e.enqueue_cmd(InputCmd::Record(chord));
 }
 
 pub fn take_record_keys() -> Vec<String> {
     let e = engine();
     e.recording.store(false, Ordering::Relaxed);
+    e.swallowed_keys.write().clear();
     let mut rec = e.recorder.write();
     let keys = rec.max_chord.clone();
     rec.reset();
@@ -2229,7 +2751,7 @@ pub fn shutdown() {
         e.paused.store(true, Ordering::SeqCst);
         e.recording.store(false, Ordering::Relaxed);
         e.listening.store(false, Ordering::Relaxed);
-        let _ = e.cmd_tx.send(InputCmd::ResetState(ResetReason::Shutdown));
+        e.enqueue_cmd(InputCmd::ResetState(ResetReason::Shutdown));
     }
     #[cfg(target_os = "windows")]
     {
@@ -2249,10 +2771,27 @@ pub fn shutdown() {
             if let Some(rx) = guard.take() {
                 if rx.recv_timeout(Duration::from_millis(800)).is_err() {
                     log::error!("worker 未在 800ms 内退出，执行兜底释放");
-                    failsafe_release_all();
                 }
             }
         }
+    }
+    // Even a cleanly-exited worker can leave ledger stragglers when a
+    // SendInput partially failed into pending_release. But SendInput can
+    // stall on a wedged foreground target, so bound the failsafe wait:
+    // shutdown must never block process exit.
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    thread::spawn(move || {
+        failsafe_release_all();
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.recv_timeout(Duration::from_millis(300));
+    // A detached emergency-save may still be persisting paused=true; give it
+    // a short grace window so an explicit stop survives an immediate exit.
+    for _ in 0..50 {
+        if !EMERGENCY_SAVE_PENDING.load(Ordering::SeqCst) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -2285,7 +2824,7 @@ pub fn start(
         on_binding_state(state);
     };
 
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<InputCmd>();
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<InputCmd>(CMD_CHANNEL_CAP);
     let (edge_tx, edge_rx) = crossbeam_channel::bounded::<InputCmd>(EDGE_CHANNEL_CAP);
     let (telem_tx, telem_rx) = crossbeam_channel::bounded::<Pulse>(16);
     let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
@@ -2302,6 +2841,7 @@ pub fn start(
             hook_status: RwLock::new("starting".into()),
             compiled: ArcSwap::from_pointee(compiled),
             paused: AtomicBool::new(paused),
+            paused_emergency: AtomicBool::new(false),
             listening: AtomicBool::new(false),
             swallowed_buttons: AtomicU32::new(0),
             recording: AtomicBool::new(false),
@@ -2320,9 +2860,17 @@ pub fn start(
         return;
     }
 
+    // Before the hook thread seeds physical state: release keys a previous
+    // (killed/panicked) process left held, or GetAsyncKeyState would seed the
+    // phantoms as "physically down" and they could never be released again.
+    release_journaled_keys();
+
     thread::Builder::new()
         .name("mi-telemetry".into())
         .spawn(move || {
+            // Lives for the process lifetime by design: telem_tx is held in
+            // the ENGINE OnceLock and never disconnects, so recv() is a pure
+            // block and the thread dies with the process.
             while let Ok(pulse) = telem_rx.recv() {
                 on_pulse(pulse);
             }
@@ -2375,16 +2923,39 @@ pub fn start(
         .expect("worker thread");
 
     #[cfg(target_os = "windows")]
-    thread::Builder::new()
-        .name("mi-hook".into())
-        .spawn(hook_loop)
-        .expect("hook thread");
+    spawn_hook_thread();
 
     #[cfg(target_os = "macos")]
     thread::Builder::new()
         .name("mi-macos-tap".into())
-        .spawn(crate::macos::hook_loop)
+        .spawn(crate::macos::guarded_hook_loop)
         .expect("macos tap thread");
+}
+
+/// Handle one edge-channel item. The channel only ever carries MouseEdge;
+/// anything else is dropped with a warning rather than stalling the drain.
+fn dispatch_edge<I: InputInjector>(state_machine: &mut InputStateMachine<I>, cmd: InputCmd) {
+    let InputCmd::MouseEdge {
+        button,
+        down,
+        action,
+        generation,
+        at,
+    } = cmd
+    else {
+        log::warn!("non-edge command on edge channel dropped");
+        return;
+    };
+    if let Some(e) = ENGINE.get() {
+        let current = e.compiled.load().generation;
+        if current > state_machine.current_generation {
+            state_machine.update_config(current);
+        }
+        if down && (e.paused.load(Ordering::SeqCst) || e.recording.load(Ordering::Relaxed)) {
+            return;
+        }
+    }
+    state_machine.handle_mouse_edge(button, down, action, generation, Instant::now(), at);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2409,13 +2980,19 @@ fn worker_loop<I: InputInjector>(
         Some(Box::new(on_send_error)),
     );
 
+    let mut last_watchdog = Instant::now();
     loop {
         let now = Instant::now();
         state_machine.tick(now);
-        for btn in state_machine.tick_watchdog(now) {
-            if let Some(e) = ENGINE.get() {
-                e.swallowed_buttons
-                    .fetch_and(!(1u32 << btn as u32), Ordering::Relaxed);
+        // Physical-state polling costs a syscall per held button on macOS;
+        // throttle it instead of paying that on every queued edge.
+        if now.duration_since(last_watchdog) >= Duration::from_millis(250) {
+            last_watchdog = now;
+            for btn in state_machine.tick_watchdog(now) {
+                if let Some(e) = ENGINE.get() {
+                    e.swallowed_buttons
+                        .fetch_and(!(1u32 << btn as u32), Ordering::Relaxed);
+                }
             }
         }
 
@@ -2429,6 +3006,7 @@ fn worker_loop<I: InputInjector>(
             {
                 e.recording.store(false, Ordering::Relaxed);
                 e.recorder.write().reset();
+                e.swallowed_keys.write().clear();
                 on_record_cancel();
             }
         }
@@ -2488,30 +3066,22 @@ fn worker_loop<I: InputInjector>(
             continue;
         };
 
-        let now = Instant::now();
         match cmd {
-            InputCmd::MouseEdge {
-                button,
-                down,
-                action,
-                generation,
-                at,
-            } => {
-                if let Some(e) = ENGINE.get() {
-                    let current = e.compiled.load().generation;
-                    if current > state_machine.current_generation {
-                        state_machine.update_config(current);
-                    }
-                    if down && (e.paused.load(Ordering::SeqCst) || e.recording.load(Ordering::Relaxed)) {
-                        continue;
-                    }
+            InputCmd::MouseEdge { .. } => {
+                dispatch_edge(&mut state_machine, cmd);
+                // A down+up pair queued during a busy spell must be decided
+                // on physical timestamps: drain the edge backlog so the next
+                // loop-top tick() cannot convert a pending dual into a hold
+                // before its up has been seen.
+                while let Ok(next) = edge_rx.try_recv() {
+                    dispatch_edge(&mut state_machine, next);
                 }
-                state_machine.handle_mouse_edge(button, down, action, generation, now, at);
             }
             InputCmd::ResetState(reason) => {
                 state_machine.reset_all(reason);
                 if let Some(e) = ENGINE.get() {
                     e.swallowed_buttons.store(0, Ordering::Relaxed);
+                    e.swallowed_keys.write().clear();
                 }
                 if matches!(reason, ResetReason::Shutdown) {
                     break;
@@ -2522,6 +3092,7 @@ fn worker_loop<I: InputInjector>(
                 if let Some(e) = ENGINE.get() {
                     e.paused.store(true, Ordering::SeqCst);
                     e.swallowed_buttons.store(0, Ordering::Relaxed);
+                    e.swallowed_keys.write().clear();
                 }
                 state_machine.emergency_stop();
                 on_record_cancel();
@@ -2530,18 +3101,20 @@ fn worker_loop<I: InputInjector>(
                 // must not write paused=true or the next launch stays paused.
                 if persist && !EMERGENCY_SAVE_PENDING.swap(true, Ordering::SeqCst) {
                     // Save the current config under the mutate lock, never an
-                    // old snapshot.
+                    // old snapshot. The pending flag must clear even on panic
+                    // or every later emergency stop silently skips its save.
                     thread::spawn(|| {
-                        if let Some(e) = ENGINE.get() {
-                            let _g = cfg_mutate_lock()
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner());
-                            let mut next = e.cfg.read().clone();
-                            next.paused = e.paused.load(Ordering::SeqCst);
-                            if save_config(&next).is_ok() {
-                                *e.cfg.write() = next;
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Some(e) = ENGINE.get() {
+                                let _g =
+                                    cfg_mutate_lock().lock().unwrap_or_else(|p| p.into_inner());
+                                let mut next = e.cfg.read().clone();
+                                next.paused = e.paused.load(Ordering::SeqCst);
+                                if save_config(&next).is_ok() {
+                                    *e.cfg.write() = next;
+                                }
                             }
-                        }
+                        }));
                         EMERGENCY_SAVE_PENDING.store(false, Ordering::SeqCst);
                     });
                 }
@@ -2551,6 +3124,7 @@ fn worker_loop<I: InputInjector>(
                 if paused {
                     if let Some(e) = ENGINE.get() {
                         e.swallowed_buttons.store(0, Ordering::Relaxed);
+                        e.swallowed_keys.write().clear();
                     }
                 }
                 on_emergency_pause(paused);
@@ -2599,7 +3173,9 @@ fn hook_loop() {
                 lpszClassName: class_name,
                 ..Default::default()
             };
-            if RegisterClassW(&wnd_class) == 0 {
+            // A respawned hook_loop finds the class still registered (the
+            // process never unregisters it); that is not a failure.
+            if RegisterClassW(&wnd_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
                 log::warn!("RegisterClassW failed; session notifications disabled");
                 None
             } else {
@@ -2664,51 +3240,76 @@ fn hook_loop() {
             }
         };
 
-        if RegisterHotKey(None, HOTKEY_PAUSE, MOD_NOREPEAT, VK_PAUSE.0 as u32).is_ok() {
-            EMERGENCY_HOTKEYS.fetch_or(1, Ordering::Relaxed);
-        } else {
+        // Only Pause is a global emergency key: Scroll Lock has a real system
+        // function (Excel etc.) and a single stray press used to silently kill
+        // every mapping. The inline kbd_proc check below is the fallback when
+        // hotkey registration is occupied.
+        let pause_registered =
+            RegisterHotKey(None, HOTKEY_PAUSE, MOD_NOREPEAT, VK_PAUSE.0 as u32).is_ok();
+        // Store the fresh result rather than OR-ing: a respawned loop whose
+        // registration failed must not keep claiming a previous life's bit.
+        EMERGENCY_HOTKEYS.store(pause_registered as u8, Ordering::Relaxed);
+        if !pause_registered {
             log::warn!("Pause 急停热键注册失败，键盘钩子内联兜底仍可用");
-        }
-        if RegisterHotKey(None, HOTKEY_SCROLL, MOD_NOREPEAT, VK_SCROLL.0 as u32).is_ok() {
-            EMERGENCY_HOTKEYS.fetch_or(2, Ordering::Relaxed);
-        } else {
-            log::warn!("Scroll Lock 急停热键注册失败，键盘钩子内联兜底仍可用");
         }
 
         let mut kbd = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), Some(module), 0) {
             Ok(h) => h,
             Err(err) => {
                 log::error!("SetWindowsHookEx WH_KEYBOARD_LL failed: {err}");
-                set_hook_status(&format!("Windows 键盘监听启动失败：{err}。请检查安全软件拦截。"));
+                set_hook_status(&format!(
+                    "Windows 键盘监听启动失败：{err}。请检查安全软件拦截。"
+                ));
                 let _ = UnhookWindowsHookEx(mouse);
                 let _ = UnregisterHotKey(None, HOTKEY_PAUSE);
-                let _ = UnregisterHotKey(None, HOTKEY_SCROLL);
                 HOOK_TID.store(0, Ordering::Relaxed);
                 return;
             }
         };
 
-        // Seed modifiers already held before our hook went live so release
-        // decisions do not send key-ups for physically held keys.
-        {
-            let mut held = physical_down_set().write();
-            for vk in (0xA0u32..=0xA5).chain([0x5B, 0x5C]) {
-                if GetAsyncKeyState(vk as i32) < 0 {
-                    held.insert(vk);
-                }
-            }
+        // Secure-desktop switches (UAC, Ctrl+Alt+Del) are not session
+        // changes: no WTS message arrives, yet the low-level hooks go blind
+        // for the transition. WinEvents still fire on this thread's queue.
+        let desktop_hook = SetWinEventHook(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            None,
+            Some(desktop_switch_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        if desktop_hook.is_invalid() {
+            log::warn!("SetWinEventHook failed; secure-desktop resets disabled");
         }
 
-        // Heartbeat: a stripped hook looks exactly like idle. If no callback
-        // ran for a full timer interval, reinstall both hooks. With a NULL
-        // hwnd the return value is the timer id needed by KillTimer.
+        // Seed keys already held before our hook went live so release
+        // decisions do not send key-ups for physically held keys. The scan
+        // covers every keyboard VK, not just modifiers; journal-released
+        // keys stay excluded so a replayed release is not undone.
+        {
+            let skip: HashSet<u32> = JOURNAL_RELEASED
+                .get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
+                .lock()
+                .drain()
+                .collect();
+            reseed_physical_down_set(&skip);
+        }
+
+        // Heartbeat: a stripped hook looks exactly like idle input. Each hook
+        // gets its own counter — a dead mouse hook cannot hide behind a live
+        // keyboard stream (and vice versa) — so a flat counter buys 60s of
+        // silent failure. With a NULL hwnd the return value is the timer id
+        // needed by KillTimer.
         let heartbeat = SetTimer(None, 0, 60_000, None);
         if heartbeat == 0 {
             log::warn!("SetTimer failed; hook heartbeat disabled");
         }
 
         set_hook_status("ready");
-        let mut last_hook_events = HOOK_EVENTS.load(Ordering::Relaxed);
+        let mut last_mouse_events = HOOK_MOUSE_EVENTS.load(Ordering::Relaxed);
+        let mut last_kbd_events = HOOK_KBD_EVENTS.load(Ordering::Relaxed);
+        let mut last_input_ms = last_input_tick();
         let mut msg = MSG::default();
         loop {
             let status = GetMessageW(&mut msg, None, 0, 0);
@@ -2716,7 +3317,11 @@ fn hook_loop() {
                 break;
             }
             if status.0 == -1 {
-                set_hook_status(&format!("Windows 监听消息循环中断：{:?}，请重新启动应用。", GetLastError()));
+                // The loop unwinds and clears HOOK_TID, so 「重试监听」 works.
+                set_hook_status(&format!(
+                    "Windows 监听消息循环中断：{:?}，请点击「重试监听」恢复；无效则重新启动应用。",
+                    GetLastError()
+                ));
                 break;
             }
 
@@ -2725,32 +3330,75 @@ fn hook_loop() {
                     request_emergency_stop(true);
                 }
                 WM_TIMER => {
-                    let count = HOOK_EVENTS.load(Ordering::Relaxed);
-                    if count == last_hook_events {
-                        let _ = UnhookWindowsHookEx(kbd);
+                    let mouse_count = HOOK_MOUSE_EVENTS.load(Ordering::Relaxed);
+                    let kbd_count = HOOK_KBD_EVENTS.load(Ordering::Relaxed);
+                    let input_ms = last_input_tick();
+                    // Both counters flat together usually means a truly idle
+                    // desktop, not two dead hooks: reinstalling anyway would
+                    // open a drop window every 60s for nothing. The OS input
+                    // tick tells the difference; a failed query errs toward
+                    // reinstalling.
+                    let system_active = match (input_ms, last_input_ms) {
+                        (Some(cur), Some(prev)) => cur != prev,
+                        _ => true,
+                    };
+                    last_input_ms = input_ms;
+                    let idle = mouse_count == last_mouse_events
+                        && kbd_count == last_kbd_events
+                        && !system_active;
+                    // A flat counter can't tell a dead hook from an idle one;
+                    // reinstall only the hook whose own stream went silent.
+                    let mut all_ok = true;
+                    if mouse_count == last_mouse_events && !idle {
                         let _ = UnhookWindowsHookEx(mouse);
                         match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(module), 0) {
                             Ok(h) => {
                                 mouse = h;
+                                // The reinstall gap can hide button releases;
+                                // reset like a session change so no injected
+                                // key or swallowed bit stays held.
+                                session_reset();
                                 log::debug!("hook heartbeat: reinstalled mouse hook");
                             }
                             Err(err) => {
+                                all_ok = false;
                                 log::error!("鼠标钩子重建失败：{err}");
-                                set_hook_status(&format!("Windows 鼠标监听重建失败：{err}，请重新启动应用。"));
-                            }
-                        }
-                        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), Some(module), 0) {
-                            Ok(h) => {
-                                kbd = h;
-                                log::debug!("hook heartbeat: reinstalled keyboard hook");
-                            }
-                            Err(err) => {
-                                log::error!("键盘钩子重建失败：{err}");
-                                set_hook_status(&format!("Windows 键盘监听重建失败：{err}，请重新启动应用。"));
+                                set_hook_status(&format!(
+                                    "Windows 鼠标监听重建失败：{err}，请重新启动应用。"
+                                ));
                             }
                         }
                     }
-                    last_hook_events = count;
+                    if kbd_count == last_kbd_events && !idle {
+                        let _ = UnhookWindowsHookEx(kbd);
+                        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), Some(module), 0) {
+                            Ok(h) => {
+                                kbd = h;
+                                // Ups lost in the reinstall gap would leave
+                                // stale entries in both keyboard ledgers.
+                                reseed_physical_down_set(&HashSet::new());
+                                if let Some(e) = ENGINE.get() {
+                                    e.swallowed_keys.write().clear();
+                                }
+                                log::debug!("hook heartbeat: reinstalled keyboard hook");
+                            }
+                            Err(err) => {
+                                all_ok = false;
+                                log::error!("键盘钩子重建失败：{err}");
+                                set_hook_status(&format!(
+                                    "Windows 键盘监听重建失败：{err}，请重新启动应用。"
+                                ));
+                            }
+                        }
+                    }
+                    last_mouse_events = mouse_count;
+                    last_kbd_events = kbd_count;
+                    // Moving counters prove their hooks alive, and a recovered
+                    // reinstall must clear the earlier failure status — but an
+                    // idle skip verified nothing, so keep the current status.
+                    if all_ok && !idle && hook_status() != "ready" {
+                        set_hook_status("ready");
+                    }
                 }
                 _ => {
                     let _ = TranslateMessage(&msg);
@@ -2760,10 +3408,12 @@ fn hook_loop() {
         }
 
         let _ = KillTimer(None, heartbeat);
+        if !desktop_hook.is_invalid() {
+            let _ = UnhookWinEvent(desktop_hook);
+        }
         let _ = UnhookWindowsHookEx(kbd);
         let _ = UnhookWindowsHookEx(mouse);
         let _ = UnregisterHotKey(None, HOTKEY_PAUSE);
-        let _ = UnregisterHotKey(None, HOTKEY_SCROLL);
         if let Some(hwnd) = session_wnd {
             let _ = WTSUnRegisterSessionNotification(hwnd);
             if let Some(h) = power_notify {
@@ -2775,7 +3425,7 @@ fn hook_loop() {
             let _ = DestroyWindow(hwnd);
         }
         if let Some(eng) = ENGINE.get() {
-            let _ = eng.cmd_tx.send(InputCmd::ResetState(ResetReason::Shutdown));
+            eng.enqueue_cmd(InputCmd::ResetState(ResetReason::Shutdown));
         }
         HOOK_TID.store(0, Ordering::Relaxed);
     }
@@ -2784,9 +3434,27 @@ fn hook_loop() {
 #[cfg(any(target_os = "windows", test))]
 fn sided_windows_vk(vk: u32, scan: u32, extended: bool) -> u32 {
     match vk {
-        0x12 => if extended { 0xA5 } else { 0xA4 },
-        0x11 => if extended { 0xA3 } else { 0xA2 },
-        0x10 => if scan == 0x36 { 0xA1 } else { 0xA0 },
+        0x12 => {
+            if extended {
+                0xA5
+            } else {
+                0xA4
+            }
+        }
+        0x11 => {
+            if extended {
+                0xA3
+            } else {
+                0xA2
+            }
+        }
+        0x10 => {
+            if scan == 0x36 {
+                0xA1
+            } else {
+                0xA0
+            }
+        }
         _ => vk,
     }
 }
@@ -2799,7 +3467,19 @@ fn is_injected_key(kb: &KBDLLHOOKSTRUCT) -> bool {
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    HOOK_EVENTS.fetch_add(1, Ordering::Relaxed);
+    // A panic escaping an extern "system" frame aborts the process with
+    // injected keys possibly held; degrade to pass-through instead.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        kbd_proc_inner(code, wparam, lparam)
+    })) {
+        Ok(r) => r,
+        Err(_) => unsafe { CallNextHookEx(None, code, wparam, lparam) },
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn kbd_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    HOOK_KBD_EVENTS.fetch_add(1, Ordering::Relaxed);
     if code != HC_ACTION as i32 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -2824,9 +3504,11 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     };
 
-    // Emergency stop keys work even while recording and are never swallowed:
-    // the press must reach the system so a stuck state is still escapable.
-    if down && (key == VK_PAUSE.0 as u32 || key == VK_SCROLL.0 as u32) {
+    // The Pause emergency stop works even while recording and is never
+    // swallowed: the press must reach the system so a stuck state is still
+    // escapable. Scroll Lock deliberately does not trigger — it has a real
+    // system function and a stray press silently killed every mapping.
+    if down && key == VK_PAUSE.0 as u32 {
         request_emergency_stop(true);
     }
 
@@ -2854,7 +3536,7 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
     if down && key == VK_ESCAPE.0 as u32 {
         eng.swallowed_keys.write().insert(key);
         eng.recording.store(false, Ordering::Relaxed);
-        let _ = eng.cmd_tx.send(InputCmd::RecordCancel);
+        eng.enqueue_cmd(InputCmd::RecordCancel);
         return LRESULT(1);
     }
 
@@ -2867,7 +3549,7 @@ unsafe extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) ->
         }
         let chord = eng.recorder.write().on_key(key, down);
         if !chord.is_empty() {
-            let _ = eng.cmd_tx.send(InputCmd::Record(chord));
+            eng.enqueue_cmd(InputCmd::Record(chord));
         }
         // Key-ups of keys not swallowed on press pass through untouched.
         if down {
@@ -2953,7 +3635,19 @@ fn win_vk_to_token(vk: u32) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    HOOK_EVENTS.fetch_add(1, Ordering::Relaxed);
+    // A panic escaping an extern "system" frame aborts the process with
+    // injected keys possibly held; degrade to pass-through instead.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        mouse_proc_inner(code, wparam, lparam)
+    })) {
+        Ok(r) => r,
+        Err(_) => unsafe { CallNextHookEx(None, code, wparam, lparam) },
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn mouse_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    HOOK_MOUSE_EVENTS.fetch_add(1, Ordering::Relaxed);
     if code != HC_ACTION as i32 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -2962,9 +3656,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     };
 
     let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-    if ms.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0
-        || ms.dwExtraInfo == EXTRA_INFO
-    {
+    if ms.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 || ms.dwExtraInfo == EXTRA_INFO {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
@@ -2977,15 +3669,14 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     // telemetry pulse instead.
     let captured = down && !button.is_primary() && eng.listening.swap(false, Ordering::Relaxed);
     if captured {
-        let _ = eng
-            .cmd_tx
-            .send(InputCmd::ListenCaptured(button.as_str().to_string()));
+        eng.enqueue_cmd(InputCmd::ListenCaptured(button.as_str().to_string()));
     }
 
     let paused = eng.paused.load(Ordering::Relaxed);
     let compiled = eng.compiled.load_full();
     let action_opt = compiled.get(button).cloned();
-    let is_mapped = action_opt.is_some() && !paused && !captured && !eng.recording.load(Ordering::Relaxed);
+    let is_mapped =
+        action_opt.is_some() && !paused && !captured && !eng.recording.load(Ordering::Relaxed);
     let mut queued = false;
 
     if is_mapped {
@@ -3016,7 +3707,11 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let bit = 1u32 << button as u32;
         if down && swallow {
             eng.swallowed_buttons.fetch_or(bit, Ordering::Relaxed);
-        } else if !down {
+        } else if down {
+            // The OS saw this down, so its up must also pass — a stale bit
+            // from a lost earlier release would wrongly eat it.
+            eng.swallowed_buttons.fetch_and(!bit, Ordering::Relaxed);
+        } else {
             swallow = eng.swallowed_buttons.fetch_and(!bit, Ordering::Relaxed) & bit != 0;
         }
     }
@@ -3371,6 +4066,7 @@ mod tests {
             label: "".into(),
             tap_keys: vec![],
             hold_keys: vec![],
+            extra: Default::default(),
         }];
         let compiled = compile_mappings(&mappings);
         let action = compiled.get(MouseButton::XButton1).expect("compiled slot");
@@ -3609,8 +4305,18 @@ mod tests {
         let t0 = Instant::now();
 
         // 1. Hold Ctrl+Alt
-        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, t0, t0);
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(hold_act.clone()),
+            1,
+            t0,
+            t0,
+        );
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
         assert_eq!(*sm.key_refs.get(&win_key_spec("LAlt").unwrap()).unwrap(), 1);
 
         // 2. Click Ctrl+Enter
@@ -3622,14 +4328,23 @@ mod tests {
             t0 + Duration::from_millis(5),
             t0 + Duration::from_millis(5),
         );
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 2);
-        assert_eq!(*sm.key_refs.get(&win_key_spec("Enter").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            2
+        );
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("Enter").unwrap()).unwrap(),
+            1
+        );
 
         // 3. Click 到期释放
         sm.tick(t0 + Duration::from_millis(35));
 
         // 验证：Enter 释放了，但是 LControl 的 refs 依然是 1，绝不能发出 LControl Up！
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
         let ctrl_ups: Vec<_> = injector
             .events()
             .into_iter()
@@ -3678,7 +4393,10 @@ mod tests {
 
         // 1. Toggle Ctrl 开启
         sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act), 1, t0, t0);
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
 
         // 2. Click Ctrl+Enter
         sm.handle_mouse_edge(
@@ -3689,11 +4407,17 @@ mod tests {
             t0 + Duration::from_millis(5),
             t0 + Duration::from_millis(5),
         );
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 2);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            2
+        );
 
         // 3. Click 到期释放
         sm.tick(t0 + Duration::from_millis(35));
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
         let ctrl_ups: Vec<_> = injector
             .events()
             .into_iter()
@@ -3880,7 +4604,10 @@ mod tests {
             Some((MouseButton::Middle, false))
         );
         assert_eq!(classify(WM_MOUSEHWHEEL, 120u32 << 16, &acc), None);
-        assert_eq!(classify(WM_LBUTTONDOWN, 0, &acc), Some((MouseButton::Left, true)));
+        assert_eq!(
+            classify(WM_LBUTTONDOWN, 0, &acc),
+            Some((MouseButton::Left, true))
+        );
         // A full positive notch emits exactly one WheelUp step.
         assert_eq!(
             classify(WM_MOUSEWHEEL, 120u32 << 16, &acc),
@@ -4007,6 +4734,7 @@ mod tests {
                 label: "".into(),
                 tap_keys: vec![],
                 hold_keys: vec![],
+                extra: Default::default(),
             },
             Mapping {
                 id: "2".into(),
@@ -4016,6 +4744,7 @@ mod tests {
                 label: "".into(),
                 tap_keys: vec![],
                 hold_keys: vec![],
+                extra: Default::default(),
             },
             Mapping {
                 id: "3".into(),
@@ -4025,6 +4754,7 @@ mod tests {
                 label: "".into(),
                 tap_keys: vec![],
                 hold_keys: vec![],
+                extra: Default::default(),
             },
         ];
 
@@ -4045,6 +4775,7 @@ mod tests {
                 label: "".into(),
                 tap_keys: vec![],
                 hold_keys: vec![],
+                extra: Default::default(),
             },
             Mapping {
                 id: "2".into(),
@@ -4054,6 +4785,7 @@ mod tests {
                 label: "".into(),
                 tap_keys: vec![],
                 hold_keys: vec![],
+                extra: Default::default(),
             },
             Mapping {
                 id: "3".into(),
@@ -4063,6 +4795,7 @@ mod tests {
                 label: "".into(),
                 tap_keys: vec![],
                 hold_keys: vec![],
+                extra: Default::default(),
             },
         ];
 
@@ -4092,7 +4825,14 @@ mod tests {
         let t0 = Instant::now();
 
         // 1. Hold Ctrl+Alt down
-        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, t0, t0);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(hold_act.clone()),
+            1,
+            t0,
+            t0,
+        );
         // 2. Click Ctrl+Enter down
         sm.handle_mouse_edge(
             MouseButton::XButton2,
@@ -4107,10 +4847,15 @@ mod tests {
         sm.tick(t0 + Duration::from_millis(35));
 
         // 此时 Ctrl 必须保持 held，Enter 释放
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
         assert_eq!(*sm.key_refs.get(&win_key_spec("LAlt").unwrap()).unwrap(), 1);
         assert_eq!(
-            *sm.key_refs.get(&win_key_spec("Enter").unwrap()).unwrap_or(&0),
+            *sm.key_refs
+                .get(&win_key_spec("Enter").unwrap())
+                .unwrap_or(&0),
             0
         );
 
@@ -4130,7 +4875,9 @@ mod tests {
             0
         );
         assert_eq!(
-            *sm.key_refs.get(&win_key_spec("LAlt").unwrap()).unwrap_or(&0),
+            *sm.key_refs
+                .get(&win_key_spec("LAlt").unwrap())
+                .unwrap_or(&0),
             0
         );
     }
@@ -4145,18 +4892,40 @@ mod tests {
         let now = Instant::now();
 
         // 1. Hold Ctrl+Alt
-        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now, now);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(hold_act.clone()),
+            1,
+            now,
+            now,
+        );
         // 2. Toggle Ctrl+Shift (ON)
-        sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act.clone()), 1, now, now);
+        sm.handle_mouse_edge(
+            MouseButton::Middle,
+            true,
+            Some(toggle_act.clone()),
+            1,
+            now,
+            now,
+        );
 
         // 3. Hold release
         sm.handle_mouse_edge(MouseButton::XButton1, false, Some(hold_act), 1, now, now);
 
         // 验证：Ctrl 和 Shift 仍由 Toggle 保持！Alt 释放！
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LShift").unwrap()).unwrap(), 1);
         assert_eq!(
-            *sm.key_refs.get(&win_key_spec("LAlt").unwrap()).unwrap_or(&0),
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LShift").unwrap()).unwrap(),
+            1
+        );
+        assert_eq!(
+            *sm.key_refs
+                .get(&win_key_spec("LAlt").unwrap())
+                .unwrap_or(&0),
             0
         );
 
@@ -4176,7 +4945,9 @@ mod tests {
             0
         );
         assert_eq!(
-            *sm.key_refs.get(&win_key_spec("LShift").unwrap()).unwrap_or(&0),
+            *sm.key_refs
+                .get(&win_key_spec("LShift").unwrap())
+                .unwrap_or(&0),
             0
         );
     }
@@ -4191,14 +4962,31 @@ mod tests {
         let now = Instant::now();
 
         // 1. Toggle Shift ON
-        sm.handle_mouse_edge(MouseButton::Middle, true, Some(toggle_act.clone()), 1, now, now);
+        sm.handle_mouse_edge(
+            MouseButton::Middle,
+            true,
+            Some(toggle_act.clone()),
+            1,
+            now,
+            now,
+        );
         // 2. Hold Shift down
-        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now, now);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(hold_act.clone()),
+            1,
+            now,
+            now,
+        );
         // 3. Hold Shift up
         sm.handle_mouse_edge(MouseButton::XButton1, false, Some(hold_act), 1, now, now);
 
         // Shift 仍应被 Toggle 保持
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LShift").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LShift").unwrap()).unwrap(),
+            1
+        );
 
         // 4. Toggle Shift OFF
         sm.handle_mouse_edge(
@@ -4210,7 +4998,9 @@ mod tests {
             now + Duration::from_millis(100),
         );
         assert_eq!(
-            *sm.key_refs.get(&win_key_spec("LShift").unwrap()).unwrap_or(&0),
+            *sm.key_refs
+                .get(&win_key_spec("LShift").unwrap())
+                .unwrap_or(&0),
             0
         );
     }
@@ -4223,7 +5013,10 @@ mod tests {
         let now = Instant::now();
 
         sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act), 1, now, now);
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
 
         sm.emergency_stop();
         assert!(sm.is_paused());
@@ -4246,11 +5039,25 @@ mod tests {
         let mut now = Instant::now();
 
         // 1. Hold Ctrl
-        sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now, now);
+        sm.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(hold_act.clone()),
+            1,
+            now,
+            now,
+        );
 
         // 2. 连续 5 次快速 Click Enter
         for _ in 0..5 {
-            sm.handle_mouse_edge(MouseButton::XButton2, true, Some(click_act.clone()), 1, now, now);
+            sm.handle_mouse_edge(
+                MouseButton::XButton2,
+                true,
+                Some(click_act.clone()),
+                1,
+                now,
+                now,
+            );
             now += Duration::from_millis(1);
         }
 
@@ -4261,7 +5068,10 @@ mod tests {
         }
 
         // 检查整个过程中 Ctrl 始终在 held
-        assert_eq!(*sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(), 1);
+        assert_eq!(
+            *sm.key_refs.get(&win_key_spec("LControl").unwrap()).unwrap(),
+            1
+        );
 
         // 验证正好产生了 5 次独立的 Enter Down 和 5 次独立的 Enter Up
         let enter_downs = injector
@@ -4297,13 +5107,34 @@ mod tests {
         let mut now = Instant::now();
 
         for i in 0..250 {
-            sm.handle_mouse_edge(MouseButton::WheelUp, true, Some(wheel_act.clone()), 1, now, now);
+            sm.handle_mouse_edge(
+                MouseButton::WheelUp,
+                true,
+                Some(wheel_act.clone()),
+                1,
+                now,
+                now,
+            );
             if i == 100 {
-                sm.handle_mouse_edge(MouseButton::XButton1, true, Some(hold_act.clone()), 1, now, now);
+                sm.handle_mouse_edge(
+                    MouseButton::XButton1,
+                    true,
+                    Some(hold_act.clone()),
+                    1,
+                    now,
+                    now,
+                );
                 assert_eq!(*sm.key_refs.get(&win_key_spec("LAlt").unwrap()).unwrap(), 1);
             }
             if i == 150 {
-                sm.handle_mouse_edge(MouseButton::XButton1, false, Some(hold_act.clone()), 1, now, now);
+                sm.handle_mouse_edge(
+                    MouseButton::XButton1,
+                    false,
+                    Some(hold_act.clone()),
+                    1,
+                    now,
+                    now,
+                );
             }
         }
 
@@ -4376,7 +5207,10 @@ mod tests {
         let ctrl = key_spec("LControl").unwrap().vk.0 as u32;
         let mut rec = RecorderState::default();
         assert_eq!(rec.on_key(a, true), vec!["A".to_string()]);
-        assert!(rec.on_key(a, true).is_empty(), "key repeat must not re-emit");
+        assert!(
+            rec.on_key(a, true).is_empty(),
+            "key repeat must not re-emit"
+        );
         rec.on_key(ctrl, true);
         assert!(rec.max_chord.iter().any(|k| k == "A"));
         assert!(rec.max_chord.iter().any(|k| k == "LControl"));
@@ -4441,6 +5275,96 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn save_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mi-cfg-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_config_never_downgrades_schema_version() {
+        let dir = save_test_dir("ver");
+        let mut cfg = AppConfig::default();
+        cfg.schema_version = CURRENT_SCHEMA_VERSION + 5;
+        save_config_in(&dir, &cfg).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved["schema_version"].as_u64().unwrap(),
+            (CURRENT_SCHEMA_VERSION + 5) as u64
+        );
+        cfg.schema_version = 1;
+        save_config_in(&dir, &cfg).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved["schema_version"].as_u64().unwrap(),
+            CURRENT_SCHEMA_VERSION as u64
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_config_skips_bak_overwrite_when_current_is_corrupt() {
+        let dir = save_test_dir("bak");
+        let good_bak = "{\"schema_version\":1,\"theme\":\"light\",\"mappings\":[]}";
+        fs::write(dir.join("config.json.bak"), good_bak).unwrap();
+        fs::write(dir.join("config.json"), "{ torn write").unwrap();
+        save_config_in(&dir, &AppConfig::default()).unwrap();
+        // The corrupt predecessor must not poison the last good backup.
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json.bak")).unwrap(),
+            good_bak
+        );
+        assert!(
+            parse_config_lenient(&fs::read_to_string(dir.join("config.json")).unwrap()).is_ok()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_config_updates_bak_from_valid_previous() {
+        let dir = save_test_dir("bakok");
+        let prev = "{\"schema_version\":1,\"theme\":\"dark\",\"mappings\":[]}";
+        fs::write(dir.join("config.json"), prev).unwrap();
+        save_config_in(&dir, &AppConfig::default()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json.bak")).unwrap(),
+            prev
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_config_writes_through_symlink() {
+        let dir = save_test_dir("link");
+        let target = dir.join("real-config.json");
+        fs::write(&target, "{\"mappings\":[]}").unwrap();
+        #[cfg(target_os = "windows")]
+        let linked = std::os::windows::fs::symlink_file(&target, dir.join("config.json"));
+        #[cfg(not(target_os = "windows"))]
+        let linked = std::os::unix::fs::symlink(&target, dir.join("config.json"));
+        // Symlink creation needs a privilege some Windows setups lack; skip
+        // rather than fail on hosts that cannot create one.
+        if linked.is_err() {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        save_config_in(&dir, &AppConfig::default()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            saved["schema_version"].as_u64().unwrap(),
+            CURRENT_SCHEMA_VERSION as u64
+        );
+        assert!(fs::symlink_metadata(dir.join("config.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn dummy_dual(id: &str, tap: &[&str], hold: &[&str]) -> Arc<CompiledAction> {
         let tap_specs: Vec<KeySpec> = tap.iter().map(|k| win_key_spec(k).unwrap()).collect();
         let hold_specs: Vec<KeySpec> = hold.iter().map(|k| win_key_spec(k).unwrap()).collect();
@@ -4462,7 +5386,10 @@ mod tests {
         let act = dummy_dual("mid", &["LControl", "V"], &["LControl", "C"]);
         let t0 = Instant::now();
         sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, t0, t0);
-        assert!(injector.events().is_empty(), "must not inject until up or threshold");
+        assert!(
+            injector.events().is_empty(),
+            "must not inject until up or threshold"
+        );
         sm.handle_mouse_edge(
             MouseButton::Middle,
             false,
@@ -4490,7 +5417,9 @@ mod tests {
         sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, t0, t0);
         sm.tick(t0 + Duration::from_millis(25));
         let after_hold = injector.events();
-        assert!(after_hold.iter().any(|e| e.spec.vk.0 == b'C' as u16 && e.action == KeyAction::Down));
+        assert!(after_hold
+            .iter()
+            .any(|e| e.spec.vk.0 == b'C' as u16 && e.action == KeyAction::Down));
         assert!(!after_hold.iter().any(|e| e.spec.vk.0 == b'V' as u16));
         sm.handle_mouse_edge(
             MouseButton::Middle,
@@ -4509,6 +5438,66 @@ mod tests {
     }
 
     #[test]
+    fn dual_backlogged_short_press_still_fires_tap() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone())
+            .with_dwell(Duration::from_millis(10))
+            .with_hold_threshold(Duration::from_millis(40));
+        let act = dummy_dual("mid", &["LControl", "V"], &["LControl", "C"]);
+        let t0 = Instant::now();
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, t0, t0);
+        // The up happened 10ms after the down physically, but the worker
+        // only processes it 500ms later — past the hold threshold on
+        // processing time. Physical duration must decide: tap, no hold.
+        sm.handle_mouse_edge(
+            MouseButton::Middle,
+            false,
+            None,
+            1,
+            t0 + Duration::from_millis(500),
+            t0 + Duration::from_millis(10),
+        );
+        let evs = injector.events();
+        assert!(
+            evs.iter().any(|e| e.spec.vk.0 == b'V' as u16),
+            "backlogged short press must still fire the tap"
+        );
+        assert!(
+            !evs.iter().any(|e| e.spec.vk.0 == b'C' as u16),
+            "backlogged short press must not flash the hold chord"
+        );
+    }
+
+    #[test]
+    fn dual_backlogged_long_press_still_fires_hold() {
+        let injector = FakeInjector::new();
+        let mut sm = InputStateMachine::new(injector.clone())
+            .with_dwell(Duration::from_millis(10))
+            .with_hold_threshold(Duration::from_millis(40));
+        let act = dummy_dual("mid", &["LControl", "V"], &["LControl", "C"]);
+        let t0 = Instant::now();
+        sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, t0, t0);
+        // Physically held 100ms (> threshold) with the up processed late:
+        // tick must still convert to hold and the up must release it.
+        sm.handle_mouse_edge(
+            MouseButton::Middle,
+            false,
+            None,
+            1,
+            t0 + Duration::from_millis(500),
+            t0 + Duration::from_millis(100),
+        );
+        let evs = injector.events();
+        assert!(evs
+            .iter()
+            .any(|e| e.spec.vk.0 == b'C' as u16 && e.action == KeyAction::Down));
+        assert!(evs
+            .iter()
+            .any(|e| e.spec.vk.0 == b'C' as u16 && e.action == KeyAction::Up));
+        assert!(!evs.iter().any(|e| e.spec.vk.0 == b'V' as u16));
+    }
+
+    #[test]
     fn compile_dual_from_tap_and_hold_keys() {
         let mappings = vec![Mapping {
             id: "1".into(),
@@ -4518,6 +5507,7 @@ mod tests {
             label: "".into(),
             tap_keys: vec!["LControl".into(), "V".into()],
             hold_keys: vec!["LControl".into(), "C".into()],
+            extra: Default::default(),
         }];
         let compiled = compile_mappings(&mappings);
         let action = compiled.get(MouseButton::Middle).unwrap();
@@ -4535,6 +5525,7 @@ mod tests {
             label: "".into(),
             tap_keys: tap.iter().map(|k| k.to_string()).collect(),
             hold_keys: hold.iter().map(|k| k.to_string()).collect(),
+            extra: Default::default(),
         }
     }
 
@@ -4566,8 +5557,8 @@ mod tests {
     #[test]
     fn dual_pending_cleared_on_pause() {
         let injector = FakeInjector::new();
-        let mut sm = InputStateMachine::new(injector.clone())
-            .with_hold_threshold(Duration::from_millis(20));
+        let mut sm =
+            InputStateMachine::new(injector.clone()).with_hold_threshold(Duration::from_millis(20));
         let act = dummy_dual("mid", &["LControl", "V"], &["LControl", "C"]);
         let t0 = Instant::now();
         sm.handle_mouse_edge(MouseButton::Middle, true, Some(act), 1, t0, t0);
@@ -4691,7 +5682,9 @@ mod tests {
             let l = unsafe { make_input(&left, down).Anonymous.ki };
             assert_eq!(r.wVk.0, 0);
             assert_eq!(r.wScan, 0x38);
-            assert!(r.dwFlags.contains(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY));
+            assert!(r
+                .dwFlags
+                .contains(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY));
             assert!(!l.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
             assert_eq!(r.dwFlags.contains(KEYEVENTF_KEYUP), !down);
         }
@@ -4700,16 +5693,38 @@ mod tests {
     #[test]
     fn cleared_dual_does_not_compile_legacy_keys() {
         // A fully cleared mapping (keys + both slots empty) compiles to nothing.
-        let mapping = Mapping { id: "clear".into(), button: "middle".into(), mode: "dual".into(), keys: vec![], tap_keys: vec![], hold_keys: vec![], label: String::new() };
-        assert!(compile_mappings(&[mapping]).get(MouseButton::Middle).is_none());
+        let mapping = Mapping {
+            id: "clear".into(),
+            button: "middle".into(),
+            mode: "dual".into(),
+            keys: vec![],
+            tap_keys: vec![],
+            hold_keys: vec![],
+            label: String::new(),
+            extra: Default::default(),
+        };
+        assert!(compile_mappings(&[mapping])
+            .get(MouseButton::Middle)
+            .is_none());
     }
 
     #[test]
     fn legacy_dual_keys_compiles_to_tap() {
         // Legacy rows only carried `keys`; with empty slots they feed the tap slot.
-        let mapping = Mapping { id: "legacy".into(), button: "middle".into(), mode: "dual".into(), keys: vec!["LAlt".into()], tap_keys: vec![], hold_keys: vec![], label: String::new() };
+        let mapping = Mapping {
+            id: "legacy".into(),
+            button: "middle".into(),
+            mode: "dual".into(),
+            keys: vec!["LAlt".into()],
+            tap_keys: vec![],
+            hold_keys: vec![],
+            label: String::new(),
+            extra: Default::default(),
+        };
         let compiled = compile_mappings(&[mapping]);
-        let compiled = compiled.get(MouseButton::Middle).expect("mapping should compile");
+        let compiled = compiled
+            .get(MouseButton::Middle)
+            .expect("mapping should compile");
         assert_eq!(compiled.mode, TriggerMode::Click);
     }
 
@@ -4720,23 +5735,48 @@ mod tests {
         let (telem_tx, _telem_rx) = crossbeam_channel::bounded(1);
         let engine = Engine {
             hook_status: RwLock::new("starting".into()),
-            cfg: RwLock::new(AppConfig::default()), compiled: ArcSwap::from_pointee(compile_mappings(&[])),
-            paused: AtomicBool::new(false), listening: AtomicBool::new(false), swallowed_buttons: AtomicU32::new(0), recording: AtomicBool::new(false),
-            window_visible: AtomicBool::new(false), last: RwLock::new(None), cmd_tx, edge_tx, telem_tx,
+            cfg: RwLock::new(AppConfig::default()),
+            compiled: ArcSwap::from_pointee(compile_mappings(&[])),
+            paused: AtomicBool::new(false),
+            paused_emergency: AtomicBool::new(false),
+            listening: AtomicBool::new(false),
+            swallowed_buttons: AtomicU32::new(0),
+            recording: AtomicBool::new(false),
+            window_visible: AtomicBool::new(false),
+            last: RwLock::new(None),
+            cmd_tx,
+            edge_tx,
+            telem_tx,
             recorder: RwLock::new(RecorderState::default()),
             swallowed_keys: RwLock::new(HashSet::new()),
             active_bindings: RwLock::new(HashMap::new()),
             recovery_notes: RwLock::new(Vec::new()),
         };
-        let edge = || InputCmd::MouseEdge { button: MouseButton::XButton1, down: false, action: None, generation: 1, at: Instant::now() };
+        let edge = || InputCmd::MouseEdge {
+            button: MouseButton::XButton1,
+            down: false,
+            action: None,
+            generation: 1,
+            at: Instant::now(),
+        };
         assert!(engine.enqueue_edge(edge()));
         assert!(!engine.enqueue_edge(edge()));
         assert!(!engine.enqueue_edge(edge()));
         assert!(engine.paused.load(Ordering::SeqCst));
-        assert!(matches!(cmd_rx.try_recv().unwrap(), InputCmd::EmergencyStop { persist: false }));
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            InputCmd::EmergencyStop { persist: false }
+        ));
         assert!(cmd_rx.try_recv().is_err());
         let mut state = InputStateMachine::new(FakeInjector::new());
-        state.handle_mouse_edge(MouseButton::XButton1, true, Some(dummy_action("held", TriggerMode::Hold, &["RAlt"])), 1, Instant::now(), Instant::now());
+        state.handle_mouse_edge(
+            MouseButton::XButton1,
+            true,
+            Some(dummy_action("held", TriggerMode::Hold, &["RAlt"])),
+            1,
+            Instant::now(),
+            Instant::now(),
+        );
         state.emergency_stop();
         assert!(state.key_refs.is_empty());
         assert!(state.is_paused());
@@ -4744,7 +5784,11 @@ mod tests {
 
     #[test]
     fn portable_layout_prefers_data_and_preserves_legacy_support() {
-        let dir = std::env::temp_dir().join(format!("mi-portable-layout-{}-{}", std::process::id(), SAVE_SEQ.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "mi-portable-layout-{}-{}",
+            std::process::id(),
+            SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(dir.join("data")).unwrap();
         assert!(portable_config_dir(&dir).is_none());
         fs::write(dir.join(".portable"), "").unwrap();
@@ -4787,7 +5831,10 @@ mod tests {
         sm.handle_mouse_edge(MouseButton::XButton1, true, Some(act), 1, now, now);
         // Only the first key was actually inserted; the second ref is rolled
         // back so a later release never keys-up something never pressed.
-        assert_eq!(sm.key_refs.get(&win_key_spec("LShift").unwrap()).copied(), Some(1));
+        assert_eq!(
+            sm.key_refs.get(&win_key_spec("LShift").unwrap()).copied(),
+            Some(1)
+        );
         assert!(!sm.key_refs.contains_key(&win_key_spec("LAlt").unwrap()));
     }
 
@@ -4802,7 +5849,11 @@ mod tests {
         sm.handle_mouse_edge(MouseButton::XButton1, false, Some(act), 1, now, now);
         assert!(!sm.pending_release.is_empty());
         assert_eq!(
-            injector.events().iter().filter(|e| e.action == KeyAction::Up).count(),
+            injector
+                .events()
+                .iter()
+                .filter(|e| e.action == KeyAction::Up)
+                .count(),
             0
         );
         injector.fail_ups.store(false, Ordering::Relaxed);
@@ -4838,7 +5889,10 @@ mod tests {
             .events()
             .iter()
             .any(|e| e.action == KeyAction::Up && e.spec.vk == VK_LSHIFT && !e.is_mask));
-        assert_eq!(sm.key_refs.get(&win_key_spec("LAlt").unwrap()).copied(), Some(1));
+        assert_eq!(
+            sm.key_refs.get(&win_key_spec("LAlt").unwrap()).copied(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4862,7 +5916,10 @@ mod tests {
             .filter(|e| e.action == KeyAction::Down && !e.is_mask)
             .count();
         assert_eq!(downs, 1);
-        assert_eq!(sm.key_refs.get(&win_key_spec("LShift").unwrap()).copied(), Some(1));
+        assert_eq!(
+            sm.key_refs.get(&win_key_spec("LShift").unwrap()).copied(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4940,6 +5997,40 @@ mod tests {
     }
 
     #[test]
+    fn lenient_parse_normalizes_unknown_mode_and_dedups_buttons() {
+        let text = r#"{"mappings":[
+            {"id":"a","button":"middle","mode":"holdd","keys":["LShift"]},
+            {"id":"b","button":"middle","mode":"click","keys":["Enter"]},
+            {"id":"c","button":"xbutton1","mode":"toggle","keys":["LWin"]}
+        ]}"#;
+        let (cfg, notes) = parse_config_lenient(text).unwrap();
+        assert_eq!(cfg.mappings.len(), 2);
+        assert_eq!(cfg.mappings[0].id, "a");
+        assert_eq!(cfg.mappings[0].mode, "hold");
+        assert_eq!(notes.len(), 2);
+    }
+
+    #[test]
+    fn lenient_parse_notes_non_bool_flags() {
+        let (cfg, notes) =
+            parse_config_lenient(r#"{"paused":"yes","autostart":1,"mappings":[]}"#).unwrap();
+        assert!(!cfg.paused);
+        assert!(!cfg.autostart);
+        assert_eq!(notes.len(), 2);
+    }
+
+    #[test]
+    fn lenient_parse_preserves_unknown_mapping_fields() {
+        let text = r#"{"mappings":[
+            {"id":"a","button":"middle","mode":"hold","keys":["LShift"],"future":{"x":1}}
+        ]}"#;
+        let (cfg, _) = parse_config_lenient(text).unwrap();
+        assert!(cfg.mappings[0].extra.contains_key("future"));
+        let out = serde_json::to_string(&cfg.mappings[0]).unwrap();
+        assert!(out.contains("\"future\""));
+    }
+
+    #[test]
     fn specs_from_names_skips_unsupported_tokens() {
         let specs = specs_from_names(&[
             "LControl".to_string(),
@@ -4970,6 +6061,7 @@ mod tests {
             tap_keys: vec![],
             hold_keys: vec![],
             label: String::new(),
+            extra: Default::default(),
         }
     }
 
@@ -4978,14 +6070,16 @@ mod tests {
         assert!(validate_mappings(&[simple_mapping("a", "middle")]).is_ok());
 
         // More than 5 mappings.
-        let many: Vec<Mapping> = (0..6).map(|i| simple_mapping(&format!("m{i}"), "middle")).collect();
+        let many: Vec<Mapping> = (0..6)
+            .map(|i| simple_mapping(&format!("m{i}"), "middle"))
+            .collect();
         assert!(validate_mappings(&many).is_err());
 
         // Duplicate button.
-        assert!(validate_mappings(&[
-            simple_mapping("a", "middle"),
-            simple_mapping("b", "middle"),
-        ]).is_err());
+        assert!(validate_mappings(
+            &[simple_mapping("a", "middle"), simple_mapping("b", "middle"),]
+        )
+        .is_err());
 
         // Primary button cannot be mapped.
         assert!(validate_mappings(&[simple_mapping("a", "left")]).is_err());
@@ -5050,5 +6144,4 @@ mod tests {
             Some(MouseButton::WheelUp)
         );
     }
-
 }

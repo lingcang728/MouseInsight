@@ -15,6 +15,7 @@ import {
   applyButtonChange,
   applyModeChange,
   removeKeyFromSlot,
+  chordRiskHint,
 } from "../src/logic.ts";
 
 // 轻量、高可读性的纯逻辑测试执行器
@@ -546,6 +547,37 @@ await suite("11. 映射编辑纯函数", async () => {
     const all = [dualMap(), { id: "m8", button: "middle", mode: "dual", keys: [], tap_keys: ["X"], hold_keys: [] }];
     assert.equal(hasButtonConflict(all, "m1", "xbutton1"), false);
     assert.equal(hasButtonConflict(all, "m1", "middle"), true);
+  });
+});
+
+// ============================================================================
+// 12. 录制组合风险提示 (chordRiskHint)
+// ============================================================================
+await suite("12. chordRiskHint 危险组合提示", async () => {
+  await test("空输入与普通组合无提示", () => {
+    assert.equal(chordRiskHint([]), null);
+    assert.equal(chordRiskHint(null), null);
+    assert.equal(chordRiskHint(undefined), null);
+    assert.equal(chordRiskHint(["LControl", "C"]), null);
+    assert.equal(chordRiskHint(["LControl", "LAlt"]), null);
+    assert.equal(chordRiskHint(["F5"]), null);
+  });
+
+  await test("系统占用或副作用强的组合给出非空提示", () => {
+    assert.match(chordRiskHint(["LAlt", "F4"]), /Alt\+F4/);
+    assert.match(chordRiskHint(["RAlt", "F4"]), /Alt\+F4/);
+    assert.match(chordRiskHint(["LControl", "LAlt", "Delete"]), /Ctrl\+Alt\+Delete/);
+    assert.match(chordRiskHint(["LControl", "W"]), /Ctrl\+W/);
+    assert.match(chordRiskHint(["LWin"]), /Win/);
+    assert.match(chordRiskHint(["LAlt"]), /Alt/);
+    assert.match(chordRiskHint(["Delete"]), /Delete/);
+  });
+
+  await test("别名先归一再判断，修饰键组合不命中单键规则", () => {
+    assert.match(chordRiskHint(["alt", "F4"]), /Alt\+F4/);
+    assert.equal(chordRiskHint(["LAlt", "C"]), null);
+    assert.equal(chordRiskHint(["LWin", "D"]), null);
+    assert.equal(chordRiskHint(["LControl", "Delete"]), null);
   });
 });
 

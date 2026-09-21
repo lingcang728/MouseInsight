@@ -5,7 +5,7 @@ const { packageVersion, files } = readVersions();
 
 assert.ok(packageVersion, "package.json version must be non-empty");
 const entries = Object.entries(files);
-assert.equal(entries.length, 6, "six version locations must be checked");
+assert.equal(entries.length, 7, "seven version locations must be checked");
 for (const [file, version] of entries) {
   assert.equal(
     version,

@@ -183,6 +183,25 @@ export function inferDefaultMode(keys: string[], button?: string): "hold" | "cli
 }
 
 /**
+ * 录制组合的非阻断性风险提示：系统占用或副作用强的组合仍允许保存，
+ * 但应在录制与保存时让用户知情。
+ */
+export function chordRiskHint(keys: string[]): string | null {
+  const set = new Set((keys ?? []).map((k) => canonicalizeToken(k)));
+  if (set.size === 0) return null;
+  const hasAlt = set.has("LAlt") || set.has("RAlt");
+  const hasCtrl = set.has("LControl") || set.has("RControl");
+  const hasWin = set.has("LWin") || set.has("RWin");
+  if (hasAlt && set.has("F4")) return "Alt+F4 会直接关闭前台窗口";
+  if (hasCtrl && hasAlt && set.has("Delete")) return "Ctrl+Alt+Delete 被系统保留，映射不会生效";
+  if (hasCtrl && set.has("W")) return "Ctrl+W 会关闭当前标签页或窗口";
+  if (set.size === 1 && hasWin) return "单独的 Win 键松开时会弹出开始菜单";
+  if (set.size === 1 && hasAlt) return "单独的 Alt 键会激活前台应用的菜单栏";
+  if (set.size === 1 && set.has("Delete")) return "单独的 Delete 会删除当前选中项";
+  return null;
+}
+
+/**
  * 把 KeyboardEvent.code 映射成引擎 token。录制时作为 LL 钩子的兜底，
  * 避免钩子没挂上时页面 preventDefault 把按键吃掉却什么都不录。
  */

@@ -2,19 +2,35 @@
 compile_error!("Mouse Insight supports Windows and macOS only");
 
 mod engine;
-mod native_menu;
 #[cfg(target_os = "macos")]
 mod macos;
+mod native_menu;
 
 use engine::{Mapping, Pulse, RuntimeBindingState, SendReport, Snapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 static WINDOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Marks a user-initiated window close so `ExitRequested(code=None)` can
+/// tell "last window closed → stay resident in tray" from a real
+/// termination request (Dock Quit, system logoff) — both arrive as
+/// `code=None`.
+static LAST_WINDOW_CLOSE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// `window_visible` gates hook-side telemetry generation and WINDOW_ACTIVE
+/// gates IPC emission; they always move together.
+fn mark_window_active(active: bool) {
+    engine::set_window_visible(active);
+    WINDOW_ACTIVE.store(active, Ordering::Relaxed);
+}
 
 #[tauri::command]
-fn get_hook_status() -> String { engine::hook_status() }
+fn get_hook_status() -> String {
+    engine::hook_status()
+}
 
 #[tauri::command]
 fn get_snapshot() -> Snapshot {
@@ -24,8 +40,12 @@ fn get_snapshot() -> Snapshot {
 #[tauri::command]
 async fn save_mappings(mappings: Vec<Mapping>) -> Result<(), String> {
     // Earliest explicit cap; engine::set_mappings re-validates everything.
-    if mappings.len() > 5 { return Err("最多支持 5 个鼠标按键映射".into()); }
-    let result = tauri::async_runtime::spawn_blocking(move || engine::set_mappings(mappings)).await.map_err(|e| e.to_string())?;
+    if mappings.len() > 5 {
+        return Err("最多支持 5 个鼠标按键映射".into());
+    }
+    let result = tauri::async_runtime::spawn_blocking(move || engine::set_mappings(mappings))
+        .await
+        .map_err(|e| e.to_string())?;
     native_menu::refresh();
     result
 }
@@ -37,18 +57,23 @@ fn clear_recovery_notes() {
 
 #[tauri::command]
 async fn save_theme(theme: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || engine::set_theme(theme)).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || engine::set_theme(theme))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 async fn save_paused(app: tauri::AppHandle, paused: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || sync_engine_paused_state(&app, paused))
-        .await.map_err(|e| e.to_string())?
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 async fn save_autostart(on: bool) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || engine::set_autostart_flag(on)).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || engine::set_autostart_flag(on))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// "In foreground" means the foreground window shares our root ancestor.
@@ -62,10 +87,10 @@ fn window_in_foreground(window: &tauri::Window) -> bool {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetAncestor, GetForegroundWindow, GA_ROOT,
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+        let Ok(hwnd) = window.hwnd() else {
+            return false;
         };
-        let Ok(hwnd) = window.hwnd() else { return false };
         unsafe {
             let foreground = GetForegroundWindow();
             if foreground.0.is_null() {
@@ -89,7 +114,9 @@ fn arm_listen(window: tauri::Window) -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn disarm_listen() { engine::disarm_listen(); }
+fn disarm_listen() {
+    engine::disarm_listen();
+}
 
 #[tauri::command]
 fn arm_record(window: tauri::Window) -> Result<u64, String> {
@@ -104,18 +131,30 @@ fn disarm_record() {
     engine::disarm_record();
 }
 
+// The record-family commands share arm_record's foreground gate: disarming is
+// always allowed, but anything that can read or mutate an armed recording
+// session must come from a frontmost window, not a compromised renderer.
 #[tauri::command]
-fn add_record_key(key: String) {
+fn add_record_key(window: tauri::Window, key: String) {
+    if !window_in_foreground(&window) {
+        return;
+    }
     engine::add_record_key(key);
 }
 
 #[tauri::command]
-fn remove_record_key(key: String) {
+fn remove_record_key(window: tauri::Window, key: String) {
+    if !window_in_foreground(&window) {
+        return;
+    }
     engine::remove_record_key(key);
 }
 
 #[tauri::command]
-fn press_record_key(key: String, down: bool) {
+fn press_record_key(window: tauri::Window, key: String, down: bool) {
+    if !window_in_foreground(&window) {
+        return;
+    }
     engine::press_record_key(key, down);
 }
 
@@ -129,7 +168,8 @@ fn open_url(url: String) -> Result<(), String> {
     // SECURITY: exact-match whitelist only. Never relax to starts_with(): cmd /C start re-parses & and | as command separators.
     if url != "https://github.com/lingcang728/MouseInsight/releases/latest"
         && url != "https://github.com/lingcang728/MouseInsight/releases"
-        && url != "https://developer.microsoft.com/microsoft-edge/webview2/" {
+        && url != "https://developer.microsoft.com/microsoft-edge/webview2/"
+    {
         return Err("Only Mouse Insight release pages can be opened".into());
     }
     #[cfg(target_os = "windows")]
@@ -161,7 +201,10 @@ fn open_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn take_record_keys() -> Vec<String> {
+fn take_record_keys(window: tauri::Window) -> Vec<String> {
+    if !window_in_foreground(&window) {
+        return Vec::new();
+    }
     engine::take_record_keys()
 }
 
@@ -178,13 +221,19 @@ fn open_dir(dir: std::path::PathBuf) -> Result<(), String> {
         let explorer = std::env::var_os("SystemRoot")
             .map(|root| std::path::PathBuf::from(root).join("explorer.exe"))
             .unwrap_or_else(|| "explorer".into());
-        Command::new(explorer).arg(dir).spawn().map_err(|e| e.to_string())?;
+        Command::new(explorer)
+            .arg(dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
         // Do not wait: `open` can block while Finder shows a dialog.
-        Command::new("/usr/bin/open").arg(dir).spawn().map_err(|e| e.to_string())?;
+        Command::new("/usr/bin/open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -235,12 +284,11 @@ pub fn sync_engine_paused_state(app: &tauri::AppHandle, paused: bool) -> Result<
 }
 
 fn sync_paused_ui(app: &tauri::AppHandle, paused: bool) {
-
     native_menu::refresh();
 
     let _ = app.emit(
         "engine-state-changed",
-        serde_json::json!({ "paused": paused }),
+        serde_json::json!({ "paused": paused, "emergency": engine::paused_emergency() }),
     );
 }
 
@@ -286,11 +334,47 @@ fn bring_hwnd_to_front(w: &tauri::WebviewWindow) {
     }
 }
 
+/// Top-level navigations are confined to the app's own origins; a remote page
+/// has no IPC bridge but would still be a phishing surface wearing our window.
+fn navigation_allowed(url: &tauri::Url) -> bool {
+    let allowed = matches!(url.scheme(), "tauri" | "ipc")
+        || matches!(
+            url.host_str(),
+            Some("tauri.localhost") | Some("ipc.localhost")
+        )
+        || url.as_str() == "about:blank"
+        // Debug builds load the UI from the Vite dev server.
+        || (cfg!(debug_assertions)
+            && url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost") | Some("127.0.0.1")));
+    if !allowed {
+        log::warn!("blocked webview navigation to {url}");
+    }
+    allowed
+}
+
 fn create_main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    // Small/high-DPI work areas (e.g. 1280x800@150% -> 853x533 logical) can be
+    // smaller than the fixed minimum; Tauri does not clamp it, so size from
+    // the monitor instead.
+    let (mut width, mut height) = (1180.0_f64, 760.0_f64);
+    let (mut min_w, mut min_h) = (920.0_f64, 620.0_f64);
+    if let Ok(Some(monitor)) = app.primary_monitor() {
+        let scale = monitor.scale_factor();
+        let work = monitor.work_area().size;
+        let (avail_w, avail_h) = (work.width as f64 / scale, work.height as f64 / scale);
+        if avail_w > 0.0 && avail_h > 0.0 {
+            width = width.min(avail_w);
+            height = height.min(avail_h);
+            min_w = min_w.min(avail_w * 0.9);
+            min_h = min_h.min(avail_h * 0.9);
+        }
+    }
     match WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Mouse Insight")
-        .inner_size(1180.0, 760.0)
-        .min_inner_size(920.0, 620.0)
+        .on_navigation(navigation_allowed)
+        .inner_size(width, height)
+        .min_inner_size(min_w, min_h)
         .center()
         .decorations(true)
         .visible(true)
@@ -302,9 +386,7 @@ fn create_main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
             #[cfg(target_os = "windows")]
             {
                 use windows::core::w;
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    MessageBoxW, MB_ICONERROR, MB_OK,
-                };
+                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
                 unsafe {
                     let _ = MessageBoxW(
                         None,
@@ -324,11 +406,12 @@ fn create_main_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
 
 fn show_main_window(app: &tauri::AppHandle) {
     #[cfg(target_os = "macos")]
-    { let _ = app.show(); }
+    {
+        let _ = app.show();
+    }
     if let Some(w) = app.get_webview_window("main") {
         bring_hwnd_to_front(&w);
-        engine::set_window_visible(true);
-        WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+        mark_window_active(true);
         return;
     }
 
@@ -336,20 +419,26 @@ fn show_main_window(app: &tauri::AppHandle) {
     let _ = app.run_on_main_thread(move || {
         if let Some(w) = app_handle.get_webview_window("main") {
             bring_hwnd_to_front(&w);
-            engine::set_window_visible(true);
-            WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+            mark_window_active(true);
             return;
         }
         if let Some(w) = create_main_window(&app_handle) {
             bring_hwnd_to_front(&w);
-            engine::set_window_visible(true);
-            WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+            mark_window_active(true);
         }
     });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // A parent process can inherit a WebView2 CDP/debug command line into us
+    // through this variable; release builds drop it before any webview spins
+    // up. scripts/verify-ui.py opts back in via MOUSE_INSIGHT_ALLOW_WEBVIEW2_ARGS.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    if std::env::var_os("MOUSE_INSIGHT_ALLOW_WEBVIEW2_ARGS").is_none() {
+        std::env::remove_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+    }
+
     // Must work before the engine (and even the logger) exists.
     std::panic::set_hook(Box::new(|info| {
         let msg = info
@@ -362,9 +451,15 @@ pub fn run() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".into());
-        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string();
         let text = format!("panic: {msg}\nthread: {thread}\nlocation: {location}\n");
         log::error!("{text}");
+        // A panic must not leave injected keys held; the try-lock variant
+        // never blocks on a ledger lock the panicking thread may hold.
+        engine::failsafe_release_all_try();
         let dir = engine::config_dir().join("logs");
         let _ = std::fs::create_dir_all(&dir);
         let ts = std::time::SystemTime::now()
@@ -372,6 +467,26 @@ pub fn run() {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let _ = std::fs::write(dir.join(format!("crash-{ts}.log")), text);
+        // Cap crash logs; a crash loop must not fill the disk. The unix-ts
+        // names sort chronologically for the next decade.
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut logs: Vec<_> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| {
+                            let n = n.to_string_lossy();
+                            n.starts_with("crash-") && n.ends_with(".log")
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+            logs.sort();
+            while logs.len() > 5 {
+                let _ = std::fs::remove_file(logs.remove(0));
+            }
+        }
     }));
 
     let is_autostart = std::env::args().any(|arg| arg == "--autostart");
@@ -416,21 +531,33 @@ pub fn run() {
         ))
         .on_window_event(|_window, event| match event {
             WindowEvent::CloseRequested { .. } => {
+                if let Ok(mut t) = LAST_WINDOW_CLOSE.lock() {
+                    *t = Some(Instant::now());
+                }
                 engine::disarm_record();
                 engine::disarm_listen();
-                engine::set_window_visible(false);
-                WINDOW_ACTIVE.store(false, Ordering::Relaxed);
+                mark_window_active(false);
             }
             WindowEvent::Destroyed => {
                 engine::disarm_record();
                 engine::disarm_listen();
-                engine::set_window_visible(false);
-                WINDOW_ACTIVE.store(false, Ordering::Relaxed);
+                mark_window_active(false);
+            }
+            // Neither platform has a dedicated minimized/hidden window event;
+            // a Windows minimize arrives as a zero-size resize. macOS app
+            // hide is additionally caught by the pulse emit check below.
+            WindowEvent::Resized(size) => {
+                mark_window_active(size.width != 0 && size.height != 0);
             }
             WindowEvent::Focused(false) => {
                 engine::disarm_record();
                 engine::disarm_listen();
                 let _ = _window.emit("record-cancel", ());
+            }
+            // Regaining focus implies visible: covers restore paths that emit
+            // no resize (unminimize, macOS unhide).
+            WindowEvent::Focused(true) => {
+                mark_window_active(true);
             }
             _ => {}
         })
@@ -439,6 +566,13 @@ pub fn run() {
                 app.handle().exit(0);
                 return Ok(());
             }
+            // Menu-bar resident tool: keep a Dock slot from being held,
+            // including on --autostart launches that never open a window.
+            // show_main_window still activates the app when it opens.
+            #[cfg(target_os = "macos")]
+            let _ = app
+                .handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle().clone();
             let handle2 = app.handle().clone();
             let handle3 = app.handle().clone();
@@ -451,9 +585,21 @@ pub fn run() {
 
             engine::start(
                 move |pulse: Pulse| {
-                    if WINDOW_ACTIVE.load(Ordering::Relaxed) {
-                        let _ = handle.emit("mouse-pulse", pulse);
+                    if !WINDOW_ACTIVE.load(Ordering::Relaxed) {
+                        return;
                     }
+                    // A hidden window (macOS Cmd+H, or any minimize path that
+                    // skipped the zero-size resize) still looks active here;
+                    // discover it once so the hook stops generating telemetry
+                    // and the hidden webview stops getting IPC wakeups.
+                    let visible = handle
+                        .get_webview_window("main")
+                        .is_some_and(|w| w.is_visible().unwrap_or(false));
+                    if !visible {
+                        mark_window_active(false);
+                        return;
+                    }
+                    let _ = handle.emit("mouse-pulse", pulse);
                 },
                 move |button: String| {
                     if WINDOW_ACTIVE.load(Ordering::Relaxed) {
@@ -537,8 +683,26 @@ pub fn run() {
         if matches!(event, tauri::RunEvent::Reopen { .. }) {
             show_main_window(_app_handle);
         }
+        // Dock Quit / AppleScript quit / system logoff bypass ExitRequested
+        // on macOS (tauri#9198): Exit is the last reliable chance to release
+        // injected keys. Idempotent — quit_app and --quit already ran it.
+        if matches!(event, tauri::RunEvent::Exit) {
+            engine::shutdown();
+        }
         if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-            if code.is_none() {
+            // code=None covers both "the last window closed" (stay resident
+            // in tray) and Dock Quit / system logoff. A close always emits
+            // CloseRequested first, so a recent one marks the tray path;
+            // anything else is a real termination — letting it through runs
+            // the RunEvent::Exit arm above, which releases injected keys.
+            let closing = LAST_WINDOW_CLOSE
+                .lock()
+                .map(|mut t| {
+                    t.take()
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+                })
+                .unwrap_or(false);
+            if code.is_none() && closing {
                 api.prevent_exit();
             }
         }
