@@ -5,11 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0-beta.1] - 2026-09-12
+## [0.3.0] - 2026-09-22
 
-基于 `MouseInsight.md` 全量审计的大规模修复版本：共复核 100+ 项疑似问题，剔除 2 项误报，其余确认项全部修复或明确标注为实机验证项。
+全量修复与性能体验重构版本：彻底修复鼠标侧键无法结束命令的底层缺陷，根除按键注入磁盘阻塞与心跳误杀，全面重构 UI 美观度与录制交互，支持完整便携免安装版。
 
 ### Added
+
+- 录制弹窗快捷预设：新增显式「中断命令 (Ctrl+C)」、「关闭标签 (Ctrl+W)」、「新建标签 (Ctrl+T)」、「刷新 (F5)」、「全屏 (F11)」、「显示桌面」等快捷预设，候选区补充 F5/F11/方向键/Enter/Backspace/Del。
+- 录制弹窗一键清空按钮，点击预设时自动重置当前组合，避免杂键拼接。
+- 规范化虚拟键码转换函数（`generic_vk`），标准统一 `VK_CONTROL`、`VK_SHIFT`、`VK_MENU`，同时精确保留硬件扫描码与扩展标志位。
+- 静态单通道异步按键日志写入队列（`JOURNAL_TX`）与单线程合并写入（Coalescing），高频触发时零阻塞主线程。
+
+### Fixed
+
+- 鼠标侧键无法结束命令：修正控制台子系统依赖的标准 `VK_CONTROL` 虚拟键注入，解决 Windows Terminal、PowerShell、cmd 无法响应 Ctrl+C 中断信号的问题。
+- 放行驱动模拟侧键：底层钩子移除对 `LLMHF_INJECTED` 的无条件拦截，仅比对软件自身签名，兼容雷蛇/罗技等鼠标宏驱动。
+- 侧键 XBUTTON 消息位掩码容错（支持 `(xhi & 1) != 0` 与 `(xhi & 2) != 0`）。
+- 消除注入核心路径的同步磁盘 I/O 阻塞与无界线程创建风暴。
+- 修复 60 秒心跳检测在鼠标点击但光标未位移时误判键盘钩子死亡并频繁重置按键账本的缺陷。
+- 全面重构 `<select>` 下拉菜单样式（现代圆角、定制 SVG 箭头、平滑 Focus 光晕、优雅 disabled 态）。
+- 按钮触控动效全面加速（缩短至 60ms~100ms），录制弹窗升级毛玻璃背景与聚焦发光边框。
 
 - 结构化日志：`tauri-plugin-log`，日志写入 `<配置目录>/logs/`，最多保留 3 份、单份 1MB；托盘新增「打开日志目录…」。日志不记录任何按键内容。
 - Panic 钩子：崩溃时写 `logs/crash-*.log` 并尽力释放所有注入按键。

@@ -797,19 +797,7 @@ function warnIfActive(m: Mapping) {
 }
 
 let discardArmed = false;
-let discardTimer = 0;
-function disarmDiscard() {
-  discardArmed = false;
-  clearTimeout(discardTimer);
-  ($("record-cancel") as HTMLButtonElement).textContent = "取消";
-}
 function requestCloseRecord() {
-  if (recordBuf.length && !discardArmed) {
-    discardArmed = true;
-    ($("record-cancel") as HTMLButtonElement).textContent = "再点一次丢弃已录按键";
-    discardTimer = window.setTimeout(disarmDiscard, 3000);
-    return;
-  }
   void closeRecord();
 }
 
@@ -818,7 +806,6 @@ async function closeRecord() {
   recordBuf = [];
   keysFromBackend = false;
   confirming = false;
-  disarmDiscard();
   recordHelpOverride = null;
   ($("record-ok") as HTMLButtonElement).disabled = false;
   $("record-mask").classList.add("hidden");
@@ -1393,14 +1380,43 @@ $("quick-add").addEventListener("click", async (event) => {
 $("record-presets").addEventListener("click", async (event) => {
   const preset = (event.target as HTMLElement).closest<HTMLElement>("[data-preset]")?.dataset.preset;
   if (!preset || !currentDraft) return;
+  const ctrlKey = isMac ? "LWin" : "LControl";
   const keys: Record<string, string[]> = {
-    copy: [isMac ? "LWin" : "LControl", "C"],
-    paste: [isMac ? "LWin" : "LControl", "V"],
-    undo: [isMac ? "LWin" : "LControl", "Z"],
+    interrupt: ["LControl", "C"],
+    copy: [ctrlKey, "C"],
+    paste: [ctrlKey, "V"],
+    undo: [ctrlKey, "Z"],
+    save: [ctrlKey, "S"],
+    selectall: [ctrlKey, "A"],
+    cut: [ctrlKey, "X"],
+    closetab: [ctrlKey, "W"],
+    newtab: [ctrlKey, "T"],
+    refresh: ["F5"],
+    fullscreen: ["F11"],
+    desktop: isMac ? ["F11"] : ["LWin", "D"],
     enter: ["Enter"],
+    esc: ["Escape"],
+    screenshot: isMac ? ["LWin", "LShift", "4"] : ["LWin", "LShift", "S"],
   };
-  if (!keys[preset]) return;
-  for (const key of keys[preset]) await safeInvoke("add_record_key", { key });
+  const targetKeys = keys[preset];
+  if (!targetKeys || !targetKeys.length) return;
+  recordBuf = [];
+  keysFromBackend = false;
+  await safeInvoke("arm_record");
+  for (const key of targetKeys) {
+    await safeInvoke("add_record_key", { key });
+  }
+  recordBuf = [...targetKeys];
+  renderKeys($("record-keys"), targetKeys, { removable: true });
+  updateRecordOk();
+});
+
+$("record-clear")?.addEventListener("click", async () => {
+  recordBuf = [];
+  keysFromBackend = false;
+  renderKeys($("record-keys"), [], { dimEmpty: false, removable: true, emptyText: "已清空，请按下新组合…" });
+  updateRecordOk();
+  await safeInvoke("arm_record");
 });
 
 let quitArmed = false;

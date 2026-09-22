@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::Devices::HumanInterfaceDevice::GUID_DEVINTERFACE_MOUSE;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::{
@@ -45,15 +45,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetLastInputInfo, MapVirtualKeyW, RegisterHotKey, SendInput,
     UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, LASTINPUTINFO, MAPVK_VK_TO_VSC,
-    MOD_NOREPEAT, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
+    MOD_NOREPEAT, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
     VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1,
     VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS,
     VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SPACE, VK_TAB, VK_UP,
+    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     KillTimer, PostThreadMessageW, RegisterClassW, RegisterDeviceNotificationW, SetTimer,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterDeviceNotification,
     DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE,
@@ -97,6 +97,12 @@ pub const VK_UP: VIRTUAL_KEY = VIRTUAL_KEY(0x26);
 pub const VK_RIGHT: VIRTUAL_KEY = VIRTUAL_KEY(0x27);
 #[cfg(not(target_os = "windows"))]
 pub const VK_DOWN: VIRTUAL_KEY = VIRTUAL_KEY(0x28);
+#[cfg(not(target_os = "windows"))]
+pub const VK_SHIFT: VIRTUAL_KEY = VIRTUAL_KEY(0x10);
+#[cfg(not(target_os = "windows"))]
+pub const VK_CONTROL: VIRTUAL_KEY = VIRTUAL_KEY(0x11);
+#[cfg(not(target_os = "windows"))]
+pub const VK_MENU: VIRTUAL_KEY = VIRTUAL_KEY(0x12);
 #[cfg(not(target_os = "windows"))]
 pub const VK_INSERT: VIRTUAL_KEY = VIRTUAL_KEY(0x2D);
 #[cfg(not(target_os = "windows"))]
@@ -143,8 +149,10 @@ pub const VK_OEM_7: VIRTUAL_KEY = VIRTUAL_KEY(0xDE);
 pub const VK_F1: VIRTUAL_KEY = VIRTUAL_KEY(0x70);
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 const LLMHF_INJECTED: u32 = 0x0000_0001;
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 const LLMHF_LOWER_IL_INJECTED: u32 = 0x0000_0002;
 #[cfg(target_os = "windows")]
 const LLKHF_UP: u32 = 0x80;
@@ -155,11 +163,11 @@ const LLKHF_LOWER_IL_INJECTED_KBD: u32 = 0x02;
 pub const EXTRA_INFO: usize = 0x4D49_484B;
 pub const VK_MASK_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xFC);
 const TAP_QUEUE_CAP: usize = 32;
-const EDGE_CHANNEL_CAP: usize = 256;
-const CMD_CHANNEL_CAP: usize = 128;
+const EDGE_CHANNEL_CAP: usize = 1024;
+const CMD_CHANNEL_CAP: usize = 256;
 /// Flooded save_* calls already serialize on CFG_MUTATE_LOCK; this floor caps
 /// the fsync+rename rate so IPC cannot amplify into a disk busy loop.
-const SAVE_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const SAVE_MIN_INTERVAL: Duration = Duration::from_millis(15);
 const HOLD_THRESHOLD: Duration = Duration::from_millis(400);
 /// Schema stamped on save. A config written by a newer version keeps its
 /// higher number on round-trip so a future migration can still tell
@@ -1476,24 +1484,44 @@ fn held_keys_path() -> PathBuf {
     config_dir().join("held-keys.json")
 }
 
+static JOURNAL_TX: OnceLock<crossbeam_channel::Sender<Vec<(u16, bool)>>> = OnceLock::new();
+
+fn journal_sender() -> &'static crossbeam_channel::Sender<Vec<(u16, bool)>> {
+    JOURNAL_TX.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<(u16, bool)>>(128);
+        let _ = thread::Builder::new()
+            .name("mi-journal".into())
+            .spawn(move || {
+                while let Ok(mut items) = rx.recv() {
+                    while let Ok(newer) = rx.try_recv() {
+                        items = newer;
+                    }
+                    let path = held_keys_path();
+                    if items.is_empty() {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    let Ok(json) = serde_json::to_string(&items) else {
+                        continue;
+                    };
+                    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let tmp = config_dir().join(format!("held-keys.{}.{seq}.tmp", std::process::id()));
+                    if fs::write(&tmp, json.as_bytes()).is_ok() {
+                        let _ = replace_file_atomic(&tmp, &path);
+                    }
+                    let _ = fs::remove_file(&tmp);
+                }
+            });
+        tx
+    })
+}
+
 /// Called with `injected_held` locked. IO failure only loses the recovery
 /// hint, never the in-memory ledger.
 pub(crate) fn persist_held_journal(held: &HashSet<KeySpec>) {
-    let path = held_keys_path();
-    if held.is_empty() {
-        let _ = fs::remove_file(&path);
-        return;
-    }
     let items: Vec<(u16, bool)> = held.iter().map(|s| (s.vk.0, s.extended)).collect();
-    let Ok(json) = serde_json::to_string(&items) else {
-        return;
-    };
-    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = config_dir().join(format!("held-keys.{}.{seq}.tmp", std::process::id()));
-    if fs::write(&tmp, json.as_bytes()).is_ok() {
-        let _ = replace_file_atomic(&tmp, &path);
-    }
-    let _ = fs::remove_file(&tmp);
+    let tx = journal_sender();
+    let _ = tx.try_send(items);
 }
 
 fn clear_held_journal() {
@@ -3310,6 +3338,8 @@ fn hook_loop() {
         let mut last_mouse_events = HOOK_MOUSE_EVENTS.load(Ordering::Relaxed);
         let mut last_kbd_events = HOOK_KBD_EVENTS.load(Ordering::Relaxed);
         let mut last_input_ms = last_input_tick();
+        let mut last_pt = POINT::default();
+        let _ = GetCursorPos(&mut last_pt);
         let mut msg = MSG::default();
         loop {
             let status = GetMessageW(&mut msg, None, 0, 0);
@@ -3333,30 +3363,28 @@ fn hook_loop() {
                     let mouse_count = HOOK_MOUSE_EVENTS.load(Ordering::Relaxed);
                     let kbd_count = HOOK_KBD_EVENTS.load(Ordering::Relaxed);
                     let input_ms = last_input_tick();
-                    // Both counters flat together usually means a truly idle
-                    // desktop, not two dead hooks: reinstalling anyway would
-                    // open a drop window every 60s for nothing. The OS input
-                    // tick tells the difference; a failed query errs toward
-                    // reinstalling.
                     let system_active = match (input_ms, last_input_ms) {
                         (Some(cur), Some(prev)) => cur != prev,
                         _ => true,
                     };
                     last_input_ms = input_ms;
-                    let idle = mouse_count == last_mouse_events
-                        && kbd_count == last_kbd_events
-                        && !system_active;
-                    // A flat counter can't tell a dead hook from an idle one;
-                    // reinstall only the hook whose own stream went silent.
+
+                    let mut cur_pt = POINT::default();
+                    let cursor_moved = GetCursorPos(&mut cur_pt).is_ok()
+                        && (cur_pt.x != last_pt.x || cur_pt.y != last_pt.y);
+                    last_pt = cur_pt;
+
+                    let mouse_dead = mouse_count == last_mouse_events && cursor_moved;
+                    let kbd_dead = kbd_count == last_kbd_events
+                        && system_active
+                        && !cursor_moved
+                        && mouse_count == last_mouse_events;
                     let mut all_ok = true;
-                    if mouse_count == last_mouse_events && !idle {
+                    if mouse_dead {
                         let _ = UnhookWindowsHookEx(mouse);
                         match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(module), 0) {
                             Ok(h) => {
                                 mouse = h;
-                                // The reinstall gap can hide button releases;
-                                // reset like a session change so no injected
-                                // key or swallowed bit stays held.
                                 session_reset();
                                 log::debug!("hook heartbeat: reinstalled mouse hook");
                             }
@@ -3369,7 +3397,7 @@ fn hook_loop() {
                             }
                         }
                     }
-                    if kbd_count == last_kbd_events && !idle {
+                    if kbd_dead {
                         let _ = UnhookWindowsHookEx(kbd);
                         match SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), Some(module), 0) {
                             Ok(h) => {
@@ -3393,10 +3421,7 @@ fn hook_loop() {
                     }
                     last_mouse_events = mouse_count;
                     last_kbd_events = kbd_count;
-                    // Moving counters prove their hooks alive, and a recovered
-                    // reinstall must clear the earlier failure status — but an
-                    // idle skip verified nothing, so keep the current status.
-                    if all_ok && !idle && hook_status() != "ready" {
+                    if all_ok && hook_status() != "ready" {
                         set_hook_status("ready");
                     }
                 }
@@ -3656,7 +3681,7 @@ unsafe fn mouse_proc_inner(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT
     };
 
     let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-    if ms.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0 || ms.dwExtraInfo == EXTRA_INFO {
+    if ms.dwExtraInfo == EXTRA_INFO {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
@@ -3770,10 +3795,10 @@ fn classify(msg: u32, mouse_data: u32, acc: &AtomicI32) -> Option<(MouseButton, 
         WM_RBUTTONUP => Some((MouseButton::Right, false)),
         WM_MBUTTONDOWN => Some((MouseButton::Middle, true)),
         WM_MBUTTONUP => Some((MouseButton::Middle, false)),
-        WM_XBUTTONDOWN if xhi == 1 => Some((MouseButton::XButton1, true)),
-        WM_XBUTTONUP if xhi == 1 => Some((MouseButton::XButton1, false)),
-        WM_XBUTTONDOWN if xhi == 2 => Some((MouseButton::XButton2, true)),
-        WM_XBUTTONUP if xhi == 2 => Some((MouseButton::XButton2, false)),
+        WM_XBUTTONDOWN if (xhi & 1) != 0 || xhi == 1 => Some((MouseButton::XButton1, true)),
+        WM_XBUTTONUP if (xhi & 1) != 0 || xhi == 1 => Some((MouseButton::XButton1, false)),
+        WM_XBUTTONDOWN if (xhi & 2) != 0 || xhi == 2 => Some((MouseButton::XButton2, true)),
+        WM_XBUTTONUP if (xhi & 2) != 0 || xhi == 2 => Some((MouseButton::XButton2, false)),
         WM_MOUSEWHEEL => wheel_step(xhi as i16, acc).map(|b| (b, true)),
         WM_MOUSEHWHEEL => None,
         _ => None,
@@ -3948,8 +3973,19 @@ fn is_alt_or_win(_vk: VIRTUAL_KEY) -> bool {
     false
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn generic_vk(vk: VIRTUAL_KEY) -> VIRTUAL_KEY {
+    match vk {
+        VK_LCONTROL | VK_RCONTROL => VK_CONTROL,
+        VK_LSHIFT | VK_RSHIFT => VK_SHIFT,
+        VK_LMENU | VK_RMENU => VK_MENU,
+        _ => vk,
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
+    let target_vk = generic_vk(vk);
     let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as u16 };
     let mut flags = KEYBD_EVENT_FLAGS(0);
     if !down {
@@ -3962,7 +3998,7 @@ fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: vk,
+                wVk: target_vk,
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
@@ -3975,9 +4011,10 @@ fn make_raw_input(vk: VIRTUAL_KEY, extended: bool, down: bool) -> INPUT {
 #[cfg(target_os = "windows")]
 fn make_input(spec: &KeySpec, down: bool) -> INPUT {
     let mut input = make_raw_input(spec.vk, spec.extended, down);
-    // Side-specific modifiers use their physical scan code. Generic VK_MENU
-    // translation in target applications must not turn right Alt into left Alt.
-    if (0xA0..=0xA5).contains(&spec.vk.0) {
+    // Right Alt (AltGr) uses extended scan code to prevent target applications
+    // from aliasing it to Left Alt. Other modifiers retain their valid generic virtual key
+    // so terminals (PowerShell/cmd) and console handlers properly process chords (e.g. Ctrl+C).
+    if spec.vk == VK_RMENU {
         unsafe {
             input.Anonymous.ki.dwFlags |= KEYEVENTF_SCANCODE;
             input.Anonymous.ki.wVk = VIRTUAL_KEY(0);
@@ -5687,6 +5724,27 @@ mod tests {
                 .contains(KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY));
             assert!(!l.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
             assert_eq!(r.dwFlags.contains(KEYEVENTF_KEYUP), !down);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ctrl_and_chord_injection_uses_canonical_vk_control() {
+        let lctrl = win_key_spec("LControl").unwrap();
+        let rctrl = win_key_spec("RControl").unwrap();
+        let c_key = win_key_spec("C").unwrap();
+        for down in [true, false] {
+            let lc = unsafe { make_input(&lctrl, down).Anonymous.ki };
+            let rc = unsafe { make_input(&rctrl, down).Anonymous.ki };
+            let c = unsafe { make_input(&c_key, down).Anonymous.ki };
+            assert_eq!(lc.wVk, VK_CONTROL);
+            assert_eq!(rc.wVk, VK_CONTROL);
+            assert_eq!(c.wVk.0, 0x43);
+            assert!(!lc.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+            assert!(rc.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+            assert_eq!(lc.wScan, 0x1D);
+            assert_eq!(rc.wScan, 0x1D);
+            assert_eq!(c.wScan, 0x2E);
         }
     }
 

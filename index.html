@@ -119,18 +119,45 @@
         <span class="eyebrow">定义你的快捷操作</span><h2 id="record-title">同时按下组合键</h2>
         <div class="keys" id="record-keys" aria-live="polite"><span class="key dim">在听</span></div>
         <div class="presets" id="record-presets" role="group" aria-label="常用快捷键">
-          <button type="button" data-preset="copy">复制</button><button type="button" data-preset="paste">粘贴</button>
-          <button type="button" data-preset="undo">撤销</button><button type="button" data-preset="enter">回车</button>
+          <button type="button" data-preset="interrupt" title="结束当前运行的终端/控制台命令 (Ctrl+C)">中断命令 (Ctrl+C)</button>
+          <button type="button" data-preset="copy">复制</button>
+          <button type="button" data-preset="paste">粘贴</button>
+          <button type="button" data-preset="undo">撤销</button>
+          <button type="button" data-preset="save">保存</button>
+          <button type="button" data-preset="selectall">全选</button>
+          <button type="button" data-preset="cut">剪切</button>
+          <button type="button" data-preset="closetab">关闭标签</button>
+          <button type="button" data-preset="newtab">新建标签</button>
+          <button type="button" data-preset="refresh">刷新 (F5)</button>
+          <button type="button" data-preset="fullscreen">全屏 (F11)</button>
+          <button type="button" data-preset="desktop">显示桌面</button>
+          <button type="button" data-preset="enter">回车</button>
+          <button type="button" data-preset="esc">Esc</button>
+          <button type="button" data-preset="screenshot">截屏</button>
         </div>
         <div class="chips" id="record-chips">
-          <button type="button" data-key="LControl">Left Ctrl</button>
-          <button type="button" data-key="LAlt">Left Alt</button>
+          <button type="button" data-key="LControl">Ctrl</button>
+          <button type="button" data-key="LAlt">Alt</button>
           <button type="button" data-key="RAlt">Right Alt</button>
-          <button type="button" data-key="LShift">Left Shift</button>
-          <button type="button" data-key="LWin">Win</button><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Escape">Esc</button>
+          <button type="button" data-key="LShift">Shift</button>
+          <button type="button" data-key="LWin">Win</button>
+          <button type="button" data-key="Space">Space</button>
+          <button type="button" data-key="Tab">Tab</button>
+          <button type="button" data-key="Escape">Esc</button>
+          <button type="button" data-key="Enter">回车</button>
+          <button type="button" data-key="Backspace">退格</button>
+          <button type="button" data-key="Delete">Del</button>
+          <button type="button" data-key="F5">F5</button>
+          <button type="button" data-key="F11">F11</button>
+          <button type="button" data-key="ArrowUp">↑</button>
+          <button type="button" data-key="ArrowDown">↓</button>
+          <button type="button" data-key="ArrowLeft">←</button>
+          <button type="button" data-key="ArrowRight">→</button>
         </div>
         <p class="meta" id="record-help">按下键盘组合，或选择上方预设。Esc 取消，Tab 切换焦点；如需映射它们，请点击对应按键。录制期间暂停触发鼠标映射。</p>
         <div class="row">
+          <button type="button" class="ghost" id="record-clear" title="清空已录按键">清空</button>
+          <div style="flex: 1;"></div>
           <button type="button" class="ghost" id="record-cancel">取消</button>
           <button type="button" class="solid" id="record-ok">保存映射</button>
         </div>
