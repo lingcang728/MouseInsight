@@ -82,9 +82,10 @@ jobs:
           # Keep PDBs next to the binary for post-release crash analysis.
           New-Item -ItemType Directory -Path "$dist/symbols" -Force | Out-Null
           Copy-Item -LiteralPath 'src-tauri/target/release/*.pdb' -Destination "$dist/symbols" -ErrorAction SilentlyContinue
-          Get-ChildItem -LiteralPath $dist -File | ForEach-Object {
+          $hashes = @(Get-ChildItem -LiteralPath $dist -File | Where-Object Name -ne 'SHA256SUMS.txt' | ForEach-Object {
             '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
-          } | Out-File -FilePath "$dist/SHA256SUMS.txt" -Encoding utf8
+          })
+          $hashes | Set-Content -LiteralPath "$dist/SHA256SUMS.txt" -Encoding utf8
           Get-ChildItem -LiteralPath $dist -Recurse -File | Select-Object FullName, Length
 
       - name: Upload GitHub Actions artifact
