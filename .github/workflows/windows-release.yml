@@ -73,7 +73,8 @@ jobs:
           # Dotted names match the release URLs written by package-release.ps1.
           Copy-Item -LiteralPath $setup -Destination "$dist/Mouse.Insight_${version}_x64-setup.exe"
           Copy-Item -LiteralPath $exe -Destination "$dist/Mouse.Insight.exe"
-          $zipStage = New-Item -ItemType Directory -Path "$dist/.zip-stage/data" -Force
+          $zipStage = "$dist/.zip-stage"
+          New-Item -ItemType Directory -Path "$zipStage/data" -Force | Out-Null
           Copy-Item -LiteralPath $exe -Destination "$zipStage/Mouse Insight.exe"
           [IO.File]::WriteAllText("$zipStage/data/.portable", '')
           Compress-Archive -Path "$zipStage/*" -DestinationPath "$dist/Mouse.Insight_${version}_portable.zip" -Force
